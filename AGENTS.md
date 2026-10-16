@@ -7,7 +7,7 @@ warmth on constrained local model servers.
 
 ### Issue tracker
 
-GitHub Issues via `gh` CLI. See `docs/agents/issue-tracker.md`.
+Local Markdown issues in `docs/issues/` (GitHub tracker is read-only for this copy). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
