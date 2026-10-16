@@ -28,4 +28,6 @@ queues.
 - Daemon auto-starts from the extension, idle-exits when last client leaves.
 - Config: `~/.pi/agent/llm-queue.json`, hot-reload.
 
-Status: design agreed, implementation not started.
+Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
+provider wrapper with turn-based lease, daemon autostart, fail-open. Priority tiers, aging,
+lease TTL, `blockSubagentLaunch`, `/queue` and the TUI indicator are #1 scope, not built.

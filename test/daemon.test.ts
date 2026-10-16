@@ -66,3 +66,32 @@ describe("daemon socket protocol", () => {
 		patient.close();
 	});
 });
+
+describe("queue policy resolution", () => {
+	it("applies a provider-name queue key to that provider's endpoint", async () => {
+		const d = startDaemon(
+			{ defaults: { maxStreams: 1 }, queues: { zen: { maxStreams: 2 } } },
+			{ providers: { zen: { baseUrl: QUEUE_KEY, api: "openai-completions" } } },
+		);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
+		const granted = [(await a.next(3000)).sessionKey, (await b.next(3000)).sessionKey];
+		assert.deepEqual(granted.sort(), ["A", "B"], "both slots of the resolved policy are usable at once");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("status reports queues without creating one for a keyless request", async () => {
+		const d = startDaemon();
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "status" });
+		assert.deepEqual((await c.next(3000)).queues, []);
+		c.close();
+		d.stop();
+	});
+});

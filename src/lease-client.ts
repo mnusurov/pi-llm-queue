@@ -12,6 +12,7 @@ export interface DaemonPaths {
 	socketPath: string;
 	daemonPath?: string;
 	configPath?: string;
+	modelsJsonPath?: string;
 }
 
 function socketAlive(socketPath: string): Promise<boolean> {
@@ -32,14 +33,20 @@ function socketAlive(socketPath: string): Promise<boolean> {
  * Start the daemon when nothing owns the socket. Detached spawn + lockfile PID;
  * a lockfile whose socket does not answer is stale and gets reclaimed.
  */
-export async function ensureDaemon({ socketPath, daemonPath, configPath }: DaemonPaths): Promise<void> {
+export async function ensureDaemon({ socketPath, daemonPath, configPath, modelsJsonPath }: DaemonPaths): Promise<void> {
 	if (!daemonPath) return;
 	if (await socketAlive(socketPath)) return;
 	const lockPath = `${socketPath}.pid`;
 	if (existsSync(lockPath)) unlinkSync(lockPath); // stale lockfile reclaim
 	const child = spawn(
 		process.execPath,
-		[daemonPath, "--socket", socketPath, ...(configPath ? ["--config", configPath] : [])],
+		[
+			daemonPath,
+			"--socket",
+			socketPath,
+			...(configPath ? ["--config", configPath] : []),
+			...(modelsJsonPath ? ["--models-json", modelsJsonPath] : []),
+		],
 		{ detached: true, stdio: "ignore" },
 	);
 	child.on("error", () => {});

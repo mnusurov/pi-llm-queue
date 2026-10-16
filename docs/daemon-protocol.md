@@ -7,9 +7,9 @@ JSON. Every message is one JSON object on a single line.
 
 | op        | fields                                        | response                                                        |
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `acquire` | `queueKey`, `sessionKey`, `role`, `group?`   | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
+| `acquire` | `queueKey`, `sessionKey`, `role`              | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
-| `renew`   | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
+| `renew`   | `queueKey`, `sessionKey`                     | `{"op":"ok"}` — keepalive; TTL expiry is #1 scope                |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
@@ -36,14 +36,20 @@ protocol does not change when they land.
 }
 ```
 
-Keys may be a baseUrl (daemon-side policy) or a provider name (the extension wraps that
-provider, declared in `models.json`, and its requests are queued under the model's baseUrl).
+Keys may be a baseUrl (the endpoint itself) or a provider name. The daemon resolves a
+provider-name key to that provider's `baseUrl` by reading `models.json` (passed as
+`--models-json`); a baseUrl key wins when both name the same endpoint. The extension wraps
+every provider named by a key plus every provider serving an endpoint named by a key, and
+queues its requests under the model's baseUrl.
 
 ## Client contract
 
 - The extension starts the daemon on demand: detached spawn, `<socket>.pid` lockfile, and
   reclaim when the socket does not answer.
 - Leases are per session (`sessionKey` is the pi session UUID), not per process.
+- Turn-based affinity: the extension acquires at `agent_start` and releases after the run
+  settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
+  at once. Requests outside a run (compaction, classifier, nested calls) queue for themselves.
 - Fail-open: daemon unreachable → the request goes through unqueued. A client whose daemon dies
   mid-wait is released to its request.
 - Recommended pi setting while queued requests queue up behind a long prefill:
@@ -51,6 +57,7 @@ provider, declared in `models.json`, and its requests are queued under the model
 
 ## Tests
 
-`make test` drives this seam only (`test/daemon.test.ts`, `test/lease-client.test.ts`) and never
-touches a real model endpoint. `node scripts/e2e-two-sessions.mjs` is the human-run tracer
-bullet: two real pi sessions against a stub endpoint, asserting zero request overlap.
+`make test` drives this seam (`test/daemon.test.ts`, `test/lease-client.test.ts`,
+`test/extension.test.ts`) and never touches a real model endpoint. `node
+scripts/e2e-two-sessions.mjs` is the human-run tracer bullet: two real pi sessions against a
+stub endpoint, asserting zero request overlap.

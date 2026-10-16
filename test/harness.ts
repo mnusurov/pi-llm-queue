@@ -15,12 +15,18 @@ export interface Daemon {
 	stop(): void;
 }
 
-export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }): Daemon {
+export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown): Daemon {
 	const dir = mkdtempSync(join(tmpdir(), "llm-queue-"));
 	const socketPath = join(dir, "queue.sock");
 	const configPath = join(dir, "config.json");
 	writeFileSync(configPath, JSON.stringify(config));
-	const proc = spawn(process.execPath, [DAEMON, "--socket", socketPath, "--config", configPath], { stdio: "ignore" });
+	const args = [DAEMON, "--socket", socketPath, "--config", configPath];
+	if (modelsJson !== undefined) {
+		const modelsJsonPath = join(dir, "models.json");
+		writeFileSync(modelsJsonPath, JSON.stringify(modelsJson));
+		args.push("--models-json", modelsJsonPath);
+	}
+	const proc = spawn(process.execPath, args, { stdio: "ignore" });
 	proc.unref();
 	return { socketPath, configPath, proc, stop: () => proc.kill() };
 }
