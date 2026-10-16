@@ -65,6 +65,50 @@ describe("daemon socket protocol", () => {
 		holder.close();
 		patient.close();
 	});
+
+	it("releases a held slot when its holder disconnects", async () => {
+		const holder = await connectClient(d.socketPath);
+		const waiter = await connectClient(d.socketPath);
+
+		holder.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "HH", role: "parent" });
+		assert.deepEqual(await holder.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "HH" });
+
+		waiter.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "W", role: "parent" });
+		await assert.rejects(waiter.next(200), /no message from daemon within/);
+
+		holder.close(); // disconnect while holding: the slot must free for W
+		assert.deepEqual(await waiter.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "W" });
+		waiter.close();
+	});
+
+	it("answers renew with ok", async () => {
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await c.next(3000), { op: "ok" });
+		c.close();
+	});
+
+	it("drops a queued request on cancel without granting it later", async () => {
+		const holder = await connectClient(d.socketPath);
+		const canceller = await connectClient(d.socketPath);
+		const next = await connectClient(d.socketPath);
+
+		holder.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "H", role: "parent" });
+		assert.deepEqual(await holder.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "H" });
+
+		canceller.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "X", role: "parent" });
+		next.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "N", role: "parent" });
+		await assert.rejects(next.next(200), /no message from daemon within/);
+
+		canceller.send({ op: "cancel", queueKey: QUEUE_KEY, sessionKey: "X" });
+		holder.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "H" });
+		// X was cancelled: N (queued after X) takes the slot, not X.
+		assert.deepEqual(await next.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "N" });
+		await assert.rejects(canceller.next(300), /no message from daemon within/);
+		holder.close();
+		canceller.close();
+		next.close();
+	});
 });
 
 describe("queue policy resolution", () => {

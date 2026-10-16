@@ -94,6 +94,19 @@ function handle(msg, conn) {
 			if (queues.has(msg.queueKey)) release(queues.get(msg.queueKey), msg.sessionKey);
 			send(conn, { op: "ok" });
 			return;
+		case "cancel": {
+			// Drop a queued request the client aborted; if it was already granted, release the slot.
+			const queue = queues.get(msg.queueKey);
+			if (queue) {
+				const w = queue.waiting.find((x) => x.sessionKey === msg.sessionKey && x.conn === conn);
+				if (w) {
+					remove(queue.waiting, w);
+					remove(conn.queued, w);
+				}
+				if (queue.holders.includes(msg.sessionKey)) release(queue, msg.sessionKey);
+			}
+			return;
+		}
 		case "renew":
 			send(conn, { op: "ok" });
 			return;
@@ -163,7 +176,15 @@ function start() {
 	});
 	probe.on("error", () => {
 		probe.destroy();
-		unlinkSync(socketPath);
+		// Reclaim the stale socket. If a concurrent daemon won the race, its unlink/listen
+		// wins: our unlink throws ENOENT (exit 0) or our listen hits EADDRINUSE (server
+		// "error" handler exits 0). Never guard with existsSync — that deletes the winner's
+		// live socket and split-brains the daemon.
+		try {
+			unlinkSync(socketPath);
+		} catch {
+			process.exit(0);
+		}
 		server.listen(socketPath);
 	});
 }

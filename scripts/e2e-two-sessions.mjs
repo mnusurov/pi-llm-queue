@@ -9,7 +9,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const repo = new URL("..", import.meta.url).pathname;
+const repo = decodeURIComponent(new URL("..", import.meta.url).pathname);
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-e2e-"));
 
 let inflight = 0;

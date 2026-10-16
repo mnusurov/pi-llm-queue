@@ -9,13 +9,16 @@ JSON. Every message is one JSON object on a single line.
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
 | `acquire` | `queueKey`, `sessionKey`, `role`              | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
+| `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
 | `renew`   | `queueKey`, `sessionKey`                     | `{"op":"ok"}` — keepalive; TTL expiry is #1 scope                |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
 request sits in the FIFO waiting list and the grant arrives when a slot frees. A client that
 disconnects while queued is dropped from the queue (that is how Esc aborts feel immediate), and
-a disconnect that held a slot releases it.
+a disconnect that held a slot releases it. A client can also send `cancel` to drop its own
+queued request without closing the socket — this is how Esc cancels a request that is still
+waiting for a slot.
 
 `role` is `parent` (interactive) or `child` (subagent). FIFO ordering is implemented today;
 parent-over-child priority and aging are spec'd in #1 and the field is carried now so the
@@ -49,7 +52,11 @@ queues its requests under the model's baseUrl.
 - Leases are per session (`sessionKey` is the pi session UUID), not per process.
 - Turn-based affinity: the extension acquires at `agent_start` and releases after the run
   settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
-  at once. Requests outside a run (compaction, classifier, nested calls) queue for themselves.
+  a held slot at once and cancels a still-queued request. Requests outside a run (compaction,
+  classifier, nested calls) queue for themselves.
+- Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
+  `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,
+  never buffered for a later request to consume.
 - Fail-open: daemon unreachable → the request goes through unqueued. A client whose daemon dies
   mid-wait is released to its request.
 - Recommended pi setting while queued requests queue up behind a long prefill:
@@ -58,6 +65,6 @@ queues its requests under the model's baseUrl.
 ## Tests
 
 `make test` drives this seam (`test/daemon.test.ts`, `test/lease-client.test.ts`,
-`test/extension.test.ts`) and never touches a real model endpoint. `node
-scripts/e2e-two-sessions.mjs` is the human-run tracer bullet: two real pi sessions against a
-stub endpoint, asserting zero request overlap.
+`test/extension.test.ts`, `test/extension-wrapper.test.ts`) and never touches a real model
+endpoint. `make e2e` (`node scripts/e2e-two-sessions.mjs`) is the human-run tracer bullet: two
+real pi sessions against a stub endpoint, asserting zero request overlap.

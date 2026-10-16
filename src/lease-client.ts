@@ -49,15 +49,20 @@ export async function ensureDaemon({ socketPath, daemonPath, configPath, modelsJ
 		],
 		{ detached: true, stdio: "ignore" },
 	);
-	child.on("error", () => {});
+	// A failed spawn (bad path, ENOENT) must surface, not vanish silently.
+	child.on("error", (error) => console.error(`pi-llm-queue: daemon spawn failed: ${error.message}`));
 	writeFileSync(lockPath, String(child.pid));
 	child.unref();
 }
 
+interface Pending {
+	match: (msg: any) => boolean;
+	resolve: (msg: any) => void;
+}
+
 export class LeaseClient {
 	private sock: Socket | null = null;
-	private msgs: any[] = [];
-	private waiter: ((msg: any) => void) | null = null;
+	private pending: Pending[] = [];
 
 	private socketPath: string;
 	private paths: DaemonPaths;
@@ -81,23 +86,19 @@ export class LeaseClient {
 					for (const line of chunk.toString().split("\n")) {
 						if (!line.trim()) continue;
 						const msg = JSON.parse(line);
-						if (this.waiter) {
-							const done = this.waiter;
-							this.waiter = null;
-							done(msg);
-						} else {
-							this.msgs.push(msg);
-						}
+						// Deliver by match; a reply with no matching request (e.g. a release "ok")
+						// is dropped, never buffered for a later acquire to consume.
+						const at = this.pending.findIndex((p) => p.match(msg));
+						if (at < 0) continue;
+						const [p] = this.pending.splice(at, 1);
+						p.resolve(msg);
 					}
 				});
-				// Daemon died while queued: release the caller to its request (fail-open).
+				// Daemon died while queued: release every caller to its request (fail-open).
 				sock.on("close", () => {
 					this.sock = null;
-					if (this.waiter) {
-						const done = this.waiter;
-						this.waiter = null;
-						done({ op: "fail-open" });
-					}
+					const wakers = this.pending.splice(0, this.pending.length);
+					for (const p of wakers) p.resolve({ op: "fail-open" });
 				});
 				this.sock = sock;
 				sock.unref(); // never keep pi's process alive through the lease connection
@@ -113,19 +114,40 @@ export class LeaseClient {
 		this.sock?.write(`${JSON.stringify(msg)}\n`);
 	}
 
-	private read(): Promise<any> {
-		return new Promise((resolve) => {
-			if (this.msgs.length) resolve(this.msgs.shift());
-			else this.waiter = resolve;
-		});
+	private read(match: (msg: any) => boolean): Promise<any> {
+		return new Promise((resolve) => this.pending.push({ match, resolve }));
 	}
 
-	/** Resolves when the slot is granted, or immediately when the daemon is unreachable. */
-	async acquire(queueKey: string, sessionKey: string, role: Role): Promise<void> {
+	/**
+	 * Resolves when the slot is granted, when the daemon is unreachable, or when
+	 * `signal` aborts (the queued request is cancelled at the daemon first).
+	 */
+	async acquire(queueKey: string, sessionKey: string, role: Role, signal?: AbortSignal): Promise<void> {
 		if (!(await this.connectDaemon())) return;
 		this.sock?.ref(); // a queued request must keep pi alive
 		this.send({ op: "acquire", queueKey, sessionKey, role });
-		await this.read();
+		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
+		const entry: Pending = { match: granted, resolve: () => {} };
+		const onAbort = () => {
+			const at = this.pending.indexOf(entry);
+			if (at >= 0) this.pending.splice(at, 1);
+			this.send({ op: "cancel", queueKey, sessionKey });
+			entry.resolve({ op: "aborted" });
+		};
+		await new Promise<void>((resolve) => {
+			entry.resolve = () => {
+				signal?.removeEventListener("abort", onAbort);
+				resolve();
+			};
+			this.pending.push(entry);
+			if (signal) {
+				if (signal.aborted) {
+					onAbort();
+					return;
+				}
+				signal.addEventListener("abort", onAbort, { once: true });
+			}
+		});
 		this.sock?.unref();
 	}
 
@@ -138,7 +160,7 @@ export class LeaseClient {
 		if (!(await this.connectDaemon())) return null;
 		this.sock?.ref();
 		this.send({ op: "status" });
-		const msg = await this.read();
+		const msg = await this.read((m) => m.op === "status");
 		this.sock?.unref();
 		return msg;
 	}

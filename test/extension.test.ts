@@ -16,4 +16,9 @@ describe("provider resolution", () => {
 	it("ignores queue keys naming no provider", () => {
 		assert.deepEqual(resolveQueueProviders({ "http://nowhere.test/v1": {} }, providers), []);
 	});
+
+	it("skips a queue key whose entry is disabled", () => {
+		const queues = { "http://gpu.test/v1": { maxStreams: 1 }, zen: { maxStreams: 3, enabled: false } };
+		assert.deepEqual(resolveQueueProviders(queues, providers), ["strata"]);
+	});
 });

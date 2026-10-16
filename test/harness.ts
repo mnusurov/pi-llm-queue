@@ -5,7 +5,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export const DAEMON = new URL("../src/daemon.js", import.meta.url).pathname;
+export const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
 export const QUEUE_KEY = "http://model.test/v1";
 
 export interface Daemon {
