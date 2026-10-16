@@ -117,6 +117,27 @@ describe("lease client", () => {
 		holder.close();
 	});
 
+	it("heartbeats keep a held lease alive past its TTL", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 400 }, queues: {} });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: 100 });
+		const b = new LeaseClient({ socketPath: d.socketPath });
+
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
+
+		await sleep(1500); // ~3.7 TTLs: A's heartbeat must keep its slot
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "heartbeats must keep A's lease");
+
+		a.release(QUEUE_KEY, "A");
+		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
 	it("cancels a queued acquire when the abort signal fires", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
 		await waitForDaemon(d.socketPath);

@@ -13,6 +13,8 @@ export interface DaemonPaths {
 	daemonPath?: string;
 	configPath?: string;
 	modelsJsonPath?: string;
+	/** Heartbeat period; must stay well under the daemon's leaseTtlMs. */
+	heartbeatMs?: number;
 }
 
 function socketAlive(socketPath: string): Promise<boolean> {
@@ -63,6 +65,7 @@ interface Pending {
 export class LeaseClient {
 	private sock: Socket | null = null;
 	private pending: Pending[] = [];
+	private heartbeat: ReturnType<typeof setInterval> | null = null;
 
 	private socketPath: string;
 	private paths: DaemonPaths;
@@ -102,6 +105,9 @@ export class LeaseClient {
 				});
 				this.sock = sock;
 				sock.unref(); // never keep pi's process alive through the lease connection
+				// Lease heartbeat: a live session must never lose its slot to the TTL.
+				this.heartbeat ??= setInterval(() => this.send({ op: "renew" }), this.paths.heartbeatMs ?? 10000);
+				this.heartbeat.unref();
 				return true;
 			} catch {
 				await sleep(50);
@@ -154,6 +160,11 @@ export class LeaseClient {
 	release(queueKey: string, sessionKey: string): void {
 		this.send({ op: "release", queueKey, sessionKey });
 		this.sock?.unref();
+	}
+
+	/** Activity beat: the holder is using the slot, so its idle/monopoly quanta restart. */
+	beat(queueKey: string, sessionKey: string): void {
+		this.send({ op: "renew", queueKey, sessionKey });
 	}
 
 	async status(): Promise<any> {

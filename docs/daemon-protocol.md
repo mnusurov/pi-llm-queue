@@ -10,7 +10,7 @@ JSON. Every message is one JSON object on a single line.
 | `acquire` | `queueKey`, `sessionKey`, `role`              | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
-| `renew`   | `queueKey`, `sessionKey`                     | `{"op":"ok"}` — keepalive; TTL expiry is #1 scope                |
+| `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` — keeps the lease alive; a beat also restarts the holder's switch quanta |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
@@ -24,6 +24,27 @@ waiting for a slot.
 parent-over-child priority and aging are spec'd in #1 and the field is carried now so the
 protocol does not change when they land.
 
+## Leases and session switches
+
+A grant is a **lease** with a TTL (`leaseTtlMs`, default 30 s). A live client keeps its leases
+alive with a bare `renew` heartbeat (the extension sends one every `leaseTtlMs / 3`, floor 1 s);
+a session that dies without heartbeating has its lease reclaimed by the daemon and the next
+waiter is granted.
+
+The slot is held per session across a whole run. A session switch happens only on:
+
+- **release** — the run settled (the extension releases 3 s after `agent_settled`, so a parent
+  woken by its child keeps the slot), the session shut down, the request aborted, or the socket died;
+- **idle quantum** (`idleQuantumMs`, default 120 s) — the holder sent no activity beat, i.e. made
+  no model request, for that long. Long tool executions stay covered: every request beats the lease;
+- **monopoly quantum** (`monopolyRequests` requests / `monopolyMs` seconds, default 12 / 180 s) —
+  a busy session is preempted so a waiting session gets its turn; the count resets on the next grant.
+
+Quanta are checked once a second and only evict when someone is waiting: an idle slot nobody
+wants is not worth a context switch. A keyed `renew` (activity beat) refreshes the TTL, restarts
+the idle quantum and counts one request toward the monopoly; re-`acquire`ing a slot the session
+already holds counts the same way.
+
 ## Queues and config
 
 `queueKey` is a provider `baseUrl`. Queues are created on first use from
@@ -31,7 +52,7 @@ protocol does not change when they land.
 
 ```json
 {
-  "defaults": { "maxStreams": 1 },
+  "defaults": { "maxStreams": 1, "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000 },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
     "zen": { "maxStreams": 3 }
@@ -53,7 +74,9 @@ queues its requests under the model's baseUrl.
 - Turn-based affinity: the extension acquires at `agent_start` and releases after the run
   settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
   a held slot at once and cancels a still-queued request. Requests outside a run (compaction,
-  classifier, nested calls) queue for themselves.
+  classifier, nested calls) queue for themselves. Every request the run makes beats its lease,
+  so the slot survives tool executions; the client heartbeats `renew` on a timer so a live
+  session never loses the slot to the TTL.
 - Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
   `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,
   never buffered for a later request to consume.

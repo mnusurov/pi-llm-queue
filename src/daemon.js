@@ -40,9 +40,16 @@ function policyFor(key) {
 
 function queueFor(key) {
 	if (!queues.has(key)) {
+		const policy = policyFor(key);
 		queues.set(key, {
 			queueKey: key,
-			maxStreams: policyFor(key).maxStreams ?? defaults.maxStreams ?? 1,
+			maxStreams: policy.maxStreams ?? defaults.maxStreams ?? 1,
+			// Session-switch knobs: a lease dies without heartbeats; a holder yields to a waiter
+			// when it goes idle, or when its monopoly quantum (N requests / M s) runs out.
+			ttlMs: policy.leaseTtlMs ?? defaults.leaseTtlMs ?? 30000,
+			idleMs: policy.idleQuantumMs ?? defaults.idleQuantumMs ?? 120000,
+			monopolyRequests: policy.monopolyRequests ?? defaults.monopolyRequests ?? 12,
+			monopolyMs: policy.monopolyMs ?? defaults.monopolyMs ?? 180000,
 			holders: [],
 			waiting: [],
 		});
@@ -50,12 +57,32 @@ function queueFor(key) {
 	return queues.get(key);
 }
 
+// A lease is the holder's record: TTL deadline, last model request, grant time, request count.
+// The same object lives in conn.leases, so a client heartbeat refreshes it in place.
+function newLease(queue, sessionKey, conn) {
+	const now = Date.now();
+	return { queueKey: queue.queueKey, sessionKey, conn, expires: now + queue.ttlMs, activeAt: now, grantedAt: now, requests: 0 };
+}
+
+function leaseOf(queue, sessionKey) {
+	return queue.holders.find((l) => l.sessionKey === sessionKey);
+}
+
+// A model request by the holder: restarts its idle quantum and counts toward its monopoly.
+function beat(lease, queue) {
+	const now = Date.now();
+	lease.expires = now + queue.ttlMs;
+	lease.activeAt = now;
+	lease.requests++;
+}
+
 function grantNext(queue) {
 	while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
 		const waiter = queue.waiting.shift();
-		queue.holders.push(waiter.sessionKey);
+		const lease = newLease(queue, waiter.sessionKey, waiter.conn);
+		queue.holders.push(lease);
 		remove(waiter.conn.queued, waiter);
-		waiter.conn.leases.push({ queueKey: queue.queueKey, sessionKey: waiter.sessionKey });
+		waiter.conn.leases.push(lease);
 		send(waiter.conn, { op: "granted", queueKey: queue.queueKey, sessionKey: waiter.sessionKey });
 	}
 }
@@ -66,22 +93,42 @@ function remove(list, item) {
 }
 
 function release(queue, sessionKey) {
-	const at = queue.holders.indexOf(sessionKey);
-	if (at >= 0) queue.holders.splice(at, 1);
+	const lease = leaseOf(queue, sessionKey);
+	if (lease) {
+		remove(queue.holders, lease);
+		remove(lease.conn.leases, lease);
+	}
 	grantNext(queue);
 }
+
+// Evict holders whose lease expired (crashed session) or whose switch quantum ran out,
+// and only when someone is waiting: an unmonopolised idle slot costs nobody anything.
+function sweep() {
+	const now = Date.now();
+	for (const queue of queues.values()) {
+		if (!queue.waiting.length) continue;
+		for (const lease of [...queue.holders]) {
+			if (now > lease.expires || now - lease.activeAt > queue.idleMs || lease.requests >= queue.monopolyRequests || now - lease.grantedAt > queue.monopolyMs)
+				release(queue, lease.sessionKey);
+		}
+	}
+}
+setInterval(sweep, 1000).unref();
 
 function handle(msg, conn) {
 	switch (msg.op) {
 		case "acquire": {
 			const queue = queueFor(msg.queueKey);
-			if (queue.holders.includes(msg.sessionKey)) {
+			const held = leaseOf(queue, msg.sessionKey);
+			if (held) {
+				beat(held, queue); // re-acquiring a held slot is a model request
 				send(conn, { op: "granted", queueKey: queue.queueKey, sessionKey: msg.sessionKey });
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
-				queue.holders.push(msg.sessionKey);
-				conn.leases.push({ queueKey: queue.queueKey, sessionKey: msg.sessionKey });
+				const lease = newLease(queue, msg.sessionKey, conn);
+				queue.holders.push(lease);
+				conn.leases.push(lease);
 				send(conn, { op: "granted", queueKey: queue.queueKey, sessionKey: msg.sessionKey });
 				return;
 			}
@@ -103,20 +150,27 @@ function handle(msg, conn) {
 					remove(queue.waiting, w);
 					remove(conn.queued, w);
 				}
-				if (queue.holders.includes(msg.sessionKey)) release(queue, msg.sessionKey);
+				if (leaseOf(queue, msg.sessionKey)) release(queue, msg.sessionKey);
 			}
 			return;
 		}
-		case "renew":
+		// Heartbeat (no keys): keep every lease of this connection alive.
+		// Keyed renew: an activity beat — the holder is using the slot, its quanta restart.
+		case "renew": {
+			for (const lease of conn.leases) {
+				if (msg.sessionKey && lease.sessionKey === msg.sessionKey && lease.queueKey === msg.queueKey) beat(lease, queueFor(lease.queueKey));
+				else lease.expires = Date.now() + queueFor(lease.queueKey).ttlMs;
+			}
 			send(conn, { op: "ok" });
 			return;
+		}
 		case "status":
 			send(conn, {
 				op: "status",
 				queues: [...queues.values()].map((q) => ({
 					queueKey: q.queueKey,
 					maxStreams: q.maxStreams,
-					holders: [...q.holders],
+					holders: q.holders.map((l) => l.sessionKey),
 					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role })),
 				})),
 			});

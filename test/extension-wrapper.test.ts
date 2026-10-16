@@ -156,6 +156,33 @@ describe("provider wrapper (queuedStream)", () => {
 			"R's lease was released on the error path",
 		);
 	});
+
+	it("beats the lease on every held request, retaining the slot across tool executions", async () => {
+		const a = makePi();
+		const b = makePi();
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "KEEP");
+		start(b, "STEAL");
+		await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its run
+
+		const stream = a.registered["stub"].streamSimple;
+		const sB = b.registered["stub"].streamSimple(model, {} as any); // queued behind A
+		const eB = firstEvent(sB);
+
+		// A keeps requesting (each request beats the lease) for ~2 idle quanta: B must not steal the slot.
+		for (let i = 0; i < 8; i++) {
+			await firstEvent(stream(model, {} as any));
+			await sleep(150);
+		}
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(700).then(() => "blocked")]),
+			"blocked",
+			"an active run keeps the slot while a session waits",
+		);
+		a.handlers["session_shutdown"][0]({}, ctxA);
+		await eB; // B proceeds once A releases
+	});
 });
 
 after(() => {
