@@ -13,6 +13,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 const SOCKET_PATH = process.env.PI_QUEUE_SOCKET || path.join(os.homedir(), ".pi", "agent", "llm-queue.sock");
 const LOCK_PATH = process.env.PI_QUEUE_LOCK || path.join(os.homedir(), ".pi", "agent", "llm-queue.lock");
@@ -27,6 +28,7 @@ const DEFAULTS = {
 };
 
 const startedAt = Date.now();
+const MAX_LINE_BYTES = 64 * 1024;
 let config = loadConfig();
 let leaseSeq = 0;
 let connSeq = 0;
@@ -36,21 +38,51 @@ let connSeq = 0;
 function loadConfig() {
 	try {
 		const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+		const providerBaseUrls = readProviderBaseUrls();
+		const queues = {};
+		for (const [key, entry] of Object.entries(raw.queues && typeof raw.queues === "object" ? raw.queues : {})) {
+			const resolved = normalizeKey(looksLikeUrl(key) ? key : (providerBaseUrls.get(key.toLowerCase()) ?? key));
+			queues[resolved] = { ...queues[resolved], ...entry };
+		}
 		return {
 			defaults: { ...DEFAULTS, ...(raw.defaults || {}) },
-			queues: raw.queues && typeof raw.queues === "object" ? raw.queues : {},
+			queues,
 		};
 	} catch {
 		return { defaults: { ...DEFAULTS }, queues: {} };
 	}
 }
 
+function looksLikeUrl(key) {
+	return /^[a-z][a-z0-9+.-]*:\/\//i.test(String(key).trim());
+}
+
+/** Provider name -> baseUrl, from pi's models.json, so config keys may name providers. */
+function readProviderBaseUrls() {
+	const map = new Map();
+	try {
+		const raw = JSON.parse(fs.readFileSync(path.join(path.dirname(CONFIG_PATH), "models.json"), "utf8"));
+		for (const [name, entry] of Object.entries(raw.providers ?? {})) {
+			if (entry && typeof entry.baseUrl === "string") map.set(name.toLowerCase(), entry.baseUrl);
+		}
+	} catch {
+		/* models.json absent */
+	}
+	return map;
+}
+
 function normalizeKey(key) {
-	return typeof key === "string" ? key.trim().replace(/\/+$/, "") : "";
+	if (typeof key !== "string") return "";
+	const trimmed = key.trim().replace(/\/+$/, "");
+	if (!trimmed) return "";
+	const match = /^([a-z][a-z0-9+.-]*):\/\/([^/]*)(.*)$/i.exec(trimmed);
+	if (!match) return trimmed.toLowerCase();
+	const [, scheme, authority, rest] = match;
+	return `${scheme}://${authority}${rest}`.toLowerCase();
 }
 
 function queueConfigFor(key) {
-	const entry = config.queues[key] || {};
+	const entry = config.queues[normalizeKey(key)] || {};
 	const num = (value, fallback) => {
 		const parsed = Number(value);
 		return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -94,6 +126,8 @@ function grantNext(queue) {
 		let index = queue.waiters.findIndex((waiter) => waiter.role !== "child");
 		if (index < 0) index = 0;
 		const [waiter] = queue.waiters.splice(index, 1);
+		const conn = conns.get(waiter.connId);
+		if (!conn) continue; // client gone: drop the waiter, slot stays free
 		const now = Date.now();
 		const leaseId = `lease-${++leaseSeq}`;
 		queue.holders.set(leaseId, {
@@ -108,9 +142,6 @@ function grantNext(queue) {
 		queue.grants += 1;
 		if (queue.lastGrantedSession && queue.lastGrantedSession !== waiter.sessionKey) queue.switches += 1;
 		queue.lastGrantedSession = waiter.sessionKey;
-		const conn = conns.get(waiter.connId);
-		if (!conn) continue;
-		conn.tokens.set(waiter.token, { queueKey: queue.key, leaseId });
 		send(conn, {
 			type: "resp",
 			token: waiter.token,
@@ -134,7 +165,7 @@ function releaseLease(queue, leaseId, reason) {
 	return true;
 }
 
-/** @type {Map<number, {id:number, sock:net.Socket, buf:string, tokens:Map<string,any>}>} */
+/** @type {Map<number, {id:number, sock:net.Socket, buf:string, decoder:StringDecoder}>} */
 const conns = new Map();
 
 function send(conn, msg) {
@@ -178,7 +209,6 @@ function handle(conn, msg) {
 			for (const holder of queue.holders.values()) {
 				if (holder.connId === conn.id && holder.sessionKey === sessionKey) {
 					holder.expiresAt = Date.now() + cfg.leaseTtlMs;
-					conn.tokens.set(msg.token, { queueKey: key, leaseId: holder.leaseId });
 					return send(conn, {
 						type: "resp",
 						token: msg.token,
@@ -194,7 +224,6 @@ function handle(conn, msg) {
 			}
 			const pending = queue.waiters.find((w) => w.connId === conn.id && w.sessionKey === sessionKey);
 			if (pending) {
-				conn.tokens.set(msg.token, { queueKey: key, pending: true });
 				return send(conn, {
 					type: "resp",
 					token: msg.token,
@@ -206,7 +235,6 @@ function handle(conn, msg) {
 			}
 			const waiter = { token: msg.token, connId: conn.id, sessionKey, role, group: msg.group, enqueuedAt: Date.now() };
 			queue.waiters.push(waiter);
-			conn.tokens.set(msg.token, { queueKey: key, pending: true });
 			send(conn, { type: "resp", token: msg.token, ok: true, state: "queued", position: queue.waiters.length - 1, holders: holderList(queue) });
 			return grantNext(queue);
 		}
@@ -215,7 +243,6 @@ function handle(conn, msg) {
 				const index = queue.waiters.findIndex((w) => w.connId === conn.id && w.token === msg.token);
 				if (index >= 0) queue.waiters.splice(index, 1);
 			}
-			conn.tokens.delete(msg.token);
 			return send(conn, { type: "resp", token: msg.token, ok: true, state: "cancelled" });
 		}
 		case "renew": {
@@ -251,14 +278,19 @@ function handle(conn, msg) {
 }
 
 function onConnection(sock) {
-	const conn = { id: ++connSeq, sock, buf: "", tokens: new Map() };
+	const conn = { id: ++connSeq, sock, buf: "", decoder: new StringDecoder("utf8") };
 	conns.set(conn.id, conn);
 	sock.on("data", (chunk) => {
-		conn.buf += chunk.toString("utf8");
+		conn.buf += conn.decoder.write(chunk);
 		let newline;
 		while ((newline = conn.buf.indexOf("\n")) >= 0) {
 			const line = conn.buf.slice(0, newline).trim();
 			conn.buf = conn.buf.slice(newline + 1);
+			if (line.length > MAX_LINE_BYTES) {
+				send(conn, { type: "resp", ok: false, error: "line too long" });
+				sock.destroy();
+				return;
+			}
 			if (!line) continue;
 			let msg;
 			try {
@@ -268,6 +300,10 @@ function onConnection(sock) {
 				continue;
 			}
 			handle(conn, msg);
+		}
+		if (conn.buf.length > MAX_LINE_BYTES) {
+			send(conn, { type: "resp", ok: false, error: "line too long" });
+			sock.destroy();
 		}
 	});
 	sock.on("close", () => {
@@ -293,16 +329,39 @@ function pidAlive(pid) {
 	}
 }
 
+/** Claim the lockfile atomically (O_EXCL). False when a live daemon holds it. */
 function claimLockfile() {
-	try {
-		const pid = Number(fs.readFileSync(LOCK_PATH, "utf8").trim());
-		if (pidAlive(pid)) return false;
-		fs.unlinkSync(LOCK_PATH);
-	} catch {
-		/* no lockfile */
+	for (let attempt = 0; attempt < 3; attempt++) {
+		try {
+			const fd = fs.openSync(LOCK_PATH, "wx");
+			fs.writeSync(fd, `${process.pid}\n`);
+			fs.closeSync(fd);
+			return true;
+		} catch (error) {
+			if (error.code !== "EEXIST") return false;
+			let pid = 0;
+			try {
+				pid = Number(fs.readFileSync(LOCK_PATH, "utf8").trim());
+			} catch {
+				continue;
+			}
+			if (pidAlive(pid)) return false;
+			try {
+				fs.unlinkSync(LOCK_PATH); // stale lock from a dead daemon
+			} catch {
+				/* raced with another claim */
+			}
+		}
 	}
-	fs.writeFileSync(LOCK_PATH, `${process.pid}\n`, "utf8");
-	return true;
+	return false;
+}
+
+function releaseLockfile() {
+	try {
+		if (fs.existsSync(LOCK_PATH) && Number(fs.readFileSync(LOCK_PATH, "utf8").trim()) === process.pid) fs.unlinkSync(LOCK_PATH);
+	} catch {
+		/* best effort */
+	}
 }
 
 function canConnect(socketPath) {
@@ -322,8 +381,14 @@ async function main() {
 		process.exit(0);
 	}
 	if (!claimLockfile()) process.exit(0);
+	if (await canConnect(SOCKET_PATH)) {
+		// A peer won the race between the first probe and the claim.
+		releaseLockfile();
+		process.exit(0);
+	}
 	try {
 		fs.mkdirSync(path.dirname(SOCKET_PATH), { recursive: true });
+		// Safe here: no live daemon answers this socket, so any file is stale.
 		if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH);
 	} catch {
 		/* best effort */
@@ -341,11 +406,7 @@ async function main() {
 	const cleanup = () => {
 		clearInterval(sweep);
 		server.close();
-		try {
-			if (fs.existsSync(LOCK_PATH) && Number(fs.readFileSync(LOCK_PATH, "utf8").trim()) === process.pid) fs.unlinkSync(LOCK_PATH);
-		} catch {
-			/* best effort */
-		}
+		releaseLockfile();
 		try {
 			if (fs.existsSync(SOCKET_PATH)) fs.unlinkSync(SOCKET_PATH);
 		} catch {

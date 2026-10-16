@@ -7,14 +7,16 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { after, describe, test } from "node:test";
-import { client, DAEMON_ENTRY, sleep, startTestDaemon, tempDir } from "./harness.ts";
+import { after, afterEach, describe, test } from "node:test";
+import { clientTracker, DAEMON_ENTRY, sleep, startTestDaemon, tempDir } from "./harness.ts";
 import { ensureDaemon, pidAlive, readLockfile, reclaimStaleLock } from "../src/lib/autostart.ts";
 import { LeaseClient } from "../src/lib/lease-client.ts";
 
 const ENDPOINT = "http://127.0.0.1:8003/v1";
 
 describe("fail-open", () => {
+	const tracker = clientTracker();
+	afterEach(() => tracker.closeAll());
 	test("acquire passes through when no daemon is listening", async () => {
 		const dir = tempDir();
 		const orphan = new LeaseClient(path.join(dir, "absent.sock"), { connectTimeoutMs: 200 });
@@ -29,7 +31,7 @@ describe("fail-open", () => {
 
 	test("a daemon that dies mid-session leaves the client passing through", async () => {
 		const daemon = await startTestDaemon({ config: { queues: { [ENDPOINT]: { maxStreams: 1 } } } });
-		const a = client(daemon.socketPath);
+		const a = tracker.make(daemon.socketPath);
 		const first = await a.acquire({ queueKey: ENDPOINT, sessionKey: "s1", role: "parent" });
 		assert.equal(first.granted, true);
 		await daemon.stop();
@@ -42,8 +44,8 @@ describe("fail-open", () => {
 	test("queueTimeoutMs degrades to a warning, not a hard failure", async () => {
 		const daemon = await startTestDaemon({ config: { queues: { [ENDPOINT]: { maxStreams: 1 } } } });
 		try {
-			const holder = client(daemon.socketPath);
-			const blocked = client(daemon.socketPath);
+			const holder = tracker.make(daemon.socketPath);
+			const blocked = tracker.make(daemon.socketPath);
 			const grant = await holder.acquire({ queueKey: ENDPOINT, sessionKey: "holder", role: "parent" });
 			assert.equal(grant.granted, true);
 			const result = await blocked.acquire({ queueKey: ENDPOINT, sessionKey: "blocked", role: "parent", timeoutMs: 400 });
@@ -58,9 +60,23 @@ describe("fail-open", () => {
 });
 
 describe("daemon autostart", () => {
+	const tracker = clientTracker();
+	afterEach(() => tracker.closeAll());
 	const dirs: string[] = [];
 	after(() => {
-		for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+		// ensureDaemon spawns detached daemons: stop them before removing their dirs
+		// so a test run never leaves orphan daemons behind.
+		for (const dir of dirs) {
+			const pid = readLockfile(path.join(dir, "queue.lock"));
+			if (pid !== null && pidAlive(pid)) {
+				try {
+					process.kill(pid, "SIGTERM");
+				} catch {
+					/* already gone */
+				}
+			}
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("ensureDaemon starts the daemon, writes a lockfile, and is idempotent", async () => {
@@ -79,7 +95,7 @@ describe("daemon autostart", () => {
 		assert.equal(second.running, true);
 		assert.equal(second.started, false, "a live daemon is reused, not restarted");
 
-		const probe = new LeaseClient(socketPath, { connectTimeoutMs: 300 });
+		const probe = tracker.make(socketPath, { connectTimeoutMs: 300 });
 		const pong = await probe.ping();
 		probe.close();
 		assert.ok(pong && pong.pid === pid, "socket is served by the lockfile pid");

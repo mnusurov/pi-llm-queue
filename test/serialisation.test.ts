@@ -4,23 +4,25 @@
  */
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
-import { client, sleep, startTestDaemon, type TestDaemon } from "./harness.ts";
+import { clientTracker, sleep, startTestDaemon, type TestDaemon } from "./harness.ts";
 
 const ENDPOINT = "http://127.0.0.1:8001/v1";
 
 describe("serialisation of two sessions (maxStreams 1)", () => {
+	const tracker = clientTracker();
 	let daemon: TestDaemon;
 
 	before(async () => {
 		daemon = await startTestDaemon({ config: { defaults: { maxStreams: 1 }, queues: { [ENDPOINT]: { maxStreams: 1 } } } });
 	});
 	after(async () => {
+		tracker.closeAll();
 		await daemon.stop();
 	});
 
 	test("second session waits while the first holds the slot, then takes over", async () => {
-		const a = client(daemon.socketPath);
-		const b = client(daemon.socketPath);
+		const a = tracker.make(daemon.socketPath);
+		const b = tracker.make(daemon.socketPath);
 		const grantOrder: string[] = [];
 
 		const grantA = await a.acquire({ queueKey: ENDPOINT, sessionKey: "session-a", role: "parent" });
@@ -61,8 +63,8 @@ describe("serialisation of two sessions (maxStreams 1)", () => {
 	});
 
 	test("a session keeps the slot across consecutive requests (turn-based affinity)", async () => {
-		const a = client(daemon.socketPath);
-		const b = client(daemon.socketPath);
+		const a = tracker.make(daemon.socketPath);
+		const b = tracker.make(daemon.socketPath);
 
 		const first = await a.acquire({ queueKey: ENDPOINT, sessionKey: "session-a2", role: "parent" });
 		assert.equal(first.granted, true);
@@ -88,9 +90,9 @@ describe("serialisation of two sessions (maxStreams 1)", () => {
 	test("maxStreams 2 grants two sessions at once and queues the third", async () => {
 		const wide = await startTestDaemon({ config: { defaults: { maxStreams: 2 }, queues: { [ENDPOINT]: { maxStreams: 2 } } } });
 		try {
-			const a = client(wide.socketPath);
-			const b = client(wide.socketPath);
-			const c = client(wide.socketPath);
+			const a = tracker.make(wide.socketPath);
+			const b = tracker.make(wide.socketPath);
+			const c = tracker.make(wide.socketPath);
 			const grantA = await a.acquire({ queueKey: ENDPOINT, sessionKey: "a", role: "parent" });
 			const grantB = await b.acquire({ queueKey: ENDPOINT, sessionKey: "b", role: "parent" });
 			assert.equal(grantA.granted, true);
@@ -114,8 +116,8 @@ describe("serialisation of two sessions (maxStreams 1)", () => {
 	});
 
 	test("a disconnected session's lease is reclaimed and handed to the next waiter", async () => {
-		const a = client(daemon.socketPath);
-		const b = client(daemon.socketPath);
+		const a = tracker.make(daemon.socketPath);
+		const b = tracker.make(daemon.socketPath);
 		const grantA = await a.acquire({ queueKey: ENDPOINT, sessionKey: "session-crashed", role: "parent" });
 		assert.equal(grantA.granted, true);
 		const pendingB = b.acquire({ queueKey: ENDPOINT, sessionKey: "session-survivor", role: "child" });

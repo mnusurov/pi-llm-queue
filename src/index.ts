@@ -5,45 +5,34 @@
  * per-session slot from the local daemon before it reaches the endpoint, and
  * autostart the daemon on session start. Fail-open everywhere.
  */
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	ProviderConfig,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
 	type Api,
 	type AssistantMessageEventStream,
-	createAssistantMessageEventStream,
 	type Model,
-	type SimpleStreamOptions,
-	type TranscriptContext,
+	createAssistantMessageEventStream,
 } from "@earendil-works/pi-ai/compat";
 import { streamSimple as openaiCompletionsStreamSimple } from "@earendil-works/pi-ai/api/openai-completions";
 import {
 	defaultConfigPath,
 	loadConfig,
 	resolveQueueKey,
-	resolveQueueSettings,
 	type ResolvedConfig,
-	type QueueSettings,
 } from "./lib/config.ts";
-import { LeaseClient, type Role } from "./lib/lease-client.ts";
+import { LeaseClient } from "./lib/lease-client.ts";
 import { ensureDaemon } from "./lib/autostart.ts";
-import {
-	acquireForRequest,
-	releaseLease,
-	resolveGroup,
-	resolveRole,
-	startHeartbeat,
-	stopHeartbeat,
-	type SessionLeaseState,
-} from "./lib/gate.ts";
+import { releaseLease, resolveGroup, resolveRole, stopHeartbeat, type SessionLeaseState } from "./lib/gate.ts";
+import { queuedStream, type PumpableStream, type WrapperModel } from "./lib/wrapper.ts";
 
 /** Grace period after a run settles: protects parent-woken-by-child wake chains. */
 const SETTLE_GRACE_MS = 3000;
 
-function errorStream(model: Model<Api>, message: string, aborted: boolean): AssistantMessageEventStream {
-	const stream = createAssistantMessageEventStream();
+function toPumpable(stream: AssistantMessageEventStream): PumpableStream {
+	return stream as unknown as PumpableStream;
+}
+
+function makeErrorStream(model: WrapperModel, message: string, aborted: boolean): PumpableStream {
+	const stream = toPumpable(createAssistantMessageEventStream());
 	stream.push({
 		type: "error",
 		reason: aborted ? "aborted" : "error",
@@ -55,8 +44,8 @@ function errorStream(model: Model<Api>, message: string, aborted: boolean): Assi
 			model: model.id,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			stopReason: aborted ? "aborted" : "error",
-			timestamp: Date.now(),
 			errorMessage: message,
+			timestamp: Date.now(),
 		},
 	});
 	stream.end();
@@ -64,9 +53,8 @@ function errorStream(model: Model<Api>, message: string, aborted: boolean): Assi
 }
 
 export default function (pi: ExtensionAPI): void {
-	const { config: initialConfig, error } = loadConfig(defaultConfigPath());
-	let config: ResolvedConfig = initialConfig;
-	if (error) queueMicrotask(() => pi.on("session_start", (_e, ctx) => ctx.ui.notify(`llm-queue: ${error}`, "warning")));
+	const loaded = loadConfig(defaultConfigPath());
+	let config: ResolvedConfig = loaded.config;
 
 	const state: SessionLeaseState = { sessionKey: "", role: resolveRole(), group: resolveGroup() };
 	const client = new LeaseClient(undefined, {
@@ -80,6 +68,8 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
+	let notifyCtx: ExtensionContext | undefined;
+	const warn = (message: string) => notifyCtx?.ui.notify(message, "warning");
 	let daemonChecked = false;
 	let releaseTimer: NodeJS.Timeout | undefined;
 
@@ -89,62 +79,33 @@ export default function (pi: ExtensionAPI): void {
 			releaseTimer = undefined;
 		}
 	};
-
 	const releaseNow = () => {
 		cancelScheduledRelease();
 		void releaseLease({ client, state });
 	};
 
-	function queueKeyFor(model: Model<Api>): string | null {
-		return resolveQueueKey(config, model.provider, model.baseUrl);
-	}
+	const streamSimple: NonNullable<ProviderConfig["streamSimple"]> = (model, context, options) =>
+		queuedStream(
+			{
+				client,
+				state,
+				config,
+				delegate: (wrapped, ctx, opts) =>
+					toPumpable(openaiCompletionsStreamSimple(wrapped as Model<"openai-completions">, ctx as never, opts as never)),
+				createStream: () => toPumpable(createAssistantMessageEventStream()),
+				errorStream: makeErrorStream,
+				onWarn: warn,
+			},
+			{ api: model.api, provider: model.provider, id: model.id, baseUrl: model.baseUrl },
+			context,
+			options,
+		) as unknown as AssistantMessageEventStream;
 
-	function settingsFor(model: Model<Api>): QueueSettings | null {
-		return resolveQueueSettings(config, model.provider, model.baseUrl);
-	}
-
-	function makeStreamSimple(): NonNullable<ProviderConfig["streamSimple"]> {
-		return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions) => {
-			if (model.api !== "openai-completions") {
-				return errorStream(model, `pi-llm-queue: unsupported api ${model.api}`, false);
-			}
-			const queueKey = queueKeyFor(model);
-			const settings = settingsFor(model);
-			if (!queueKey || !settings) {
-				return openaiCompletionsStreamSimple(model as Model<"openai-completions">, context, options);
-			}
-			const stream = createAssistantMessageEventStream();
-			void (async () => {
-				try {
-					const grant = await acquireForRequest(
-						{ client, state, settings, queueKey, onWarn: (message) => ctxNotify(message, "warning") },
-						options?.signal,
-					);
-					if (!grant.granted) {
-						const aborted = errorStream(model, "pi-llm-queue: request aborted while queued", true);
-						for await (const event of aborted) stream.push(event);
-						stream.end();
-						return;
-					}
-					startHeartbeat(state, client, Math.max(1000, Math.floor(settings.leaseTtlMs / 3)));
-					const inner = openaiCompletionsStreamSimple(model as Model<"openai-completions">, context, options);
-					for await (const event of inner) stream.push(event);
-					stream.end();
-				} catch (inner) {
-					const failed = errorStream(model, `pi-llm-queue: ${(inner as Error).message}`, false);
-					for await (const event of failed) stream.push(event);
-					stream.end();
-				}
-			})();
-			return stream;
-		};
-	}
-
-	let notifyCtx: ExtensionContext | undefined;
-	function ctxNotify(message: string, level: "info" | "warning" | "error"): void {
-		notifyCtx?.ui.notify(message, level);
-	}
-
+	/**
+	 * Wrap every queued provider whose models speak openai-completions.
+	 * Providers owned by another extension (native provider, OAuth login flow)
+	 * are left alone: a legacy-config registration would replace their base.
+	 */
 	function registerWrappers(ctx: ExtensionContext): void {
 		const providers = new Map<string, { baseUrl?: string; apis: Set<string> }>();
 		for (const model of ctx.modelRegistry.getAll()) {
@@ -156,17 +117,19 @@ export default function (pi: ExtensionAPI): void {
 		for (const [provider, entry] of providers) {
 			if (!entry.apis.has("openai-completions")) continue;
 			if (!resolveQueueKey(config, provider, entry.baseUrl)) continue;
-			pi.registerProvider(provider, { api: "openai-completions", streamSimple: makeStreamSimple() });
+			if (ctx.modelRegistry.getRegisteredNativeProvider(provider)) continue;
+			if (ctx.modelRegistry.getRegisteredProviderConfig(provider)?.oauth) continue;
+			pi.registerProvider(provider, { api: "openai-completions", streamSimple });
 		}
 	}
 
-	pi.on("session_start", async (event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		notifyCtx = ctx;
+		if (loaded.error) ctx.ui.notify(`llm-queue: ${loaded.error}`, "warning");
 		state.sessionKey = ctx.sessionManager.getSessionId();
 		state.role = resolveRole();
 		state.group = resolveGroup();
-		const reloaded = loadConfig(defaultConfigPath());
-		config = reloaded.config;
+		config = loadConfig(defaultConfigPath()).config;
 		registerWrappers(ctx);
 		if (!daemonChecked) {
 			daemonChecked = true;
@@ -210,8 +173,7 @@ export default function (pi: ExtensionAPI): void {
 				const holders = queue.holders.map((holder) => `${holder.sessionKey} (${holder.role})`).join(", ") || "none";
 				return `${queue.key}\n  slot: ${holders}\n  waiting: parent ${queue.waiting.parent}, child ${queue.waiting.child}\n  switches: ${queue.switches}, grants: ${queue.grants}`;
 			});
-			const role: Role = state.role;
-			const header = `pi-llm-queue — session ${state.sessionKey || "?"} as ${role}${state.leaseId ? ` holds ${state.leaseId}` : ""}`;
+			const header = `pi-llm-queue — session ${state.sessionKey || "?"} as ${state.role}${state.leaseId ? ` holds ${state.leaseId}` : ""}`;
 			ctx.ui.notify(lines.length ? `${header}\n${lines.join("\n")}` : `${header}\n  no queues`, "info");
 		},
 	});

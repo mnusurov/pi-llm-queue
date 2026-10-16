@@ -4,9 +4,17 @@
  * One client per pi session. Grants are per session lease, so a session's
  * consecutive requests keep the same slot (cache-warm append-only prefix).
  * Transport failure degrades fail-open: requests pass through unqueued.
+ *
+ * A token can produce several messages (an `acquire` answers `queued` first,
+ * then `granted` later — sometimes in the same socket chunk), so handlers stay
+ * registered until the exchange reaches a terminal state.
  */
 import net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import { defaultSocketPath } from "./config.ts";
+
+const MAX_LINE_BYTES = 64 * 1024;
+const REQUEST_TIMEOUT_MS = 2000;
 
 export type Role = "parent" | "child";
 
@@ -31,7 +39,7 @@ export interface QueueStatus {
 	grants: number;
 }
 
-interface Msg {
+export interface Msg {
 	type?: string;
 	token?: string;
 	ok?: boolean;
@@ -46,12 +54,15 @@ export interface LeaseClientOptions {
 	onDisconnect?: () => void;
 }
 
+type Handler = (msg: Msg | null) => void;
+
 export class LeaseClient {
 	readonly socketPath: string;
 	private socket: net.Socket | null = null;
 	private buffer = "";
+	private decoder = new StringDecoder("utf8");
 	private seq = 0;
-	private pending = new Map<string, (msg: Msg | null) => void>();
+	private handlers = new Map<string, Handler>();
 	private closed = false;
 	private readonly failOpen: boolean;
 	private readonly connectTimeoutMs: number;
@@ -66,15 +77,14 @@ export class LeaseClient {
 
 	private dispatch(msg: Msg | null) {
 		if (!msg) {
-			for (const resolve of this.pending.values()) resolve(null);
-			this.pending.clear();
+			const handlers = [...this.handlers.values()];
+			this.handlers.clear();
+			for (const handler of handlers) handler(null);
 			this.options.onDisconnect?.();
 			return;
 		}
-		if (msg.token && this.pending.has(msg.token)) {
-			const resolve = this.pending.get(msg.token)!;
-			this.pending.delete(msg.token);
-			resolve(msg);
+		if (msg.token && this.handlers.has(msg.token)) {
+			this.handlers.get(msg.token)!(msg);
 			return;
 		}
 		if (msg.type === "lease_expired" && typeof msg.leaseId === "string") {
@@ -92,14 +102,15 @@ export class LeaseClient {
 				clearTimeout(timer);
 				resolve(value);
 			};
+			const sock = net.connect(this.socketPath);
 			const timer = setTimeout(() => {
 				sock.destroy();
 				settle(false);
 			}, this.connectTimeoutMs);
-			const sock = net.connect(this.socketPath);
 			sock.once("connect", () => {
 				this.socket = sock;
 				this.buffer = "";
+				this.decoder = new StringDecoder("utf8");
 				sock.on("data", (chunk) => this.onData(chunk));
 				sock.on("close", () => {
 					if (this.socket === sock) {
@@ -118,11 +129,15 @@ export class LeaseClient {
 	}
 
 	private onData(chunk: Buffer) {
-		this.buffer += chunk.toString("utf8");
+		this.buffer += this.decoder.write(chunk);
 		let newline: number;
 		while ((newline = this.buffer.indexOf("\n")) >= 0) {
 			const line = this.buffer.slice(0, newline).trim();
 			this.buffer = this.buffer.slice(newline + 1);
+			if (Buffer.byteLength(line, "utf8") > MAX_LINE_BYTES) {
+				this.socket?.destroy();
+				return;
+			}
 			if (!line) continue;
 			try {
 				this.dispatch(JSON.parse(line) as Msg);
@@ -138,21 +153,21 @@ export class LeaseClient {
 		return true;
 	}
 
-	private request(msg: Msg, timeoutMs?: number): Promise<Msg | null> {
+	/** One request, one answer. Resolves null on transport failure or timeout. */
+	private request(msg: Msg, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<Msg | null> {
 		return new Promise((resolve) => {
 			const token = msg.token ?? `t${++this.seq}`;
-			const payload = { ...msg, token };
 			let settled = false;
-			const settle = (value: Msg | null) => {
+			const finish = (value: Msg | null) => {
 				if (settled) return;
 				settled = true;
-				if (timer) clearTimeout(timer);
-				this.pending.delete(token);
+				clearTimeout(timer);
+				this.handlers.delete(token);
 				resolve(value);
 			};
-			this.pending.set(token, settle);
-			const timer = timeoutMs ? setTimeout(() => settle(null), timeoutMs) : null;
-			if (!this.write(payload)) settle(null);
+			this.handlers.set(token, (incoming) => finish(incoming));
+			const timer = setTimeout(() => finish(null), timeoutMs);
+			if (!this.write({ ...msg, token })) finish(null);
 		});
 	}
 
@@ -168,84 +183,115 @@ export class LeaseClient {
 		signal?: AbortSignal;
 		timeoutMs?: number | null;
 	}): Promise<LeaseGrant> {
-		if (this.closed) return { granted: true, failOpen: true };
-		const connected = await this.ensureConnected();
-		if (!connected) return { granted: true, failOpen: this.failOpen };
+		if (this.closed) return { granted: this.failOpen, failOpen: true };
+		if (!(await this.ensureConnected())) return { granted: this.failOpen, failOpen: true };
+
 		const token = `t${++this.seq}`;
-		const ack = await this.request(
-			{
-				type: "acquire",
-				token,
-				queueKey: args.queueKey,
-				sessionKey: args.sessionKey,
-				role: args.role,
-				...(args.group ? { group: args.group } : {}),
-			},
-			2000,
-		);
-		if (!ack || ack.ok === false) return { granted: true, failOpen: this.failOpen };
-		if (ack.state === "granted") return { granted: true, leaseId: ack.leaseId as string | undefined, position: 0 };
-		const position = typeof ack.position === "number" ? ack.position : 0;
-		return new Promise((resolve) => {
-			let settled = false;
-			const cleanup = () => {
-				if (settled) return;
-				settled = true;
-				this.pending.delete(token);
-				if (timer) clearTimeout(timer);
-				args.signal?.removeEventListener("abort", onAbort);
-			};
-			const settle = (grant: LeaseGrant) => {
-				cleanup();
-				resolve(grant);
-			};
-			this.pending.set(token, (msg) => {
-				if (!msg) settle({ granted: true, failOpen: this.failOpen });
-				else if (msg.state === "granted") settle({ granted: true, leaseId: msg.leaseId as string | undefined, position: 0 });
-				else if (msg.state === "cancelled") settle({ granted: false, aborted: true });
-				else settle({ granted: true, failOpen: this.failOpen });
-			});
-			const timer =
-				args.timeoutMs && args.timeoutMs > 0
-					? setTimeout(() => {
-							this.write({ type: "cancel", token });
-							settle({ granted: true, failOpen: this.failOpen, timedOut: true, position });
-						}, args.timeoutMs)
-					: null;
-			const onAbort = () => {
-				this.write({ type: "cancel", token });
-				settle({ granted: false, aborted: true });
-			};
-			if (args.signal) {
-				if (args.signal.aborted) onAbort();
-				else args.signal.addEventListener("abort", onAbort, { once: true });
+		let settleAck: (msg: Msg | null) => void = () => undefined;
+		let settleGrant: (grant: LeaseGrant) => void = () => undefined;
+		const ack = new Promise<Msg | null>((resolve) => (settleAck = resolve));
+		const grant = new Promise<LeaseGrant>((resolve) => (settleGrant = resolve));
+
+		const finish = () => {
+			this.handlers.delete(token);
+			if (timer) clearTimeout(timer);
+			args.signal?.removeEventListener("abort", onAbort);
+		};
+		const handler: Handler = (msg) => {
+			if (!msg) {
+				settleAck(null);
+				settleGrant({ granted: this.failOpen, failOpen: true });
+				finish();
+				return;
 			}
-		});
+			if (msg.state === "queued") {
+				settleAck(msg);
+				return; // keep listening for the grant
+			}
+			if (msg.state === "granted") {
+				settleAck(msg);
+				settleGrant({ granted: true, leaseId: msg.leaseId as string | undefined, position: 0 });
+				finish();
+				return;
+			}
+			if (msg.state === "cancelled") {
+				settleGrant({ granted: false, aborted: true });
+				finish();
+				return;
+			}
+			settleAck(msg);
+			settleGrant({ granted: this.failOpen, failOpen: true });
+			finish();
+		};
+		this.handlers.set(token, handler);
+
+		const grantTimeoutMs = args.timeoutMs && args.timeoutMs > 0 ? args.timeoutMs : null;
+		const timer = grantTimeoutMs
+			? setTimeout(() => {
+					this.write({ type: "cancel", token });
+					settleAck({ state: "timeout" });
+					settleGrant({ granted: this.failOpen, failOpen: true, timedOut: true });
+					finish();
+				}, grantTimeoutMs)
+			: null;
+		const onAbort = () => {
+			this.write({ type: "cancel", token });
+			settleGrant({ granted: false, aborted: true });
+			finish();
+		};
+		if (args.signal) {
+			if (args.signal.aborted) onAbort();
+			else args.signal.addEventListener("abort", onAbort, { once: true });
+		}
+
+		if (!this.write({ type: "acquire", token, queueKey: args.queueKey, sessionKey: args.sessionKey, role: args.role, ...(args.group ? { group: args.group } : {}) })) {
+			settleAck(null);
+			settleGrant({ granted: this.failOpen, failOpen: true });
+			finish();
+		}
+
+		const first = await Promise.race([ack, new Promise<Msg | null>((resolve) => setTimeout(() => resolve(null), REQUEST_TIMEOUT_MS))]);
+		if (first?.state === "granted") return { granted: true, leaseId: first.leaseId as string | undefined, position: 0 };
+		if (first?.state !== "queued") {
+			settleGrant({ granted: this.failOpen, failOpen: true });
+			finish();
+			return { granted: this.failOpen, failOpen: true };
+		}
+		const position = typeof first.position === "number" ? first.position : 0;
+		const result = await grant;
+		return { ...result, position: result.position ?? position };
 	}
 
 	async renew(leaseId: string): Promise<boolean> {
 		if (this.closed || !this.socket) return false;
-		const resp = await this.request({ type: "renew", leaseId }, 2000);
+		const resp = await this.request({ type: "renew", leaseId });
 		return !!resp && resp.ok === true && resp.state === "renewed";
 	}
 
 	async release(leaseId: string): Promise<void> {
 		if (this.closed || !this.socket) return;
-		await this.request({ type: "release", leaseId }, 2000);
+		await this.request({ type: "release", leaseId });
 	}
 
 	async status(): Promise<QueueStatus[] | null> {
 		if (this.closed) return null;
 		if (!(await this.ensureConnected())) return null;
-		const resp = await this.request({ type: "status" }, 2000);
+		const resp = await this.request({ type: "status" });
 		if (!resp || resp.ok === false || !Array.isArray(resp.queues)) return null;
 		return resp.queues as QueueStatus[];
+	}
+
+	/** Ask the daemon to re-read its config file (hot-reload). */
+	async reload(): Promise<boolean> {
+		if (this.closed || !this.socket) return false;
+		const resp = await this.request({ type: "reload" });
+		return !!resp && resp.ok === true && resp.state === "reloaded";
 	}
 
 	async ping(): Promise<{ pid: number; uptimeMs: number } | null> {
 		if (this.closed) return null;
 		if (!(await this.ensureConnected())) return null;
-		const resp = await this.request({ type: "ping" }, 2000);
+		const resp = await this.request({ type: "ping" });
 		if (!resp || resp.ok === false) return null;
 		return { pid: Number(resp.pid), uptimeMs: Number(resp.uptimeMs) };
 	}

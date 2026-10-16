@@ -68,6 +68,14 @@ provider names resolved to their baseUrl; baseUrl entries win on collision.
 `httpIdleTimeoutMs: 900000` so queue wait plus long prefill never trips pi's
 HTTP idle timeout.
 
+Accepted today by the daemon: `maxStreams`, `enabled`, `failOpen`, `leaseTtlMs`.
+Accepted by the client: `queueTimeoutMs`. Parsed but not yet acted on (tracked
+by later tickets): `policy`, `agingAfterSlots`, `agingAfterMs` (#4 aging),
+`blockSubagentLaunch` (#6 subagent-launch hook), `daemonIdleExitMs` (#8
+idle-exit). The daemon re-reads config on a `reload` request; a file watcher
+for automatic hot-reload is #5. `failOpen: false` makes a daemon outage fail
+the request instead of passing it through.
+
 Role contract (no dependency on any subagent extension): `PI_QUEUE_ROLE=child|parent`
 wins over the `PI_SUBAGENT_CHILD` hint (read as an env string); `PI_QUEUE_GROUP`
 groups sessions.

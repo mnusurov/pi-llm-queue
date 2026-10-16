@@ -4,23 +4,25 @@
  */
 import assert from "node:assert/strict";
 import { after, before, describe, test } from "node:test";
-import { client, sleep, startTestDaemon, type TestDaemon } from "./harness.ts";
+import { clientTracker, sleep, startTestDaemon, type TestDaemon } from "./harness.ts";
 
 const ENDPOINT = "http://127.0.0.1:8002/v1";
 
 describe("lease TTL reclaim", () => {
+	const tracker = clientTracker();
 	let daemon: TestDaemon;
 
 	before(async () => {
 		daemon = await startTestDaemon({ config: { defaults: { maxStreams: 1, leaseTtlMs: 1500 }, queues: { [ENDPOINT]: { leaseTtlMs: 1500 } } } });
 	});
 	after(async () => {
+		tracker.closeAll();
 		await daemon.stop();
 	});
 
 	test("an un-renewed lease expires and the next waiter is granted", async () => {
-		const holder = client(daemon.socketPath);
-		const waiter = client(daemon.socketPath);
+		const holder = tracker.make(daemon.socketPath);
+		const waiter = tracker.make(daemon.socketPath);
 		// Simulate a session that acquired a slot and died: no renew, no release.
 		const grant = await holder.acquire({ queueKey: ENDPOINT, sessionKey: "dead-session", role: "parent" });
 		assert.equal(grant.granted, true);
@@ -46,7 +48,7 @@ describe("lease TTL reclaim", () => {
 	});
 
 	test("renewing a lease keeps the slot alive past the TTL", async () => {
-		const a = client(daemon.socketPath);
+		const a = tracker.make(daemon.socketPath);
 		const grant = await a.acquire({ queueKey: ENDPOINT, sessionKey: "alive-session", role: "parent" });
 		assert.equal(grant.granted, true);
 		const start = Date.now();

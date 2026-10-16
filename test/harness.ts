@@ -28,12 +28,13 @@ export function tempDir(prefix = "pi-llm-queue-test-"): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
 
-export async function startTestDaemon(options: { config?: Record<string, unknown>; dir?: string } = {}): Promise<TestDaemon> {
+export async function startTestDaemon(options: { config?: Record<string, unknown>; modelsJson?: Record<string, unknown>; dir?: string } = {}): Promise<TestDaemon> {
 	const dir = options.dir ?? tempDir();
 	const socketPath = path.join(dir, "queue.sock");
 	const lockPath = path.join(dir, "queue.lock");
 	const configPath = path.join(dir, "queue.json");
 	fs.writeFileSync(configPath, JSON.stringify(options.config ?? {}), "utf8");
+	if (options.modelsJson) fs.writeFileSync(path.join(dir, "models.json"), JSON.stringify(options.modelsJson), "utf8");
 	const child: ChildProcess = spawn(process.execPath, [DAEMON_ENTRY], {
 		cwd: dir,
 		env: { ...process.env, PI_QUEUE_SOCKET: socketPath, PI_QUEUE_LOCK: lockPath, PI_QUEUE_CONFIG: configPath },
@@ -53,8 +54,19 @@ export async function startTestDaemon(options: { config?: Record<string, unknown
 				configPath,
 				pid: pong.pid,
 				stop: async () => {
-					if (!child.killed) child.kill("SIGTERM");
-					await new Promise((resolve) => child.once("exit", resolve));
+					if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
+					await new Promise<void>((resolve) => {
+						const timer = setTimeout(resolve, 2000);
+						if (child.exitCode !== null) {
+							clearTimeout(timer);
+							resolve();
+							return;
+						}
+						child.once("exit", () => {
+							clearTimeout(timer);
+							resolve();
+						});
+					});
 					fs.rmSync(dir, { recursive: true, force: true });
 				},
 			};
@@ -67,4 +79,22 @@ export async function startTestDaemon(options: { config?: Record<string, unknown
 
 export function client(socketPath: string, options?: ConstructorParameters<typeof LeaseClient>[1]): LeaseClient {
 	return new LeaseClient(socketPath, options);
+}
+
+/**
+ * Tracks clients so a failing or timing-out test cannot leave open sockets
+ * that keep the test process alive. Call closeAll() in `after`.
+ */
+export function clientTracker(): { make: (socketPath: string, options?: ConstructorParameters<typeof LeaseClient>[1]) => LeaseClient; closeAll: () => void } {
+	const created: LeaseClient[] = [];
+	return {
+		make: (socketPath, options) => {
+			const instance = new LeaseClient(socketPath, options);
+			created.push(instance);
+			return instance;
+		},
+		closeAll: () => {
+			for (const instance of created.splice(0)) instance.close();
+		},
+	};
 }
