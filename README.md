@@ -29,5 +29,6 @@ queues.
 - Config: `~/.pi/agent/llm-queue.json`, hot-reload.
 
 Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
-provider wrapper with turn-based lease, daemon autostart, fail-open. Priority tiers, aging,
-lease TTL, `blockSubagentLaunch`, `/queue` and the TUI indicator are #1 scope, not built.
+provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and
+the session-switch quanta (release / idle / monopoly) are implemented (#3). Priority tiers,
+aging, `blockSubagentLaunch`, `/queue` and the TUI indicator are #1 scope, not built.

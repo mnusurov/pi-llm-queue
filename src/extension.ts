@@ -62,13 +62,17 @@ export function resolveQueueProviders(
 
 export default function (pi: ExtensionAPI) {
 	const modelsJson = loadJson(MODELS_JSON_PATH).providers ?? {};
-	const queues = (loadJson(CONFIG_PATH).queues ?? {}) as Record<string, QueueEntry>;
+	const config = loadJson(CONFIG_PATH);
+	const queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+	// Heartbeat at a third of the lease TTL (floor 1 s): a live session never loses its slot.
+	const heartbeatMs = Math.max(1000, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
 
 	const lease = new LeaseClient({
 		socketPath: SOCKET_PATH,
 		daemonPath: DAEMON_PATH,
 		configPath: CONFIG_PATH,
 		modelsJsonPath: MODELS_JSON_PATH,
+		heartbeatMs,
 	});
 	const role: Role = process.env.PI_QUEUE_ROLE === "child" ? "child" : "parent";
 
@@ -99,7 +103,9 @@ export default function (pi: ExtensionAPI) {
 		(async () => {
 			try {
 				// Requests outside a run (compaction, classifier, nested calls) queue for themselves.
-				if (!held) await lease.acquire(queueKey, sessionKey, role);
+				// A held request beats its lease: the run keeps the slot across tool executions.
+				if (held) lease.beat(queueKey, sessionKey);
+				else await lease.acquire(queueKey, sessionKey, role);
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
 				for await (const event of impl.streamSimple(model, context, options)) out.push(event);

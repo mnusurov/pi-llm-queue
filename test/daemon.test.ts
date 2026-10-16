@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { connectClient, startDaemon, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { connectClient, sleep, startDaemon, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -108,6 +108,148 @@ describe("daemon socket protocol", () => {
 		holder.close();
 		canceller.close();
 		next.close();
+	});
+});
+
+// Lease lifecycle: TTL reclaim, heartbeat, and the session-switch quanta. Asserted through
+// the socket seam only. Daemons/clients are registered for cleanup so a failing assert
+// cannot leave them alive and hang the runner.
+describe("lease lifecycle and session switch", () => {
+	const daemons: Daemon[] = [];
+	const clients: Client[] = [];
+
+	const startQuanta = (quanta: Record<string, number>) => {
+		const d = startDaemon({
+			defaults: { maxStreams: 1, leaseTtlMs: 60000, idleQuantumMs: 60000, monopolyRequests: 1000, monopolyMs: 60000, ...quanta },
+			queues: {},
+		});
+		daemons.push(d);
+		return d;
+	};
+	const open = async (d: Daemon) => {
+		const c = await connectClient(d.socketPath);
+		clients.push(c);
+		return c;
+	};
+	const acquire = (c: Client, sessionKey: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
+	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+
+	after(() => {
+		for (const c of clients) c.close();
+		for (const d of daemons) d.stop();
+	});
+
+	it("reclaims a crashed session's lease after the TTL and grants the next waiter", async () => {
+		const d = startQuanta({ leaseTtlMs: 300 });
+		const a = await open(d); // live socket, abandoned lease: never renews
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+		await assert.rejects(b.next(300), /no message from daemon within/);
+
+		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("keeps a lease alive while its client heartbeats, and reclaims it when heartbeats stop", async () => {
+		const d = startQuanta({ leaseTtlMs: 400 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+
+		for (let i = 0; i < 10; i++) {
+			await sleep(150); // ~3.7 TTLs of heartbeats
+			a.send({ op: "renew" });
+		}
+		await assert.rejects(b.next(300), /no message from daemon within/, "heartbeats keep A's slot");
+
+		for (let i = 0; i < 6; i++) await sleep(150); // heartbeats stop: the TTL reclaims
+		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("idle quantum: a holder that stops requesting yields the slot to a waiter", async () => {
+		const d = startQuanta({ idleQuantumMs: 300 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("activity beats retain the slot across a long tool execution (no idle eviction)", async () => {
+		const d = startQuanta({ idleQuantumMs: 400 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+
+		for (let i = 0; i < 12; i++) {
+			await sleep(150); // ~4.5 idle quanta of activity
+			beat(a, "A");
+		}
+		await assert.rejects(b.next(400), /no message from daemon within/, "an active holder keeps the slot");
+	});
+
+	it("monopoly quantum: N requests force a session switch", async () => {
+		const d = startQuanta({ monopolyRequests: 3 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		for (let i = 0; i < 3; i++) {
+			beat(a, "A");
+			await sleep(150);
+		}
+		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("monopoly time quantum: M seconds of monopoly forces a session switch", async () => {
+		const d = startQuanta({ monopolyMs: 400 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+
+		for (let i = 0; i < 10; i++) {
+			await sleep(150); // keeps TTL and idle alive: only the time quantum can switch
+			beat(a, "A");
+		}
+		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("a monopoly-evicted session is granted again once the queue drains", async () => {
+		const d = startQuanta({ monopolyRequests: 2 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A");
+		beat(a, "A");
+		for (let i = 0; i < 2; i++) assert.deepEqual(await a.next(3000), { op: "ok" }); // drain beat replies
+		acquire(b, "B");
+		assert.deepEqual(await b.next(5000), granted("B"));
+
+		b.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "B" });
+		acquire(a, "A"); // A's next run re-acquires: the monopoly count resets on grant
+		assert.deepEqual(await a.next(5000), granted("A"));
 	});
 });
 
