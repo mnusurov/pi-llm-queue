@@ -59,10 +59,13 @@ will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools r
 
 ```json
 {
-  "defaults": { "maxStreams": 1, "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000 },
+  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000 },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
-    "zen": { "maxStreams": 3 }
+    "zen": { "maxStreams": 3, "policy": "fifo" },
+    "free-api": { "enabled": false },
+    "one-gpu": { "match": ["http://192.168.1.100:8001/v1", "http://192.168.1.100:8002/v1"], "maxStreams": 1 },
+    "serial-llama": { "match": ["llamacpp"], "maxStreams": 1 }
   }
 }
 ```
@@ -71,7 +74,36 @@ Keys may be a baseUrl (the endpoint itself) or a provider name. The daemon resol
 provider-name key to that provider's `baseUrl` by reading `models.json` (passed as
 `--models-json`); a baseUrl key wins when both name the same endpoint. The extension wraps
 every provider named by a key plus every provider serving an endpoint named by a key, and
-queues its requests under the model's baseUrl.
+queues its requests under the model's baseUrl — or under its group's name, when a group names it.
+
+Per-queue fields (all also valid in `defaults`): `maxStreams`, `policy`, `leaseTtlMs`,
+`idleQuantumMs`, `monopolyRequests`, `monopolyMs`, `agingAfterSlots`, `agingAfterMs`,
+`enabled`, `match`. `blockSubagentLaunch` (#6), `queueTimeoutMs`, `failOpen` and
+`daemonIdleExitMs` (#8) are documented in the schema and take effect in those tickets; schema
+validation with clear errors is #9.
+
+- **`enabled: false`** — passthrough: the queue grants every session immediately (`status`
+  reports `maxStreams: null`), and the extension leaves the provider unwrapped. A disabled
+  group does not re-key its members, so their own endpoint entries still apply.
+- **`match`** — an explicit resource group, overriding baseUrl keying:
+  - **merge**: members (baseUrls and/or provider names) share the group's slot pool. The
+    extension keys a grouped model's requests by the group name; a raw socket client naming a
+    member baseUrl is resolved to the first group whose `match` names it.
+  - **split**: a group naming one provider of an endpoint shared by several providers gives
+    that provider its own slot pool (`match: ["strata"]` beside `match: ["llama"]` on one
+    server). Splitting needs provider identity, so it works through the extension's key, not
+    through a raw baseUrl.
+
+### Hot-reload
+
+The daemon watches `llm-queue.json` (250 ms debounce, directory watch so atomic saves keep
+working), re-applies queue policy to live queues, and rebuilds them through the reloaded
+groups — holders and waiters move with their queue, so an endpoint never ends up with two
+slot pools. A widened `maxStreams` grants waiting sessions at once. The extension watches the
+same file and re-resolves its wrapped provider set (registering new providers, unregistering
+removed ones). A half-written file keeps the last good config. No daemon or pi restart is
+needed; `leaseTtlMs` on the client side (heartbeat period) is the one field that needs a pi
+restart.
 
 ## Client contract
 
@@ -86,7 +118,9 @@ queues its requests under the model's baseUrl.
   session never loses the slot to the TTL.
 - Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
   `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,
-  never buffered for a later request to consume.
+  never buffered for a later request to consume. A request addressed at a group member gets its
+  replies keyed by the key it asked with (its own `baseUrl`), never the group name — only
+  `status` reports group keys.
 - Fail-open: daemon unreachable → the request goes through unqueued. A client whose daemon dies
   mid-wait is released to its request.
 - Recommended pi setting while queued requests queue up behind a long prefill:

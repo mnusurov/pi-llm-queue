@@ -2,7 +2,8 @@
 // pi-llm-queue daemon: serialises model access per endpoint over a unix socket.
 // Protocol: newline-delimited JSON. See docs/daemon-protocol.md.
 import { createConnection, createServer } from "node:net";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, watch } from "node:fs";
+import { basename, dirname } from "node:path";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -17,8 +18,8 @@ if (!socketPath) {
 	process.exit(1);
 }
 
-const config = configPath ? JSON.parse(readFileSync(configPath, "utf8")) : {};
-const defaults = config.defaults ?? {};
+let config = configPath ? JSON.parse(readFileSync(configPath, "utf8")) : {};
+let defaults = config.defaults ?? {};
 const modelsJson = modelsJsonPath ? JSON.parse(readFileSync(modelsJsonPath, "utf8")).providers ?? {} : {};
 
 function send(conn, msg) {
@@ -38,30 +39,41 @@ function policyFor(key) {
 	return {};
 }
 
-function queueFor(key) {
-	if (!queues.has(key)) {
-		const policy = policyFor(key);
-		queues.set(key, {
-			queueKey: key,
-			maxStreams: policy.maxStreams ?? defaults.maxStreams ?? 1,
-			// Session-switch knobs: a lease dies without heartbeats; a holder yields to a waiter
-			// when it goes idle, or when its monopoly quantum (N requests / M s) runs out.
-			ttlMs: policy.leaseTtlMs ?? defaults.leaseTtlMs ?? 30000,
-			idleMs: policy.idleQuantumMs ?? defaults.idleQuantumMs ?? 120000,
-			monopolyRequests: policy.monopolyRequests ?? defaults.monopolyRequests ?? 12,
-			monopolyMs: policy.monopolyMs ?? defaults.monopolyMs ?? 180000,
-			// Aging: a child is boosted ahead of parents after this many consecutive parent
-			// grants, or after waiting this long — anti-starvation for background jobs.
-			agingAfterSlots: policy.agingAfterSlots ?? defaults.agingAfterSlots ?? 3,
-			agingAfterMs: policy.agingAfterMs ?? defaults.agingAfterMs ?? 60000,
-			// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
-			policy: policy.policy ?? defaults.policy ?? "priority-aging",
-			parentGrantStreak: 0,
-			holders: [],
-			waiting: [],
-		});
+// Explicit resource groups: queues.<name>.match lists baseUrls and/or provider names that
+// share one queue, overriding baseUrl keying so endpoints can be merged or re-slotted.
+// A disabled group is passthrough, so it must not re-key its members.
+function groupFor(key) {
+	for (const [name, entry] of Object.entries(config.queues ?? {})) {
+		const match = entry?.enabled === false ? undefined : entry?.match;
+		if (Array.isArray(match) && match.some((m) => m === key || modelsJson[m]?.baseUrl === key)) return name;
 	}
-	return queues.get(key);
+	return key;
+}
+
+// Queue policy, re-applied on hot-reload. `enabled: false` is passthrough: unlimited slots,
+// so every session is granted immediately (status reports maxStreams null).
+function applyPolicy(queue, policy) {
+	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
+	queue.maxStreams = policy.enabled === false ? Infinity : pick("maxStreams", 1);
+	// Session-switch knobs: a lease dies without heartbeats; a holder yields to a waiter when
+	// it goes idle, or when its monopoly quantum (N requests / M s) runs out. "fifo" opts a
+	// queue out of parent/child tiering and aging (external multi-slot queues).
+	queue.ttlMs = pick("leaseTtlMs", 30000);
+	queue.idleMs = pick("idleQuantumMs", 120000);
+	queue.monopolyRequests = pick("monopolyRequests", 12);
+	queue.monopolyMs = pick("monopolyMs", 180000);
+	// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after
+	// this many consecutive parent grants, or after waiting this long.
+	queue.agingAfterSlots = pick("agingAfterSlots", 3);
+	queue.agingAfterMs = pick("agingAfterMs", 60000);
+	queue.policy = pick("policy", "priority-aging");
+	return queue;
+}
+
+function queueFor(key) {
+	const queueKey = groupFor(key);
+	if (!queues.has(queueKey)) queues.set(queueKey, applyPolicy({ queueKey, parentGrantStreak: 0, holders: [], waiting: [] }, policyFor(queueKey)));
+	return queues.get(queueKey);
 }
 
 // A lease is the holder's record: TTL deadline, last model request, grant time, request count.
@@ -108,7 +120,7 @@ function grantNext(queue) {
 		queue.holders.push(lease);
 		remove(waiter.conn.queued, waiter);
 		waiter.conn.leases.push(lease);
-		send(waiter.conn, { op: "granted", queueKey: queue.queueKey, sessionKey: waiter.sessionKey });
+		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
 	}
 }
 
@@ -141,13 +153,17 @@ function sweep() {
 setInterval(sweep, 1000).unref();
 
 function handle(msg, conn) {
+	// Every keyed op is resolved through groups first: a group's members all address one queue.
+	// Replies always echo the key the client asked with — clients match replies on their own key.
+	const requestedKey = msg.queueKey;
+	if (msg.queueKey) msg.queueKey = groupFor(msg.queueKey);
 	switch (msg.op) {
 		case "acquire": {
 			const queue = queueFor(msg.queueKey);
 			const held = leaseOf(queue, msg.sessionKey);
 			if (held) {
 				beat(held, queue); // re-acquiring a held slot is a model request
-				send(conn, { op: "granted", queueKey: queue.queueKey, sessionKey: msg.sessionKey });
+				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
@@ -157,10 +173,10 @@ function handle(msg, conn) {
 				// A direct grant counts toward the parent-grant streak too: a parent that never
 				// queues must not starve a queued child past agingAfterSlots.
 				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
-				send(conn, { op: "granted", queueKey: queue.queueKey, sessionKey: msg.sessionKey });
+				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
-			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, conn, queue, enqueuedAt: Date.now() };
+			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now() };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
 			return;
@@ -192,7 +208,7 @@ function handle(msg, conn) {
 				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
 				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
 				if (granted) beat(lease, queue);
-				send(conn, { op: "ok", queueKey: msg.queueKey, sessionKey: msg.sessionKey, granted });
+				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
 			for (const lease of [...conn.leases]) lease.expires = Date.now() + queueFor(lease.queueKey).ttlMs;
@@ -296,5 +312,53 @@ process.on("SIGTERM", () => {
 	} catch {}
 	process.exit(0);
 });
+
+// Rebuild queues from the reloaded config, carrying holders and waiters with them: adding a
+// group at runtime must not leave the endpoint's old slot pool running beside the group's.
+// shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
+function rebuildQueues() {
+	const rebuilt = new Map();
+	for (const [key, queue] of queues) {
+		const target = groupFor(key);
+		let moved = rebuilt.get(target);
+		if (!moved) {
+			moved = applyPolicy({ queueKey: target, parentGrantStreak: 0, holders: [], waiting: [] }, policyFor(target));
+			rebuilt.set(target, moved);
+		}
+		for (const lease of queue.holders) {
+			lease.queueKey = target;
+			moved.holders.push(lease);
+		}
+		for (const waiter of queue.waiting) {
+			waiter.queue = moved;
+			moved.waiting.push(waiter);
+		}
+	}
+	queues.clear();
+	for (const [key, queue] of rebuilt) queues.set(key, queue);
+	for (const queue of queues.values()) grantNext(queue);
+}
+
+// Hot-reload: a config edit re-applies queue policy to live queues and grants whoever the
+// new capacity frees — no daemon restart, no pi restart. A half-written file keeps the last
+// good config. Watch the directory, not the file: an atomic-save editor replaces the file and
+// a file watcher goes dead.
+if (configPath) {
+	let debounce = null;
+	const watcher = watch(dirname(configPath), (_event, file) => {
+		if (file && file !== basename(configPath)) return;
+		clearTimeout(debounce);
+		debounce = setTimeout(() => {
+			try {
+				config = JSON.parse(readFileSync(configPath, "utf8"));
+				defaults = config.defaults ?? {};
+				rebuildQueues();
+			} catch {}
+		}, 250);
+		debounce.unref();
+	});
+	watcher.on("error", () => {});
+	watcher.unref();
+}
 
 start();
