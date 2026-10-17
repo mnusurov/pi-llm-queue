@@ -29,12 +29,23 @@ queues.
 - Daemon auto-starts from the extension, idle-exits when last client leaves.
 - Config: `~/.pi/agent/llm-queue.json`, hot-reload.
 
+## Subagent launches (batch pattern)
+
+On a single-slot queue (`maxStreams: 1`) the extension's `tool_call` hook rewrites
+the `subagent` tool's `async: true → false`, so the orchestrator blocks on each
+launch and parallel launches become a serial queue. Launch one batch as a single
+workflow call (one `subagent` call with a `workflow`/`tasks`/`chain` argument): the
+parent is woken once at the end, so its large context is re-prefilled once, not
+once per child. `blockSubagentLaunch` defaults to `true` when `maxStreams == 1`
+(`false` otherwise); override per queue with `queues.<name>.blockSubagentLaunch`.
+The hook is a no-op when the `subagent` tool is absent (pi-subagents not installed).
+
 Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
 provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and
 the session-switch quanta (release / idle / monopoly) are implemented (#3). Priority tiers
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
 `/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
-`enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` lands
-in #6, `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` in #8) and config hot-reload (daemon +
-extension) are implemented (#5). `blockSubagentLaunch` (#6), observability (#7), fail-open hardening +
+`enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` is
+implemented (#6); `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` in #8) and config hot-reload
+(daemon + extension) are implemented (#5). Observability (#7), fail-open hardening +
 idle-exit (#8) and packaging (#9) are not built; the TUI indicator is #1 scope, not built.
