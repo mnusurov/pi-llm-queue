@@ -1,8 +1,8 @@
 // pi-llm-queue extension: wraps configured providers so a session holds the endpoint's slot for
 // its whole run, keeping the KV cache warm for one session at a time.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, watch } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename, dirname } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type {
 	Api,
@@ -26,6 +26,8 @@ const GRACE_MS = 3000;
 interface QueueEntry {
 	maxStreams?: number;
 	enabled?: boolean;
+	/** BaseUrls and/or provider names that share this queue (overrides baseUrl keying). */
+	match?: string[];
 }
 
 function loadJson(path: string): Record<string, any> {
@@ -36,16 +38,30 @@ function loadJson(path: string): Record<string, any> {
 	}
 }
 
-/** A queue key matches a provider named directly, or an endpoint a provider serves. */
-function keyMatches(key: string, providers: Record<string, any>): boolean {
-	if (providers[key]) return true;
-	return Object.values(providers).some((p: any) => p?.baseUrl === key);
+/** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
+function matchingProviders(key: string, providers: Record<string, any>): string[] {
+	if (providers[key]) return [key];
+	return Object.keys(providers).filter((name) => providers[name]?.baseUrl === key);
+}
+
+/**
+ * Queue key for a model: the group whose `match` names its provider or endpoint (so one
+ * endpoint can be split per provider, and several endpoints merged), else its baseUrl.
+ */
+export function resolveQueueKey(queues: Record<string, QueueEntry>, model: { provider: string; baseUrl: string }): string {
+	for (const [name, entry] of Object.entries(queues)) {
+		if (entry?.enabled === false) continue;
+		const match = entry?.match ?? [];
+		if (match.includes(model.provider) || match.includes(model.baseUrl)) return name;
+	}
+	return model.baseUrl;
 }
 
 /**
  * Providers to wrap: queue keys naming a provider directly, and queue keys naming an
- * endpoint that a provider serves (providers on one endpoint share one queue).
- * Keys whose entry is `enabled: false` are skipped.
+ * endpoint that a provider serves (providers on one endpoint share one queue). A group's
+ * `match` list contributes its providers the same way. Keys whose entry is `enabled: false`
+ * are skipped.
  */
 export function resolveQueueProviders(
 	queues: Record<string, QueueEntry>,
@@ -54,8 +70,7 @@ export function resolveQueueProviders(
 	const names = new Set<string>();
 	for (const [key, entry] of Object.entries(queues)) {
 		if (entry?.enabled === false) continue;
-		if (providers[key]) names.add(key);
-		else for (const [name, provider] of Object.entries(providers)) if (provider?.baseUrl === key) names.add(name);
+		for (const member of [key, ...(entry?.match ?? [])]) for (const provider of matchingProviders(member, providers)) names.add(provider);
 	}
 	return [...names];
 }
@@ -74,8 +89,8 @@ export function resolveRole(env: Record<string, string | undefined>): Role {
 
 export default function (pi: ExtensionAPI) {
 	const modelsJson = loadJson(MODELS_JSON_PATH).providers ?? {};
-	const config = loadJson(CONFIG_PATH);
-	const queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+	let config = loadJson(CONFIG_PATH);
+	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 	// Heartbeat at a third of the lease TTL (floor 1 s): a live session never loses its slot.
 	const heartbeatMs = Math.max(1000, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
 
@@ -97,6 +112,8 @@ export default function (pi: ExtensionAPI) {
 	let heldQueueKey: string | null = null;
 	let releaseTimer: ReturnType<typeof setTimeout> | null = null;
 	let providers: string[] = [];
+	// Only what we registered: unregistering a native-owned provider would drop the built-in.
+	let registeredProviders = new Set<string>();
 	let registered = false;
 
 	const releaseSlot = () => {
@@ -114,7 +131,7 @@ export default function (pi: ExtensionAPI) {
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const out = createAssistantMessageEventStream();
-		const queueKey = model.baseUrl;
+		const queueKey = resolveQueueKey(queues, model);
 		const wasHeld = heldQueueKey === queueKey;
 		(async () => {
 			let selfQueued = false;
@@ -188,12 +205,14 @@ export default function (pi: ExtensionAPI) {
 	const registerQueuedProviders = (ctx: ExtensionContext) => {
 		providers = resolveQueueProviders(queues, modelsJson);
 
-		// Queue keys naming a provider absent from models.json (finding 7).
-		for (const key of Object.keys(queues)) {
-			if (queues[key]?.enabled === false) continue;
-			if (!keyMatches(key, modelsJson)) ctx.ui.notify(`pi-llm-queue: queue key "${key}" names no provider in models.json`, "warning");
+		// Queue keys naming no provider in models.json (directly, or through a group's match) (finding 7).
+		for (const [key, entry] of Object.entries(queues)) {
+			if (entry?.enabled === false) continue;
+			if (![key, ...(entry?.match ?? [])].some((k) => matchingProviders(k, modelsJson).length))
+				ctx.ui.notify(`pi-llm-queue: queue key "${key}" names no provider in models.json`, "warning");
 		}
 
+		const wrapped = new Set<string>();
 		for (const provider of providers) {
 			// Provider ids owned by native extensions (e.g. built-in llama) must not be wrapped (finding 8).
 			if (ctx.modelRegistry.getRegisteredNativeProvider?.(provider)) {
@@ -208,7 +227,45 @@ export default function (pi: ExtensionAPI) {
 			if (offApi.length)
 				ctx.ui.notify(`pi-llm-queue: "${provider}" models with api ${offApi.join(", ")} bypass the queue (queued for "${api}")`, "warning");
 			pi.registerProvider(provider, { api, streamSimple: queuedStream });
+			wrapped.add(provider);
 		}
+		for (const provider of registeredProviders) if (!wrapped.has(provider)) pi.unregisterProvider(provider);
+		registeredProviders = wrapped;
+	};
+
+	// Hot-reload: a config edit re-resolves the wrapped provider set (pi applies provider
+	// registration immediately); the daemon reloads the same file for queue policy.
+	// shortcut: leaseTtlMs changes only take effect on pi restart (the client heartbeat period
+	// is fixed at connect).
+	const watchConfig = (ctx: ExtensionContext) => {
+		if (!existsSync(CONFIG_PATH)) return;
+		let debounce: ReturnType<typeof setTimeout> | null = null;
+		// Watch the directory, not the file: an atomic-save editor replaces the file and a
+		// file watcher goes dead; a config created after startup needs a watcher too.
+		const watcher = watch(dirname(CONFIG_PATH), (_event, file) => {
+			if (file && file !== basename(CONFIG_PATH)) return;
+			clearTimeout(debounce ?? undefined);
+			debounce = setTimeout(() => {
+				let raw: string | null = null;
+				try {
+					raw = readFileSync(CONFIG_PATH, "utf8");
+				} catch {}
+				if (raw === null) return; // config deleted: keep the current wrap set
+				let next: Record<string, any>;
+				try {
+					next = JSON.parse(raw);
+				} catch {
+					return; // half-written file: keep the last good config
+				}
+				config = next;
+				queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+				registerQueuedProviders(ctx);
+				ctx.ui.notify("pi-llm-queue: config reloaded", "info");
+			}, 250);
+			debounce.unref();
+		});
+		watcher.on("error", () => {});
+		watcher.unref();
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -216,6 +273,7 @@ export default function (pi: ExtensionAPI) {
 		if (!registered) {
 			registered = true;
 			registerQueuedProviders(ctx);
+			watchConfig(ctx);
 		}
 	});
 
@@ -231,9 +289,10 @@ export default function (pi: ExtensionAPI) {
 		if (!model || !providers.includes(model.provider)) return;
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
-		await lease.acquire(model.baseUrl, sessionKey, currentRole(), group, ctx.signal);
+		const queueKey = resolveQueueKey(queues, model);
+		await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal);
 		// An abort already released the slot: do not claim a lease we no longer hold.
-		if (!ctx.signal?.aborted) heldQueueKey = model.baseUrl;
+		if (!ctx.signal?.aborted) heldQueueKey = queueKey;
 	});
 
 	pi.on("agent_settled", () => {

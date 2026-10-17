@@ -38,6 +38,27 @@ describe("lease client", () => {
 		d.stop();
 	});
 
+	it("resolves a group member through the client api (replies echo the requested key)", async () => {
+		const GPU = "http://gpu.test/v1";
+		const ZEN = "http://zen.test/v1";
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU, ZEN], maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath });
+		const b = new LeaseClient({ socketPath: d.socketPath });
+
+		assert.equal(await raceWithSleep(a.acquire(GPU, "A", "parent"), 3000), "resolved", "acquire on a grouped endpoint resolves: the reply echoes the requested key");
+		assert.equal(await a.beat(GPU, "A"), true, "an activity beat on a grouped endpoint is granted");
+
+		const bAcquire = b.acquire(ZEN, "B", "parent");
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "the group's single slot is shared across endpoints");
+		a.release(GPU, "A");
+		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
 	it("does not let a release reply satisfy the next acquire (turn 2+ serialisation)", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
 		await waitForDaemon(d.socketPath);

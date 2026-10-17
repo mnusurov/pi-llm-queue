@@ -14,8 +14,8 @@ queues.
 ## Design decisions (from grilling session)
 
 - Client-side: pi extension + shared local daemon (unix socket), fail-open.
-- Queue key = provider baseUrl; explicit resource groups override; providers
-  can be excluded (`enabled: false`).
+- Queue key = provider baseUrl; explicit resource groups (`queues.<name>.match`) override;
+  providers can be excluded (`enabled: false`); config hot-reload.
 - Turn-based session affinity: slot held per session across a run
   (`agent_start` → `agent_settled`), lease with TTL, released on settle.
 - Priority: interactive parent > subagent child, with aging anti-starvation.
@@ -33,5 +33,8 @@ Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO schedule
 provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and
 the session-switch quanta (release / idle / monopoly) are implemented (#3). Priority tiers
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
-`/queue promote|demote` are implemented (#4). `blockSubagentLaunch` and the TUI indicator are
-#1 scope, not built.
+`/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
+`enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` lands
+in #6, `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` in #8) and config hot-reload (daemon +
+extension) are implemented (#5). `blockSubagentLaunch` (#6), observability (#7), fail-open hardening +
+idle-exit (#8) and packaging (#9) are not built; the TUI indicator is #1 scope, not built.

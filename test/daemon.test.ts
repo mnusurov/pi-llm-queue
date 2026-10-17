@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { after, before, describe, it } from "node:test";
 import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
@@ -470,6 +471,178 @@ describe("queue policy resolution", () => {
 		c.send({ op: "status" });
 		assert.deepEqual((await c.next(3000)).queues, []);
 		c.close();
+		d.stop();
+	});
+});
+
+describe("per-endpoint queues, groups and hot-reload", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	const GPU = "http://gpu.test/v1";
+	const ZEN = "http://zen.test/v1";
+	const modelsJson = { providers: { strata: { baseUrl: GPU }, llama: { baseUrl: GPU }, zen: { baseUrl: ZEN } } };
+	const acquire = (c: Client, queueKey: string, sessionKey: string) => c.send({ op: "acquire", queueKey, sessionKey, role: "parent" });
+	const release = (c: Client, queueKey: string, sessionKey: string) => c.send({ op: "release", queueKey, sessionKey });
+	const granted = (queueKey: string, sessionKey: string) => ({ op: "granted", queueKey, sessionKey });
+
+	it("serialises two providers on one baseUrl through one queue", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, GPU, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/, "second provider on the endpoint waits");
+
+		a.send({ op: "status" });
+		const status = await a.next(3000);
+		assert.equal(status.queues.length, 1, "strata and llama on one endpoint share one queue");
+		assert.deepEqual(status.queues[0].holders, ["A"]);
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("lets a baseUrl key win over a provider-name key naming the same endpoint", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { zen: { maxStreams: 1 }, [ZEN]: { maxStreams: 2 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, ZEN, "A");
+		acquire(b, ZEN, "B");
+		assert.deepEqual(await a.next(3000), granted(ZEN, "A"));
+		assert.deepEqual(await b.next(3000), granted(ZEN, "B"), "the endpoint entry's maxStreams 2 applies");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("merges endpoints into one queue with an explicit group", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU, ZEN], maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"), "the reply echoes the key the client asked with");
+		a.send({ op: "status" });
+		assert.deepEqual((await a.next(3000)).queues.map((q: any) => q.queueKey), ["gpu"], "status reports the group");
+
+		acquire(b, ZEN, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/, "the merged endpoint shares the group's single slot");
+
+		release(a, GPU, "A");
+		assert.deepEqual(await b.next(3000), granted(ZEN, "B"));
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("resolves provider names in a group's match list to their endpoints", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { merged: { match: ["strata", "zen"], maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, ZEN, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("overrides baseUrl keying with a group", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 3 }, gpu: { match: [GPU], maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, GPU, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/, "the group's maxStreams 1 wins over the endpoint's 3");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("leaves baseUrl keying alone for a disabled group", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU, ZEN], enabled: false }, [GPU]: { maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, GPU, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/, "the endpoint's own maxStreams 1 still serialises it");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("passes every session through a queue whose entry is disabled", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { enabled: false } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+		const c = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		acquire(b, GPU, "B");
+		acquire(c, GPU, "C");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		assert.deepEqual(await b.next(3000), granted(GPU, "B"), "no queueing for a disabled endpoint");
+		assert.deepEqual(await c.next(3000), granted(GPU, "C"));
+
+		a.close();
+		b.close();
+		c.close();
+		d.stop();
+	});
+
+	it("hot-reloads a config change without restarting the daemon", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, GPU, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 2 } } }));
+		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the reloaded maxStreams frees a second slot");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("hot-reloads a new group without leaving the endpoint's old slot pool behind", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, GPU, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU], maxStreams: 1 } } }));
+		await sleep(600); // reload debounce + queue rebuild
+		release(a, GPU, "A");
+		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the migrated queue keeps holder and waiter in one slot pool");
+
+		a.close();
+		b.close();
 		d.stop();
 	});
 });

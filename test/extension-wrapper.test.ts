@@ -31,6 +31,7 @@ function makePi() {
 		registered,
 		on: (event: string, handler: (e: any, ctx: any) => void) => (handlers[event] ??= []).push(handler),
 		registerProvider: (name: string, config: any) => (registered[name] = config),
+		unregisterProvider: (name: string) => delete registered[name],
 		registerCommand: (_name: string, _config: any) => {},
 	};
 }
@@ -262,6 +263,19 @@ describe("provider wrapper (queuedStream)", () => {
 		);
 		raw.close();
 		a.handlers["session_shutdown"][0]({}, ctxA);
+	});
+});
+
+describe("config hot-reload (provider set)", () => {
+	it("unregisters a provider a config edit disables, so it passes through unqueued", async () => {
+		const a = makePi();
+		extension(a as any);
+		start(a, "RELOAD");
+		assert.ok(a.registered["stub"], "wrapped before the edit");
+
+		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { enabled: false } } }));
+		await sleep(600); // reload debounce
+		assert.equal(a.registered["stub"], undefined, "a disabled provider is unregistered: passthrough, no pi restart");
 	});
 });
 
