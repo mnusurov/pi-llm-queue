@@ -171,7 +171,7 @@ describe("lease client", () => {
 		await holder.acquire(QUEUE_KEY, "H", "parent");
 		const c = new LeaseClient({ socketPath: d.socketPath });
 		const ac = new AbortController();
-		const queued = c.acquire(QUEUE_KEY, "C", "parent", ac.signal);
+		const queued = c.acquire(QUEUE_KEY, "C", "parent", undefined, ac.signal);
 		assert.equal(await raceWithSleep(queued, 300), "pending");
 		ac.abort();
 		assert.equal(await raceWithSleep(queued, 3000), "resolved");

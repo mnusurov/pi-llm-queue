@@ -60,6 +60,18 @@ export function resolveQueueProviders(
 	return [...names];
 }
 
+/**
+ * Role from the neutral env contract, read as plain strings (zero imports, so the queue
+ * works with or without pi-subagents): explicit PI_QUEUE_ROLE wins, then a pi-subagents
+ * child hint, then default parent.
+ */
+export function resolveRole(env: Record<string, string | undefined>): Role {
+	const explicit = env.PI_QUEUE_ROLE;
+	if (explicit === "child" || explicit === "parent") return explicit;
+	if (env.PI_SUBAGENT_CHILD === "1" || env.PI_SUBAGENT_PARENT_SESSION) return "child";
+	return "parent";
+}
+
 export default function (pi: ExtensionAPI) {
 	const modelsJson = loadJson(MODELS_JSON_PATH).providers ?? {};
 	const config = loadJson(CONFIG_PATH);
@@ -74,7 +86,11 @@ export default function (pi: ExtensionAPI) {
 		modelsJsonPath: MODELS_JSON_PATH,
 		heartbeatMs,
 	});
-	const role: Role = process.env.PI_QUEUE_ROLE === "child" ? "child" : "parent";
+	const envRole: Role = resolveRole(process.env);
+	const group = process.env.PI_QUEUE_GROUP;
+	// /queue promote|demote overrides the env-resolved tier per session (one process can run several).
+	const roleOverride = new Map<string, Role>();
+	const currentRole = (): Role => roleOverride.get(sessionKey) ?? envRole;
 
 	// shortcut: one lease per process; a process running several sessions needs per-session keys.
 	let sessionKey = "";
@@ -110,7 +126,7 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					await lease.acquire(queueKey, sessionKey, role, options?.signal);
+					await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal);
 					if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
 					else selfQueued = true;
 				}
@@ -148,6 +164,24 @@ export default function (pi: ExtensionAPI) {
 		})();
 		return out;
 	};
+
+	// /queue [promote|demote]: promote/demote this session's tier, or print queue status.
+	pi.registerCommand("queue", {
+		description: "Queue status, or promote/demote this session's tier",
+		handler: async (args: string, ctx: ExtensionContext) => {
+			const arg = args.trim().toLowerCase();
+			if (arg === "promote" || arg === "demote") {
+				const role: Role = arg === "promote" ? "parent" : "child";
+				const sid = ctx.sessionManager.getSessionId();
+				roleOverride.set(sid, role);
+				lease.setRole(sid, role); // re-tier a request already queued behind a long run
+				ctx.ui.notify(`pi-llm-queue: session tier is now ${role}`, "info");
+				return;
+			}
+			const s = await lease.status();
+			ctx.ui.notify(s ? JSON.stringify(s.queues) : "pi-llm-queue: daemon unreachable", "info");
+		},
+	});
 
 	// Registration is deferred to the first session so ctx gives us the model registry
 	// (native-provider detection) and ui.notify (unmatched keys, api mismatches).
@@ -197,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 		if (!model || !providers.includes(model.provider)) return;
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
-		await lease.acquire(model.baseUrl, sessionKey, role, ctx.signal);
+		await lease.acquire(model.baseUrl, sessionKey, currentRole(), group, ctx.signal);
 		// An abort already released the slot: do not claim a lease we no longer hold.
 		if (!ctx.signal?.aborted) heldQueueKey = model.baseUrl;
 	});

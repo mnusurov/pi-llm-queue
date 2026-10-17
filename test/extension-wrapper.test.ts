@@ -31,6 +31,7 @@ function makePi() {
 		registered,
 		on: (event: string, handler: (e: any, ctx: any) => void) => (handlers[event] ??= []).push(handler),
 		registerProvider: (name: string, config: any) => (registered[name] = config),
+		registerCommand: (_name: string, _config: any) => {},
 	};
 }
 
