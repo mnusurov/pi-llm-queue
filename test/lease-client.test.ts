@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -228,6 +228,46 @@ describe("lease client", () => {
 
 		a.close();
 		b.close();
+		d.stop();
+	});
+
+	it("keeps a headless process alive across status polls while its acquire waits (socket stays ref'd)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const holder = new LeaseClient({ socketPath: d.socketPath });
+		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the single slot
+
+		// The waiting client runs in its own process: only the lease socket keeps it alive, so a
+		// status poll that drops the socket ref makes it exit (the --print headless regression).
+		const leasePath = decodeURIComponent(new URL("../src/lease-client.ts", import.meta.url).pathname);
+		const script = join(mkdtempSync(join(tmpdir(), "llm-queue-child-")), "child.mts");
+		writeFileSync(
+			script,
+			[
+				`import { LeaseClient } from ${JSON.stringify(leasePath)};`,
+				`const lease = new LeaseClient({ socketPath: process.argv[2] });`,
+				`const reason = await lease.acquire(${JSON.stringify(QUEUE_KEY)}, "CHILD", "parent", undefined, undefined, () => {});`,
+				"console.log(`GRANTED ${reason}`);",
+				"lease.close();",
+			].join("\n"),
+		);
+		const child = spawn(process.execPath, [script, d.socketPath], { stdio: ["ignore", "pipe", "pipe"] });
+		let out = "";
+		child.stdout.on("data", (c) => (out += c));
+		child.stderr.on("data", (c) => (out += c));
+		let exited: number | null = null;
+		child.on("exit", (code) => (exited = code));
+
+		// Long enough for the 300 ms first poll and one 2 s follow-up to drop-and-restore the ref.
+		await sleep(2500);
+		assert.equal(exited, null, `the queued process exited while waiting (out=${JSON.stringify(out)})`);
+
+		holder.release(QUEUE_KEY, "H");
+		const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+		assert.equal(code, 0);
+		assert.match(out, /GRANTED granted/, "the child was granted its slot once it freed");
+
+		holder.close();
 		d.stop();
 	});
 
