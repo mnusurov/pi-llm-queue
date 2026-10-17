@@ -82,11 +82,20 @@ provider-name key to that provider's `baseUrl` by reading `models.json` (passed 
 every provider named by a key plus every provider serving an endpoint named by a key, and
 queues its requests under the model's baseUrl — or under its group's name, when a group names it.
 
-Per-queue fields (all also valid in `defaults`): `maxStreams`, `policy`, `leaseTtlMs`,
-`idleQuantumMs`, `monopolyRequests`, `monopolyMs`, `agingAfterSlots`, `agingAfterMs`,
-`enabled`, `match`, `blockSubagentLaunch`. `failOpen` (default `true`) and `queueTimeoutMs`
+Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs`, `idleQuantumMs`, `monopolyRequests`,
+`monopolyMs`, `agingAfterSlots`, `agingAfterMs`, `blockSubagentLaunch` (all also valid in
+`defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
+`failOpen` (default `true`) and `queueTimeoutMs`
 are client-side (`defaults` only); `daemonIdleExitMs` (default `60000`) is daemon-side
-(`defaults` only). Schema validation with clear errors is #9.
+(`defaults` only). An optional top-level `schemaVersion` (current: 1) must be a positive
+integer; a newer version is rejected with an "upgrade pi-llm-queue" error. Validation
+(`src/config.js`) reports every violation as a path-named error (`queues.zen.maxStreams must
+be a positive integer (got 0)`): the extension notifies them through `ui.notify` at session
+start and on a rejected reload; the daemon prints them to stderr — discarded when the extension
+spawns it detached, visible when the daemon is run by hand — and serves with defaults at
+startup, or keeps the last good config on hot-reload. A missing config
+file is all defaults with no error; a half-written file (invalid JSON) is a silent no-op that
+keeps the last good config.
 
 - **`blockSubagentLaunch`** — force the `subagent` tool's `async: true → false` on this queue so
   launches serialise. Defaults to `true` when `maxStreams == 1` (`false` otherwise); a disabled

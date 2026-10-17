@@ -4,6 +4,39 @@
   "description": "Pi extension + local daemon that serialises LLM access to protect KV-cache warmth",
   "type": "module",
   "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "llm",
+    "queue",
+    "kv-cache",
+    "llama.cpp"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mnusurov/pi-llm-queue.git"
+  },
+  "homepage": "https://github.com/mnusurov/pi-llm-queue#readme",
+  "bugs": {
+    "url": "https://github.com/mnusurov/pi-llm-queue/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "docs/daemon-protocol.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/*.test.ts"

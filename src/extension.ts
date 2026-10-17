@@ -13,6 +13,7 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role } from "./lease-client.ts";
+import { loadValidConfig } from "./config.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -108,7 +109,11 @@ export function resolveRole(env: Record<string, string | undefined>): Role {
 
 export default function (pi: ExtensionAPI) {
 	const modelsJson = loadJson(MODELS_JSON_PATH).providers ?? {};
-	let config = loadJson(CONFIG_PATH);
+	// Startup config load: any failure falls back to defaults and surfaces through ui.notify at
+	// session_start (ui does not exist at module load).
+	const loaded = loadValidConfig(CONFIG_PATH);
+	let config = loaded.config;
+	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 	// Heartbeat at a third of the lease TTL (floor 1 s): a live session never loses its slot.
 	const heartbeatMs = Math.max(1000, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
@@ -322,18 +327,14 @@ export default function (pi: ExtensionAPI) {
 			if (file && file !== basename(CONFIG_PATH)) return;
 			clearTimeout(debounce ?? undefined);
 			debounce = setTimeout(() => {
-				let raw: string | null = null;
-				try {
-					raw = readFileSync(CONFIG_PATH, "utf8");
-				} catch {}
-				if (raw === null) return; // config deleted: keep the current wrap set
-				let next: Record<string, any>;
-				try {
-					next = JSON.parse(raw);
-				} catch {
-					return; // half-written file: keep the last good config
+				if (!existsSync(CONFIG_PATH)) return; // config deleted: keep the current wrap set
+				const next = loadValidConfig(CONFIG_PATH);
+				if (next.errors.length) {
+					// A half-written file (invalid JSON) is a silent no-op: the last good config is kept.
+					if (!next.invalidJson) ctx.ui.notify(`pi-llm-queue: config not reloaded:\n${next.errors.join("\n")}`, "error");
+					return;
 				}
-				config = next;
+				config = next.config;
 				queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 				registerQueuedProviders(ctx);
 				ctx.ui.notify("pi-llm-queue: config reloaded", "info");
@@ -347,6 +348,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		sessionKey = ctx.sessionManager.getSessionId();
 		ui = ctx.ui;
+		if (configErrors.length) ctx.ui.notify(`pi-llm-queue: config rejected, running with defaults:\n${configErrors.join("\n")}`, "error");
 		if (!registered) {
 			registered = true;
 			registerQueuedProviders(ctx);
