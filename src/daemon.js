@@ -4,6 +4,7 @@
 import { createConnection, createServer } from "node:net";
 import { existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
+import { loadValidConfig } from "./config.js";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -18,7 +19,11 @@ if (!socketPath) {
 	process.exit(1);
 }
 
-let config = configPath ? JSON.parse(readFileSync(configPath, "utf8")) : {};
+// A bad config must not kill the daemon: print clear errors and serve with defaults.
+// A missing file is all defaults — the documented default install, no error.
+const loaded = loadValidConfig(configPath ?? "");
+for (const e of loaded.errors) console.error(`pi-llm-queue daemon: config: ${e}`);
+let config = loaded.config;
 let defaults = config.defaults ?? {};
 const modelsJson = modelsJsonPath ? JSON.parse(readFileSync(modelsJsonPath, "utf8")).providers ?? {} : {};
 
@@ -382,11 +387,16 @@ if (configPath) {
 		if (file && file !== basename(configPath)) return;
 		clearTimeout(debounce);
 		debounce = setTimeout(() => {
-			try {
-				config = JSON.parse(readFileSync(configPath, "utf8"));
-				defaults = config.defaults ?? {};
-				rebuildQueues();
-			} catch {}
+			if (!existsSync(configPath)) return; // config deleted: keep the last good config
+			const next = loadValidConfig(configPath);
+			if (next.errors.length) {
+				// A half-written file (invalid JSON) is a silent no-op: the last good config is kept.
+				if (!next.invalidJson) for (const e of next.errors) console.error(`pi-llm-queue daemon: config reload rejected: ${e}`);
+				return;
+			}
+			config = next.config;
+			defaults = config.defaults ?? {};
+			rebuildQueues();
 		}, 250);
 		debounce.unref();
 	});

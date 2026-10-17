@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -754,5 +757,75 @@ describe("daemon idle-exit", () => {
 		c2.send({ op: "status" });
 		assert.equal((await c2.next(3000)).op, "status", "the daemon survived the idle grace");
 		c2.close();
+	});
+});
+
+// Config schema validation (#9): a bad config surfaces clear errors (stderr / ui.notify)
+// and never kills the queue — the daemon serves with defaults, a bad reload keeps the last good config.
+describe("config schema validation at the daemon seam", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	it("serves with defaults when the config is invalid at startup", async () => {
+		const d = startDaemon({ defaults: { maxStreams: "many" }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
+		await assert.rejects(b.next(200), /no message from daemon within/, "defaults (maxStreams 1) apply: B queues");
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("keeps the last good config when a reload is invalid", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 2 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" }, "two slots from the good config");
+
+		writeFileSync(d.configPath, JSON.stringify({ queues: { [QUEUE_KEY]: { maxStreams: 0 } } }));
+		await sleep(600); // reload debounce: the invalid file is rejected
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "C", role: "parent" });
+		await assert.rejects(c.next(300), /no message from daemon within/, "maxStreams stays 2, not the invalid 0");
+
+		a.close();
+		b.close();
+		c.close();
+		d.stop();
+	});
+
+	// The installed daemon runs under node_modules, where Node refuses type stripping: a .ts
+	// import would crash it at spawn and fail-open silently (no serialisation at all).
+	it("starts from a node_modules path, where Node refuses type stripping", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-nm-"));
+		const srcDir = join(dir, "node_modules", "pi-llm-queue", "src");
+		mkdirSync(srcDir, { recursive: true });
+		copyFileSync(DAEMON, join(srcDir, "daemon.js"));
+		copyFileSync(decodeURIComponent(new URL("../src/config.js", import.meta.url).pathname), join(srcDir, "config.js"));
+		const configPath = join(dir, "config.json");
+		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
+		const socketPath = join(dir, "queue.sock");
+		const proc = spawn(process.execPath, [join(srcDir, "daemon.js"), "--socket", socketPath, "--config", configPath], { stdio: "ignore" });
+		proc.unref();
+
+		const c = await connectClient(socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "N", role: "parent" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "N" }, "the installed daemon serves");
+
+		c.close();
+		proc.kill();
 	});
 });
