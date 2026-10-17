@@ -8,7 +8,7 @@ import { after, describe, it } from "node:test";
 import { LeaseClient, ensureDaemon } from "../src/lease-client.ts";
 import { DAEMON, QUEUE_KEY, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
-const raceWithSleep = (promise: Promise<void>, ms: number) =>
+const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
 
 describe("lease client", () => {
@@ -228,6 +228,47 @@ describe("lease client", () => {
 
 		a.close();
 		b.close();
+		d.stop();
+	});
+
+	it("fails closed (hard error) when failOpen is false and the daemon is unreachable", async () => {
+		const lease = new LeaseClient({ socketPath: "/tmp/pi-llm-queue-absent.sock", failOpen: false });
+		await assert.rejects(lease.acquire(QUEUE_KEY, "S", "parent"), /failOpen is false/);
+	});
+
+	it("fails closed when the daemon dies mid-wait and failOpen is false", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const holder = new LeaseClient({ socketPath: d.socketPath });
+		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the slot
+		const c = new LeaseClient({ socketPath: d.socketPath, failOpen: false });
+		const queued = c.acquire(QUEUE_KEY, "C", "parent");
+		assert.equal(await raceWithSleep(queued, 300), "pending", "C is queued behind H");
+		d.stop(); // daemon dies mid-wait: failOpen:false must hard-error, not pass through
+		await assert.rejects(queued, /failOpen is false/);
+		holder.close();
+	});
+
+	it("passes a parent through with a timeout after queueTimeoutMs; a child waits unlimited", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const holder = new LeaseClient({ socketPath: d.socketPath });
+		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the single slot
+
+		const parent = new LeaseClient({ socketPath: d.socketPath, queueTimeoutMs: 300 });
+		const child = new LeaseClient({ socketPath: d.socketPath, queueTimeoutMs: 300 });
+		const p = parent.acquire(QUEUE_KEY, "P", "parent");
+		const c = child.acquire(QUEUE_KEY, "C", "child");
+
+		assert.equal(await p, "timeout", "a parent passes through with a timeout reason after queueTimeoutMs");
+		assert.equal(await raceWithSleep(c, 400), "pending", "child default is unlimited: queueTimeoutMs never applies to a child");
+
+		holder.release(QUEUE_KEY, "H");
+		assert.equal(await raceWithSleep(c, 3000), "resolved", "the child is granted once the slot frees");
+
+		parent.close();
+		child.close();
+		holder.close();
 		d.stop();
 	});
 });

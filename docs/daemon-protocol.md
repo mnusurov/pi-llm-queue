@@ -65,7 +65,7 @@ unanswered, so the client polls `status` every 2 s for its position).
 
 ```json
 {
-  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000 },
+  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 60000 },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
     "zen": { "maxStreams": 3, "policy": "fifo" },
@@ -84,9 +84,9 @@ queues its requests under the model's baseUrl — or under its group's name, whe
 
 Per-queue fields (all also valid in `defaults`): `maxStreams`, `policy`, `leaseTtlMs`,
 `idleQuantumMs`, `monopolyRequests`, `monopolyMs`, `agingAfterSlots`, `agingAfterMs`,
-`enabled`, `match`, `blockSubagentLaunch`. `queueTimeoutMs`, `failOpen` and
-`daemonIdleExitMs` (#8) are documented in the schema and take effect in those tickets; schema
-validation with clear errors is #9.
+`enabled`, `match`, `blockSubagentLaunch`. `failOpen` (default `true`) and `queueTimeoutMs`
+are client-side (`defaults` only); `daemonIdleExitMs` (default `60000`) is daemon-side
+(`defaults` only). Schema validation with clear errors is #9.
 
 - **`blockSubagentLaunch`** — force the `subagent` tool's `async: true → false` on this queue so
   launches serialise. Defaults to `true` when `maxStreams == 1` (`false` otherwise); a disabled
@@ -112,8 +112,8 @@ groups — holders and waiters move with their queue, so an endpoint never ends 
 slot pools. A widened `maxStreams` grants waiting sessions at once. The extension watches the
 same file and re-resolves its wrapped provider set (registering new providers, unregistering
 removed ones). A half-written file keeps the last good config. No daemon or pi restart is
-needed; `leaseTtlMs` on the client side (heartbeat period) is the one field that needs a pi
-restart.
+needed; `leaseTtlMs` on the client side (heartbeat period), `failOpen` and `queueTimeoutMs` are
+read once at connect and are the fields that need a pi restart.
 
 ## Client contract
 
@@ -131,8 +131,17 @@ restart.
   never buffered for a later request to consume. A request addressed at a group member gets its
   replies keyed by the key it asked with (its own `baseUrl`), never the group name — only
   `status` reports group keys.
-- Fail-open: daemon unreachable → the request goes through unqueued. A client whose daemon dies
-  mid-wait is released to its request.
+- Fail-open: daemon unreachable → the request goes through unqueued (`failOpen: true`, the
+  default). A client whose daemon dies mid-wait is released to its request. With
+  `failOpen: false` the request hard-errors instead (the queue becomes a single point of failure).
+- Queue-wait cap: a parent `acquire` older than `queueTimeoutMs` is dropped from the queue and
+  passes through unqueued with a visible warning (no hard error). A child's wait is always
+  unlimited — a subagent never passes through unqueued, which would defeat serialisation.
+- Idle-exit: the daemon self-terminates `daemonIdleExitMs` (default 60 s) after the last client
+  disconnects, unlinking its socket, so no orphan process lingers. A client that reconnects
+  within the grace cancels the exit, so a quick relaunch keeps the warm daemon. A daemon that
+  starts with no client arms the same timer, so a spawn whose client never arrives does not linger.
+  Set `daemonIdleExitMs` high to keep the daemon resident.
 - Recommended pi setting while queued requests queue up behind a long prefill:
   `httpIdleTimeoutMs: 900000`.
 
