@@ -7,22 +7,24 @@ JSON. Every message is one JSON object on a single line.
 
 | op        | fields                                        | response                                                        |
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `acquire` | `queueKey`, `sessionKey`, `role`              | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
+| `acquire` | `queueKey`, `sessionKey`, `role`, `group`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
+| `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`) |
 | `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
-request sits in the FIFO waiting list and the grant arrives when a slot frees. A client that
+request sits in the priority waiting list and the grant arrives when a slot frees. A client that
 disconnects while queued is dropped from the queue (that is how Esc aborts feel immediate), and
 a disconnect that held a slot releases it. A client can also send `cancel` to drop its own
 queued request without closing the socket — this is how Esc cancels a request that is still
 waiting for a slot.
 
-`role` is `parent` (interactive) or `child` (subagent). FIFO ordering is implemented today;
-parent-over-child priority and aging are spec'd in #1 and the field is carried now so the
-protocol does not change when they land.
+`role` is `parent` (interactive) or `child` (subagent); `group` is an optional `PI_QUEUE_GROUP`
+label carried through to `status`. The scheduler grants by tier — parent over child, FIFO within a
+tier — with aging anti-starvation: the longest-waiting child jumps the queue once it has waited
+`agingAfterMs`, or once `agingAfterSlots` parents have been granted in a row.
 
 ## Leases and session switches
 
@@ -57,7 +59,7 @@ will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools r
 
 ```json
 {
-  "defaults": { "maxStreams": 1, "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000 },
+  "defaults": { "maxStreams": 1, "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000 },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
     "zen": { "maxStreams": 3 }

@@ -138,10 +138,10 @@ export class LeaseClient {
 	 * Resolves when the slot is granted, when the daemon is unreachable, or when
 	 * `signal` aborts (the queued request is cancelled at the daemon first).
 	 */
-	async acquire(queueKey: string, sessionKey: string, role: Role, signal?: AbortSignal): Promise<void> {
+	async acquire(queueKey: string, sessionKey: string, role: Role, group?: string, signal?: AbortSignal): Promise<void> {
 		if (!(await this.connectDaemon())) return;
 		this.sock?.ref(); // a queued request must keep pi alive
-		this.send({ op: "acquire", queueKey, sessionKey, role });
+		this.send({ op: "acquire", queueKey, sessionKey, role, group });
 		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
 		const entry: Pending = { match: granted, resolve: () => {} };
 		const onAbort = () => {
@@ -170,6 +170,11 @@ export class LeaseClient {
 	release(queueKey: string, sessionKey: string): void {
 		this.send({ op: "release", queueKey, sessionKey });
 		this.sock?.unref();
+	}
+
+	/** Re-tier a live queued waiter (from /queue promote|demote); fire-and-forget. */
+	setRole(sessionKey: string, role: Role): void {
+		this.send({ op: "role", sessionKey, role });
 	}
 
 	/**

@@ -291,6 +291,155 @@ describe("lease lifecycle and session switch", () => {
 	});
 });
 
+describe("priority tiers and aging", () => {
+	const daemons: Daemon[] = [];
+	const clients: Client[] = [];
+	const open = async (d: Daemon) => {
+		const c = await connectClient(d.socketPath);
+		clients.push(c);
+		return c;
+	};
+	const acquire = (c: Client, sessionKey: string, role: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role });
+	const release = (c: Client, sessionKey: string) => c.send({ op: "release", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+
+	after(() => {
+		for (const c of clients) c.close();
+		for (const d of daemons) d.stop();
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	it("grants a queued parent ahead of an earlier-queued child", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		daemons.push(d);
+		const h = await open(d);
+		const child = await open(d);
+		const parent = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(child, "C", "child");
+		acquire(parent, "P", "parent");
+		await assert.rejects(parent.next(200), /no message from daemon within/);
+
+		release(h, "H");
+		assert.deepEqual(await parent.next(3000), granted("P"), "parent outranks the earlier-queued child");
+		release(parent, "P");
+		assert.deepEqual(await child.next(3000), granted("C"));
+	});
+
+	it("grants queued parents in arrival order (FIFO within tier)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		daemons.push(d);
+		const h = await open(d);
+		const a = await open(d);
+		const b = await open(d);
+		const e = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(a, "A", "parent");
+		acquire(b, "B", "parent");
+		acquire(e, "C", "parent");
+		await assert.rejects(a.next(200), /no message from daemon within/);
+
+		const order: string[] = [];
+		release(h, "H");
+		for (const cl of [a, b, e]) {
+			const g = await cl.next(3000);
+			order.push(g.sessionKey);
+			release(cl, g.sessionKey);
+		}
+		assert.deepEqual(order, ["A", "B", "C"]);
+	});
+
+	it("boosts a child that has waited past agingAfterMs ahead of a parent", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 300, agingAfterSlots: 1000 }, queues: {} });
+		daemons.push(d);
+		const h = await open(d);
+		const child = await open(d);
+		const parent = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(child, "C", "child");
+		acquire(parent, "P", "parent");
+		await sleep(400); // child ages past agingAfterMs
+
+		release(h, "H");
+		assert.deepEqual(await child.next(3000), granted("C"), "aged child jumps ahead of the parent");
+	});
+
+	it("boosts the longest-waiting child after agingAfterSlots consecutive parent grants", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 100000, agingAfterSlots: 2 }, queues: {} });
+		daemons.push(d);
+		const h = await open(d);
+		const child = await open(d);
+		const p1 = await open(d);
+		const p2 = await open(d);
+		const p3 = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(child, "C", "child");
+		acquire(p1, "P1", "parent");
+		acquire(p2, "P2", "parent");
+		acquire(p3, "P3", "parent");
+		await assert.rejects(child.next(200), /no message from daemon within/);
+
+		release(h, "H");
+		// H's direct grant is streak 1, P1's queued grant is streak 2 → the child is boosted next.
+		assert.deepEqual(await p1.next(3000), granted("P1"));
+		release(p1, "P1");
+		// streak reached agingAfterSlots: the child is boosted ahead of the remaining parents
+		assert.deepEqual(await child.next(3000), granted("C"), "aged by parent-grant streak");
+		release(child, "C");
+		assert.deepEqual(await p2.next(3000), granted("P2"));
+		release(p2, "P2");
+		assert.deepEqual(await p3.next(3000), granted("P3"));
+	});
+
+	it("counts direct (free-slot) parent grants toward the aging streak", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 100000, agingAfterSlots: 2 }, queues: {} });
+		daemons.push(d);
+		const p1 = await open(d);
+		const p2 = await open(d);
+		const child = await open(d);
+		const p3 = await open(d);
+
+		acquire(p1, "P1", "parent");
+		assert.deepEqual(await p1.next(3000), granted("P1")); // streak 1 (fast path)
+		release(p1, "P1");
+		acquire(p2, "P2", "parent");
+		assert.deepEqual(await p2.next(3000), granted("P2")); // streak 2 (fast path)
+		acquire(child, "C", "child");
+		acquire(p3, "P3", "parent");
+		await assert.rejects(child.next(200), /no message from daemon within/);
+
+		release(p2, "P2");
+		assert.deepEqual(await child.next(3000), granted("C"), "fast-path grants aged the child past P3");
+	});
+
+	it("re-tiers a queued waiter on the role op (promote a child ahead of a parent)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		daemons.push(d);
+		const h = await open(d);
+		const child = await open(d);
+		const parent = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(child, "C", "child");
+		acquire(parent, "P", "parent");
+		await assert.rejects(parent.next(200), /no message from daemon within/);
+
+		child.send({ op: "role", sessionKey: "C", role: "parent" }); // promote the queued child
+		release(h, "H");
+		assert.deepEqual(await child.next(3000), granted("C"), "promoted child now leads the parent tier (enqueued first)");
+	});
+});
+
 describe("queue policy resolution", () => {
 	after(() => {
 		closeAllClients();

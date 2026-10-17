@@ -50,6 +50,13 @@ function queueFor(key) {
 			idleMs: policy.idleQuantumMs ?? defaults.idleQuantumMs ?? 120000,
 			monopolyRequests: policy.monopolyRequests ?? defaults.monopolyRequests ?? 12,
 			monopolyMs: policy.monopolyMs ?? defaults.monopolyMs ?? 180000,
+			// Aging: a child is boosted ahead of parents after this many consecutive parent
+			// grants, or after waiting this long — anti-starvation for background jobs.
+			agingAfterSlots: policy.agingAfterSlots ?? defaults.agingAfterSlots ?? 3,
+			agingAfterMs: policy.agingAfterMs ?? defaults.agingAfterMs ?? 60000,
+			// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
+			policy: policy.policy ?? defaults.policy ?? "priority-aging",
+			parentGrantStreak: 0,
 			holders: [],
 			waiting: [],
 		});
@@ -76,9 +83,27 @@ function beat(lease, queue) {
 	lease.requests++;
 }
 
+// Pick the next waiter: an aged child (longest-waiting) jumps the queue; otherwise the
+// earliest parent, then the earliest child — FIFO within each tier (parent > child).
+function pickNext(queue) {
+	if (queue.policy === "fifo") return queue.waiting[0];
+	const now = Date.now();
+	let aged = null;
+	for (const w of queue.waiting) {
+		if (w.role !== "child") continue;
+		if (now - w.enqueuedAt >= queue.agingAfterMs || queue.parentGrantStreak >= queue.agingAfterSlots) {
+			if (!aged || w.enqueuedAt < aged.enqueuedAt) aged = w;
+		}
+	}
+	if (aged) return aged;
+	return queue.waiting.find((w) => w.role === "parent") ?? queue.waiting[0];
+}
+
 function grantNext(queue) {
 	while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
-		const waiter = queue.waiting.shift();
+		const waiter = pickNext(queue);
+		remove(queue.waiting, waiter);
+		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
 		const lease = newLease(queue, waiter.sessionKey, waiter.conn);
 		queue.holders.push(lease);
 		remove(waiter.conn.queued, waiter);
@@ -129,10 +154,13 @@ function handle(msg, conn) {
 				const lease = newLease(queue, msg.sessionKey, conn);
 				queue.holders.push(lease);
 				conn.leases.push(lease);
+				// A direct grant counts toward the parent-grant streak too: a parent that never
+				// queues must not starve a queued child past agingAfterSlots.
+				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
 				send(conn, { op: "granted", queueKey: queue.queueKey, sessionKey: msg.sessionKey });
 				return;
 			}
-			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", conn, queue };
+			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, conn, queue, enqueuedAt: Date.now() };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
 			return;
@@ -171,6 +199,17 @@ function handle(msg, conn) {
 			send(conn, { op: "ok" });
 			return;
 		}
+		case "role": {
+			// /queue promote|demote: re-tier a live queued waiter in place (no reply, like cancel).
+			for (const queue of queues.values()) {
+				const w = queue.waiting.find((x) => x.sessionKey === msg.sessionKey && x.conn === conn);
+				if (w) {
+					w.role = msg.role === "child" ? "child" : "parent";
+					break;
+				}
+			}
+			return;
+		}
 		case "status":
 			send(conn, {
 				op: "status",
@@ -178,7 +217,7 @@ function handle(msg, conn) {
 					queueKey: q.queueKey,
 					maxStreams: q.maxStreams,
 					holders: q.holders.map((l) => l.sessionKey),
-					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role })),
+					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role, group: w.group })),
 				})),
 			});
 			return;
