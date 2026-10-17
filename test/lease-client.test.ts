@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,6 +10,8 @@ import { DAEMON, QUEUE_KEY, sleep, startDaemon, stopAllDaemons, waitForDaemon } 
 
 const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
+
+const QUEUE_KEY2 = "http://model.test/v2";
 
 describe("lease client", () => {
 	after(stopAllDaemons);
@@ -142,7 +144,7 @@ describe("lease client", () => {
 	});
 
 	it("heartbeats keep a held lease alive past its TTL", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 400 }, queues: {} });
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 1000 }, queues: {} });
 		await waitForDaemon(d.socketPath);
 		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: 100 });
 		const b = new LeaseClient({ socketPath: d.socketPath });
@@ -151,8 +153,32 @@ describe("lease client", () => {
 		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
 
-		await sleep(1500); // ~3.7 TTLs: A's heartbeat must keep its slot
+		await sleep(1500); // ~1.5 TTLs: A's heartbeat must keep its slot
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "heartbeats must keep A's lease");
+
+		a.release(QUEUE_KEY, "A");
+		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("the default heartbeat ratio keeps a lease alive at the leaseTtlMs floor", async () => {
+		// The extension heartbeats at max(250, leaseTtlMs/3). At the 1000 ms floor a 1 s floor would
+		// equal the TTL, so a sweep landing between two beats would evict a healthy holder.
+		const TTL = 1000;
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: TTL }, queues: {} });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: Math.max(250, Math.floor(TTL / 3)) });
+		const b = new LeaseClient({ socketPath: d.socketPath });
+
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
+
+		await sleep(4000); // ~4 TTLs at the floor, with the sweep running every second
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "the heartbeat stays under the TTL: the holder keeps its slot");
 
 		a.release(QUEUE_KEY, "A");
 		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
@@ -311,6 +337,48 @@ describe("lease client", () => {
 		holder.close();
 		d.stop();
 	});
+
+	it("keeps a queued acquire alive when a concurrent beat on the same socket finishes", async () => {
+		// ref/unref on a Node socket is one switch, not a counter: any second op that unrefs frees
+		// the process to exit while the queued grant is still outstanding (audit finding 5).
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const holder = new LeaseClient({ socketPath: d.socketPath });
+		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the single slot
+
+		const leasePath = decodeURIComponent(new URL("../src/lease-client.ts", import.meta.url).pathname);
+		const script = join(mkdtempSync(join(tmpdir(), "llm-queue-child-ref-")), "child.mts");
+		writeFileSync(
+			script,
+			[
+				`import { LeaseClient } from ${JSON.stringify(leasePath)};`,
+				`const lease = new LeaseClient({ socketPath: process.argv[2] });`,
+				`const OTHER = ${JSON.stringify(QUEUE_KEY2)};`,
+				`await lease.acquire(OTHER, "CHILD", "parent");`,
+				`const queued = lease.acquire(${JSON.stringify(QUEUE_KEY)}, "CHILD", "parent");`,
+				`await lease.beat(OTHER, "CHILD"); // a finished op: must not free the socket under the queued acquire`,
+				"console.log(`GRANTED ${await queued}`);",
+				"lease.close();",
+			].join("\n"),
+		);
+		const child = spawn(process.execPath, [script, d.socketPath], { stdio: ["ignore", "pipe", "pipe"] });
+		let out = "";
+		child.stdout.on("data", (c) => (out += c));
+		child.stderr.on("data", (c) => (out += c));
+		let exited: number | null = null;
+		child.on("exit", (code) => (exited = code));
+
+		await sleep(2500);
+		assert.equal(exited, null, `the queued process exited after the concurrent beat (out=${JSON.stringify(out)})`);
+
+		holder.release(QUEUE_KEY, "H");
+		const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+		assert.equal(code, 0);
+		assert.match(out, /GRANTED granted/, "the child was granted its slot once it freed");
+
+		holder.close();
+		d.stop();
+	});
 });
 
 describe("daemon autostart", () => {
@@ -318,24 +386,22 @@ describe("daemon autostart", () => {
 	const socketPath = join(dir, "queue.sock");
 	const configPath = join(dir, "config.json");
 	writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
-	const lockPath = `${socketPath}.pid`;
 
 	after(() => spawnSync("pkill", ["-f", socketPath]));
 
-	it("starts the daemon detached and records its pid in the lockfile", async () => {
+	it("starts the daemon detached on demand", async () => {
 		const lease = new LeaseClient({ socketPath, daemonPath: DAEMON, configPath });
 		assert.equal((await lease.status()).op, "status");
-		assert.ok(Number(readFileSync(lockPath, "utf8")) > 0);
 		lease.close();
 	});
 
-	it("reclaims a stale lockfile left by a dead daemon", async () => {
+	it("reclaims a socket left by a dead daemon", async () => {
+		// No lockfile: the daemon's own start() resolves a live socket (the second daemon exits 0)
+		// and reclaims a stale socket file, so the client needs no liveness probe of its own.
 		spawnSync("pkill", ["-f", socketPath]);
 		await sleep(300);
-		writeFileSync(lockPath, "999999");
 		const lease = new LeaseClient({ socketPath, daemonPath: DAEMON, configPath });
 		assert.equal((await lease.status()).op, "status");
-		assert.notEqual(Number(readFileSync(lockPath, "utf8")), 999999);
 		lease.close();
 	});
 });

@@ -19,6 +19,7 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 const STUB_API = "stub-subagent-api";
 const SERIAL_KEY = "http://serial.test/v1";
 const PARALLEL_KEY = "http://parallel.test/v1";
+const NAMED_KEY = "http://named.test/v1";
 
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-sub-"));
@@ -27,7 +28,7 @@ writeFileSync(
 	join(agentDir, "llm-queue.json"),
 	JSON.stringify({
 		defaults: { maxStreams: 1 },
-		queues: { serial: { match: ["serial_prov"], maxStreams: 1 }, par: { match: ["par_prov"], maxStreams: 2 } },
+		queues: { serial: { match: ["serial_prov"], maxStreams: 1 }, par: { match: ["par_prov"], maxStreams: 2 }, named_prov: { maxStreams: 1 } },
 	}),
 );
 writeFileSync(
@@ -36,6 +37,7 @@ writeFileSync(
 		providers: {
 			serial_prov: { baseUrl: SERIAL_KEY, api: STUB_API, models: [{ id: "m" }] },
 			par_prov: { baseUrl: PARALLEL_KEY, api: STUB_API, models: [{ id: "m" }] },
+			named_prov: { baseUrl: NAMED_KEY, api: STUB_API, models: [{ id: "m" }] },
 		},
 	}),
 );
@@ -96,6 +98,7 @@ async function runSession(model: Model<any>, tools: any[] = [subagentTool]): Pro
 	const modelRuntime = await ModelRuntime.create({ modelsPath: join(agentDir, "models.json"), refreshOnCreate: false });
 	await modelRuntime.setRuntimeApiKey("serial_prov", "test");
 	await modelRuntime.setRuntimeApiKey("par_prov", "test");
+	await modelRuntime.setRuntimeApiKey("named_prov", "test");
 
 	const observed: unknown[] = [];
 	const resourceLoader = new DefaultResourceLoader({
@@ -127,6 +130,14 @@ describe("subagent launch serialisation (tool_call async rewrite)", () => {
 		const runtime = await ModelRuntime.create({ modelsPath: join(agentDir, "models.json"), refreshOnCreate: false });
 		const model = runtime.getModel("serial_prov", "m")!;
 		assert.equal(await runSession(model), false, "a serialised queue must rewrite async:true to false");
+	});
+
+	it("forces async:false for a queue keyed by the provider name (no match group)", async () => {
+		// The README's shape: queues = { named_prov: { maxStreams: 1 } }. The launch-blocking policy
+		// must resolve through the provider-name key, exactly as the daemon resolves queue policy.
+		const runtime = await ModelRuntime.create({ modelsPath: join(agentDir, "models.json"), refreshOnCreate: false });
+		const model = runtime.getModel("named_prov", "m")!;
+		assert.equal(await runSession(model), false, "a provider-name queue key must resolve blockSubagentLaunch");
 	});
 
 	it("leaves async:true on a multi-slot (parallel) queue", async () => {

@@ -29,7 +29,7 @@ That single command is the whole install:
    by native extensions are left unqueued. Providers must be declared in
    `~/.pi/agent/models.json` — queue keys name providers or their baseUrls.
 2. **Daemon autostart** — the extension spawns the daemon on demand (detached,
-   `~/.pi/agent/llm-queue.sock` + `.pid` lockfile, stale-socket reclaim, idle-exit after the
+   `~/.pi/agent/llm-queue.sock`, stale-socket reclaim, idle-exit after the
    last client leaves). Nothing to run manually, no launch agent, no systemd unit.
 3. **Config file** — `~/.pi/agent/llm-queue.json` is optional: a missing (or empty) file
    queues nothing, because queue keys are what select the providers to wrap. Create it to
@@ -75,9 +75,9 @@ to upgrade pi-llm-queue instead of failing silently.
 | `policy` | `priority-aging` | `priority-aging` (parent > child with aging) or `fifo`. |
 | `agingAfterSlots` | `3` | Boost a waiting child after this many consecutive parent grants. |
 | `agingAfterMs` | `60000` | Boost a waiting child after this long waiting. |
-| `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim). |
-| `idleQuantumMs` | `120000` | A holder with no model request for this long yields to a waiter. |
-| `monopolyRequests` / `monopolyMs` | `12` / `180000` | A busy holder is preempted after N requests or M seconds. |
+| `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim). Minimum `1000`. |
+| `idleQuantumMs` | `120000` | A holder with no model request for this long yields to a waiter — never while a request is in flight. |
+| `monopolyRequests` / `monopolyMs` | `12` / `180000` | A holder is preempted after N requests or M seconds — never while a request is in flight. |
 | `enabled` | `true` | `false` = passthrough: provider unwrapped, fully parallel. |
 | `match` | — | Explicit resource group: baseUrls and/or provider names sharing one queue. |
 | `blockSubagentLaunch` | `maxStreams == 1` | Force `subagent` launches to `async: false` on this queue. |

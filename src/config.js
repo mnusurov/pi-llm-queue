@@ -10,6 +10,7 @@ export const SCHEMA_VERSION = 1;
  * @typedef {object} FieldSpec
  * @property {"posInt"|"nonNegInt"|"posNum"|"nonNegNum"|"bool"|"strings"|"enum"} kind
  * @property {string[]} [values]
+ * @property {number} [min] Accepted floor for a number field (inclusive).
  * @property {boolean} [defaultsOnly] Valid in `defaults` only; a per-queue entry with it is rejected.
  * @property {boolean} [queuesOnly] Valid in a queue entry only; `defaults` never reads it.
  */
@@ -18,7 +19,9 @@ export const SCHEMA_VERSION = 1;
 const FIELDS = {
 	maxStreams: { kind: "posInt" },
 	policy: { kind: "enum", values: ["priority-aging", "fifo"] },
-	leaseTtlMs: { kind: "posNum" },
+	// Floor: the client heartbeats at max(250, leaseTtlMs/3), and the sweep runs every second.
+	// A shorter TTL means a heartbeating session loses its slot to a waiter over and over.
+	leaseTtlMs: { kind: "posNum", min: 1000 },
 	idleQuantumMs: { kind: "nonNegNum" },
 	monopolyRequests: { kind: "posInt" },
 	monopolyMs: { kind: "nonNegNum" },
@@ -59,8 +62,11 @@ function checkValue(path, value, spec) {
 			return Number.isInteger(value) && value >= 1 ? null : bad(DESC.posInt);
 		case "nonNegInt":
 			return Number.isInteger(value) && value >= 0 ? null : bad(DESC.nonNegInt);
-		case "posNum":
-			return typeof value === "number" && isFinite(value) && value > 0 ? null : bad(DESC.posNum);
+		case "posNum": {
+			const floor = spec.min ?? 0;
+			const desc = spec.min === undefined ? DESC.posNum : `a number >= ${spec.min}`;
+			return typeof value === "number" && isFinite(value) && value >= floor && value > 0 ? null : bad(desc);
+		}
 		case "nonNegNum":
 			return typeof value === "number" && isFinite(value) && value >= 0 ? null : bad(DESC.nonNegNum);
 		case "bool":
@@ -125,6 +131,51 @@ export function validateConfig(raw) {
 			}
 	}
 	return errors;
+}
+
+/**
+ * Read a JSON file as an object; anything unreadable (missing file, bad JSON) is an empty one.
+ * models.json is optional for pi, and a config/catalog read must never kill a detached daemon.
+ * @param {string} path @returns {Record<string, any>}
+ */
+export function readJson(path) {
+	try {
+		return JSON.parse(readFileSync(path, "utf8")) ?? {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Queue key for a model, resolved through the group rule. The daemon and the extension share
+ * this one implementation: a group whose `match` names the provider exactly owns it (split),
+ * else a group naming the endpoint (directly, or through a member provider serving it), else
+ * the endpoint itself. A raw socket client names only the endpoint, so it lands in the
+ * endpoint-level group — the documented split limitation.
+ * @param {Record<string, any>} queues
+ * @param {Record<string, any>} providers models.json provider catalog
+ * @param {{ provider?: string, baseUrl?: string }} model
+ * @returns {string}
+ */
+export function groupKeyFor(queues, providers, model) {
+	const active = Object.entries(queues ?? {}).filter(([, entry]) => entry?.enabled !== false);
+	for (const [name, entry] of active) if (entry?.match?.includes(model.provider)) return name;
+	for (const [name, entry] of active) if (entry?.match?.some((m) => m === model.baseUrl || providers[m]?.baseUrl === model.baseUrl)) return name;
+	return model.baseUrl;
+}
+
+/**
+ * Queue entry owning a model: the group's entry, else the endpoint key's entry (a baseUrl key
+ * wins over a provider-name key naming the same endpoint), else a provider-name key naming it.
+ * @param {Record<string, any>} queues
+ * @param {Record<string, any>} providers
+ * @param {{ provider?: string, baseUrl?: string }} model
+ * @returns {Record<string, any> | undefined}
+ */
+export function queueEntryFor(queues, providers, model) {
+	const key = groupKeyFor(queues, providers, model);
+	if (queues[key]) return queues[key];
+	return Object.entries(queues).find(([name]) => !name.includes("://") && providers[name]?.baseUrl === key)?.[1];
 }
 
 /**

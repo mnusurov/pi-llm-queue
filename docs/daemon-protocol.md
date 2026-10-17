@@ -7,12 +7,15 @@ JSON. Every message is one JSON object on a single line.
 
 | op        | fields                                        | response                                                        |
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `acquire` | `queueKey`, `sessionKey`, `role`, `group`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
-| `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
-| `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
+| `acquire` | `queueKey`*, `sessionKey`, `role`, `group`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
+| `release` | `queueKey`*, `sessionKey`                     | `{"op":"ok"}`                                                    |
+| `cancel`  | `queueKey`*, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`) |
-| `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
+| `renew`   | — (heartbeat) or `queueKey`*, `sessionKey` (activity beat), `done` (stream completed) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,switches,holders,waiting}]}` |
+
+\* `acquire`, `release` and `cancel` require `queueKey`: a keyless one would create an unnamed
+queue that silently holds a slot. The reply is `{"op":"error","reason":"... requires queueKey"}`.
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
 request sits in the priority waiting list and the grant arrives when a slot frees. A client that
@@ -28,8 +31,9 @@ tier — with aging anti-starvation: the longest-waiting child jumps the queue o
 
 ## Leases and session switches
 
-A grant is a **lease** with a TTL (`leaseTtlMs`, default 30 s). A live client keeps its leases
-alive with a bare `renew` heartbeat (the extension sends one every `leaseTtlMs / 3`, floor 1 s);
+A grant is a **lease** with a TTL (`leaseTtlMs`, default 30 s, minimum 1000 ms). A live client
+keeps its leases alive with a bare `renew` heartbeat (the extension sends one every
+`leaseTtlMs / 3`, floor 250 ms, always under the TTL so a sweep never lands between two beats);
 a session that dies without heartbeating has its lease reclaimed by the daemon and the next
 waiter is granted.
 
@@ -40,17 +44,35 @@ The slot is held per session across a whole run. A session switch happens only o
 - **idle quantum** (`idleQuantumMs`, default 120 s) — the holder sent no activity beat, i.e. made
   no model request, for that long. Long tool executions stay covered: every request beats the lease;
 - **monopoly quantum** (`monopolyRequests` requests / `monopolyMs` seconds, default 12 / 180 s) —
-  a busy session is preempted so a waiting session gets its turn; the count resets on the next grant.
+  a session with no request in flight is preempted so a waiting session gets its turn; the count
+  resets on the next grant.
 
 Quanta are checked once a second and only evict when someone is waiting: an idle slot nobody
 wants is not worth a context switch. A keyed `renew` (activity beat) refreshes the TTL, restarts
-the idle quantum and counts one request toward the monopoly; re-`acquire`ing a slot the session
-already holds counts the same way. A beat's reply is authoritative: `granted: false` means the
-slot was switched away, and the client must re-queue before it streams again — a preempted run
-never streams unqueued. A bare `renew` (no keys) heartbeats every lease of the connection.
+the idle quantum, counts one request toward the monopoly and counts the lease **in flight**; re-
+`acquire`ing a slot the session already holds counts the same way. A beat's reply is
+authoritative: `granted: false` means the slot was switched away, and the client must re-queue
+before it streams again — a preempted run never streams unqueued. A bare `renew` (no keys)
+heartbeats every lease of the connection.
+
+**A request in flight is never switched away.** The daemon cannot see the HTTP stream, so the
+beat is its start signal and a keyed `renew` with `done: true` is its end (the extension sends
+one when the stream finishes). The count is a counter, not a flag: concurrent same-session
+requests (a run plus a compaction) share one lease, and the first completion must not open the
+slot under the other. While the count is above zero the idle, request-count and elapsed-time
+quanta all pass the lease over — a preempted holder would keep streaming while the waiter started
+on the same endpoint, which is exactly the overlap the tool exists to prevent. The in-flight
+grace is the TTL: a live client heartbeats, so an in-flight lease survives as long as its stream
+does; a client killed mid-stream stops heartbeating and the TTL reclaims the slot for the next
+waiter. A `done` beat refreshes the TTL and decrements the count without counting a new request.
 
 shortcut: a tool execution longer than `idleQuantumMs` (default 120 s) with a session waiting
 will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools run longer.
+
+shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its in-flight lease never
+expires and a waiter waits for the whole stream. That is the serialisation promise, not a bug —
+raise `httpIdleTimeoutMs` (recommended 900000) so the waiter's client stays patient, and cap
+long generations per queue with `monopolyRequests` / `monopolyMs` once the stream ends.
 
 The daemon counts every **session switch** — every grant of a queued waiter, whether the slot was
 released by its holder or evicted by a quantum — as the event that re-prefills the KV cache, and
@@ -78,11 +100,15 @@ unanswered, so the client polls `status` every 2 s for its position).
 
 Keys may be a baseUrl (the endpoint itself) or a provider name. The daemon resolves a
 provider-name key to that provider's `baseUrl` by reading `models.json` (passed as
-`--models-json`); a baseUrl key wins when both name the same endpoint. The extension wraps
+`--models-json`, optional: a missing catalog is an empty one, never a startup crash); a baseUrl
+key wins when both name the same endpoint. The extension wraps
 every provider named by a key plus every provider serving an endpoint named by a key, and
 queues its requests under the model's baseUrl — or under its group's name, when a group names it.
+The group/entry resolution rule is one implementation (`groupKeyFor`, `queueEntryFor` in
+`src/config.js`) shared by the extension and the daemon.
 
-Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs`, `idleQuantumMs`, `monopolyRequests`,
+Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `idleQuantumMs`,
+`monopolyRequests`,
 `monopolyMs`, `agingAfterSlots`, `agingAfterMs`, `blockSubagentLaunch` (all also valid in
 `defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
 `failOpen` (default `true`) and `queueTimeoutMs`
@@ -102,7 +128,7 @@ keeps the last good config.
   (passthrough) queue never blocks.
 
 - **`enabled: false`** — passthrough: the queue grants every session immediately (`status`
-  reports `maxStreams: null`), and the extension leaves the provider unwrapped. A disabled
+  reports `maxStreams: null`, printed as `passthrough` by `/queue`), and the extension leaves the provider unwrapped. A disabled
   group does not re-key its members, so their own endpoint entries still apply.
 - **`match`** — an explicit resource group, overriding baseUrl keying:
   - **merge**: members (baseUrls and/or provider names) share the group's slot pool. The
@@ -112,6 +138,8 @@ keeps the last good config.
     that provider its own slot pool (`match: ["strata"]` beside `match: ["llama"]` on one
     server). Splitting needs provider identity, so it works through the extension's key, not
     through a raw baseUrl.
+  - **precedence**: a group naming the model's provider exactly owns it, ahead of a group naming
+    only its endpoint — split beats merge, whatever the order in the config file.
 
 ### Hot-reload
 
@@ -126,20 +154,24 @@ read once at connect and are the fields that need a pi restart.
 
 ## Client contract
 
-- The extension starts the daemon on demand: detached spawn, `<socket>.pid` lockfile, and
-  reclaim when the socket does not answer.
+- The extension starts the daemon on demand: one detached spawn per session start. The daemon
+  resolves the race itself — a live socket makes the second daemon exit 0, a stale socket file is
+  reclaimed — so the client needs no liveness probe and no lockfile.
 - Leases are per session (`sessionKey` is the pi session UUID), not per process.
 - Turn-based affinity: the extension acquires at `agent_start` and releases after the run
   settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
   a held slot at once and cancels a still-queued request. Requests outside a run (compaction,
   classifier, nested calls) queue for themselves. Every request the run makes beats its lease,
-  so the slot survives tool executions; the client heartbeats `renew` on a timer so a live
-  session never loses the slot to the TTL.
+  so the slot survives tool executions, and reports completion (`done`) when its stream ends, so
+  the next waiter gets its turn; the client heartbeats `renew` on a timer so a live session never
+  loses the slot to the TTL.
 - Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
   `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,
   never buffered for a later request to consume. A request addressed at a group member gets its
   replies keyed by the key it asked with (its own `baseUrl`), never the group name — only
   `status` reports group keys.
+- Socket framing: a peer that never sends a newline is disconnected past a 100 KB line buffer,
+  and a message split inside a multi-byte character is decoded whole (streaming `TextDecoder`).
 - Fail-open: daemon unreachable → the request goes through unqueued (`failOpen: true`, the
   default). A client whose daemon dies mid-wait is released to its request. With
   `failOpen: false` the request hard-errors instead (the queue becomes a single point of failure).
