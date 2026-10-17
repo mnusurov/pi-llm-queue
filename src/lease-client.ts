@@ -137,8 +137,16 @@ export class LeaseClient {
 	/**
 	 * Resolves when the slot is granted, when the daemon is unreachable, or when
 	 * `signal` aborts (the queued request is cancelled at the daemon first).
+	 * `onQueued` fires while the request waits, so the caller can show a live indicator.
 	 */
-	async acquire(queueKey: string, sessionKey: string, role: Role, group?: string, signal?: AbortSignal): Promise<void> {
+	async acquire(
+		queueKey: string,
+		sessionKey: string,
+		role: Role,
+		group?: string,
+		signal?: AbortSignal,
+		onQueued?: (info: { position: number; holders: string[] }) => void,
+	): Promise<void> {
 		if (!(await this.connectDaemon())) return;
 		this.sock?.ref(); // a queued request must keep pi alive
 		this.send({ op: "acquire", queueKey, sessionKey, role, group });
@@ -150,6 +158,27 @@ export class LeaseClient {
 			this.send({ op: "cancel", queueKey, sessionKey });
 			entry.resolve({ op: "aborted" });
 		};
+		// A queued acquire stays unanswered by design, so the indicator reads its position
+		// from status polls: a short grace (an idle slot grants instantly) then every 2 s.
+		// shortcut: position is enqueue order, not priority-grant order; upgrade when the
+		// daemon pushes queued acks.
+		let poll: ReturnType<typeof setInterval> | null = null;
+		let settled = false;
+		const report = async () => {
+			const s = await this.status();
+			if (settled) return; // the grant landed mid-poll: never re-arm the indicator after it
+			const q = s?.queues?.find((q: any) => q.queueKey === queueKey);
+			const at = q?.waiting.findIndex((w: any) => w.sessionKey === sessionKey) ?? -1;
+			if (at >= 0) onQueued?.({ position: at + 1, holders: q.holders });
+		};
+		const firstPoll = onQueued
+			? setTimeout(() => {
+					report();
+					poll = setInterval(report, 2000);
+					poll.unref();
+				}, 300)
+			: null;
+		firstPoll?.unref();
 		await new Promise<void>((resolve) => {
 			entry.resolve = () => {
 				signal?.removeEventListener("abort", onAbort);
@@ -164,6 +193,9 @@ export class LeaseClient {
 				signal.addEventListener("abort", onAbort, { once: true });
 			}
 		});
+		if (firstPoll) clearTimeout(firstPoll);
+		if (poll) clearInterval(poll);
+		settled = true;
 		this.sock?.unref();
 	}
 

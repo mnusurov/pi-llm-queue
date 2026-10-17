@@ -12,7 +12,7 @@ JSON. Every message is one JSON object on a single line.
 | `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`) |
 | `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
-| `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
+| `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,switches,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
 request sits in the priority waiting list and the grant arrives when a slot frees. A client that
@@ -51,6 +51,12 @@ never streams unqueued. A bare `renew` (no keys) heartbeats every lease of the c
 
 shortcut: a tool execution longer than `idleQuantumMs` (default 120 s) with a session waiting
 will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools run longer.
+
+The daemon counts every **session switch** — every grant of a queued waiter, whether the slot was
+released by its holder or evicted by a quantum — as the event that re-prefills the KV cache, and
+reports the per-queue count as `switches` in `status`. `/queue` prints it with the slot holder and
+the per-tier queue depth; the footer indicator reads the same status (a queued `acquire` stays
+unanswered, so the client polls `status` every 2 s for its position).
 
 ## Queues and config
 

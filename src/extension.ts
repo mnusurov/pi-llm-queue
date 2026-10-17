@@ -124,6 +124,38 @@ export default function (pi: ExtensionAPI) {
 	const roleOverride = new Map<string, Role>();
 	const currentRole = (): Role => roleOverride.get(sessionKey) ?? envRole;
 
+	// Footer indicator while this session waits for a slot: queue position + elapsed wait,
+	// refreshed every second, cleared in sync with the grant.
+	let ui: ExtensionContext["ui"] | null = null;
+	let queuedInfo: { position: number; holders: string[]; startedAt: number } | null = null;
+	let indicatorTimer: ReturnType<typeof setInterval> | null = null;
+
+	const renderIndicator = () =>
+		ui?.setStatus(
+			"llm-queue",
+			queuedInfo
+				? `llm-queue #${queuedInfo.position} · ${Math.round((Date.now() - queuedInfo.startedAt) / 1000)}s · behind ${queuedInfo.holders.join(", ") || "?"}`
+				: undefined,
+		);
+
+	const showQueued = (info: { position: number; holders: string[] }) => {
+		queuedInfo = { ...info, startedAt: queuedInfo?.startedAt ?? Date.now() };
+		indicatorTimer ??= setInterval(renderIndicator, 1000);
+		indicatorTimer.unref();
+		renderIndicator();
+	};
+
+	const clearQueued = () => {
+		if (indicatorTimer) {
+			clearInterval(indicatorTimer);
+			indicatorTimer = null;
+		}
+		if (queuedInfo) {
+			queuedInfo = null;
+			renderIndicator();
+		}
+	};
+
 	// shortcut: one lease per process; a process running several sessions needs per-session keys.
 	let sessionKey = "";
 	let heldQueueKey: string | null = null;
@@ -160,7 +192,8 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal);
+					await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal, showQueued);
+					clearQueued();
 					if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
 					else selfQueued = true;
 				}
@@ -213,7 +246,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			const s = await lease.status();
-			ctx.ui.notify(s ? JSON.stringify(s.queues) : "pi-llm-queue: daemon unreachable", "info");
+			if (!s) {
+				ctx.ui.notify("pi-llm-queue: daemon unreachable", "info");
+				return;
+			}
+			const lines = s.queues.map((q: any) => {
+				const depth = (role: string) => q.waiting.filter((w: any) => w.role === role).length;
+				return `${q.queueKey}: slot ${q.holders.join(", ") || "free"} (${q.holders.length}/${q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")} · switches ${q.switches}`;
+			});
+			ctx.ui.notify(lines.length ? lines.join("\n") : "pi-llm-queue: no queues", "info");
 		},
 	});
 
@@ -298,6 +339,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionKey = ctx.sessionManager.getSessionId();
+		ui = ctx.ui;
 		if (!registered) {
 			registered = true;
 			registerQueuedProviders(ctx);
@@ -318,7 +360,8 @@ export default function (pi: ExtensionAPI) {
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
 		const queueKey = resolveQueueKey(queues, model);
-		await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal);
+		await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued);
+		clearQueued();
 		// An abort already released the slot: do not claim a lease we no longer hold.
 		if (!ctx.signal?.aborted) heldQueueKey = queueKey;
 	});
@@ -328,5 +371,8 @@ export default function (pi: ExtensionAPI) {
 		releaseTimer.unref();
 	});
 
-	pi.on("session_shutdown", () => releaseSlot());
+	pi.on("session_shutdown", () => {
+		releaseSlot();
+		clearQueued(); // a shutdown while queued must not leave the indicator up
+	});
 }

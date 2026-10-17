@@ -646,3 +646,80 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		d.stop();
 	});
 });
+
+describe("observability: status counters", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	const acquire = (c: Client, sessionKey: string, role: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role });
+
+	it("counts a session switch when the idle quantum evicts a holder", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, idleQuantumMs: 300 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, "A", "parent");
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		acquire(b, "B", "parent");
+		assert.deepEqual(await b.next(5000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" }, "the idle quantum switched the slot to the waiter");
+
+		a.send({ op: "status" });
+		const status = await a.next(3000);
+		assert.equal(status.queues[0].switches, 1, "a quantum eviction counts as one session switch");
+		assert.deepEqual(status.queues[0].holders, ["B"]);
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("counts a plain release handover as a session switch", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, "A", "parent");
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		acquire(b, "B", "parent");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "ok" }, "the release reply is consumed before status");
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+
+		a.send({ op: "status" });
+		assert.equal((await a.next(3000)).queues[0].switches, 1, "the settle-and-handoff switch is the one a normal run makes");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("reports queue depth per tier in status", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		acquire(a, "A", "parent");
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		acquire(b, "P", "parent");
+		acquire(b, "C", "child");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		a.send({ op: "status" });
+		const status = await a.next(3000);
+		assert.deepEqual(
+			status.queues[0].waiting.map((w: any) => [w.sessionKey, w.role]),
+			[
+				["P", "parent"],
+				["C", "child"],
+			],
+			"status carries the tier of every waiter so /queue can report per-tier depth",
+		);
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+});
