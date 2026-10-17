@@ -10,7 +10,7 @@ JSON. Every message is one JSON object on a single line.
 | `acquire` | `queueKey`, `sessionKey`, `role`              | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
-| `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` — keeps the lease alive; a beat also restarts the holder's switch quanta |
+| `renew`   | — (heartbeat) or `queueKey`, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,holders,waiting}]}` |
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
@@ -43,7 +43,12 @@ The slot is held per session across a whole run. A session switch happens only o
 Quanta are checked once a second and only evict when someone is waiting: an idle slot nobody
 wants is not worth a context switch. A keyed `renew` (activity beat) refreshes the TTL, restarts
 the idle quantum and counts one request toward the monopoly; re-`acquire`ing a slot the session
-already holds counts the same way.
+already holds counts the same way. A beat's reply is authoritative: `granted: false` means the
+slot was switched away, and the client must re-queue before it streams again — a preempted run
+never streams unqueued. A bare `renew` (no keys) heartbeats every lease of the connection.
+
+shortcut: a tool execution longer than `idleQuantumMs` (default 120 s) with a session waiting
+will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools run longer.
 
 ## Queues and config
 

@@ -15,6 +15,22 @@ export interface Daemon {
 	stop(): void;
 }
 
+// Every harness daemon/socket is tracked so a failing assert cannot leave them alive:
+// ref'd sockets and live daemons keep `node --test` from exiting. Call stopAllDaemons()
+// and closeAllClients() from an `after` hook in each suite.
+const spawned: ChildProcess[] = [];
+const sockets: import("node:net").Socket[] = [];
+
+export function stopAllDaemons(): void {
+	for (const proc of spawned) proc.kill();
+	spawned.length = 0;
+}
+
+export function closeAllClients(): void {
+	for (const sock of sockets) sock.destroy();
+	sockets.length = 0;
+}
+
 export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown): Daemon {
 	const dir = mkdtempSync(join(tmpdir(), "llm-queue-"));
 	const socketPath = join(dir, "queue.sock");
@@ -28,6 +44,7 @@ export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, que
 	}
 	const proc = spawn(process.execPath, args, { stdio: "ignore" });
 	proc.unref();
+	spawned.push(proc);
 	return { socketPath, configPath, proc, stop: () => proc.kill() };
 }
 
@@ -53,6 +70,7 @@ export async function connectClient(socketPath: string): Promise<Client> {
 	for (let attempt = 0; attempt < 40; attempt++) {
 		try {
 			const sock = await tryConnect(socketPath);
+			sockets.push(sock);
 			return makeClient(sock);
 		} catch {
 			await sleep(50);

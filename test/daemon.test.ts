@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
-import { connectClient, sleep, startDaemon, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -84,7 +84,7 @@ describe("daemon socket protocol", () => {
 	it("answers renew with ok", async () => {
 		const c = await connectClient(d.socketPath);
 		c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await c.next(3000), { op: "ok" });
+		assert.deepEqual(await c.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false });
 		c.close();
 	});
 
@@ -134,10 +134,13 @@ describe("lease lifecycle and session switch", () => {
 	const acquire = (c: Client, sessionKey: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
 	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+	const QUEUE_KEY2 = "http://model.test/v2";
 
 	after(() => {
 		for (const c of clients) c.close();
 		for (const d of daemons) d.stop();
+		closeAllClients();
+		stopAllDaemons();
 	});
 
 	it("reclaims a crashed session's lease after the TTL and grants the next waiter", async () => {
@@ -170,6 +173,41 @@ describe("lease lifecycle and session switch", () => {
 
 		for (let i = 0; i < 6; i++) await sleep(150); // heartbeats stop: the TTL reclaims
 		assert.deepEqual(await b.next(5000), granted("B"));
+	});
+
+	it("answers a keyed beat with the authoritative grant state", async () => {
+		const d = startQuanta({});
+		const a = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }, "a beat on a held slot is acknowledged");
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "ok" });
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "a beat on a lost slot tells the client to re-queue");
+	});
+
+	it("releases every lease of a client that disconnects (no phantom holder)", async () => {
+		const d = startQuanta({});
+		const multi = await open(d); // one client holding two sessions on two endpoints
+		const w1 = await open(d);
+		const w2 = await open(d);
+
+		acquire(multi, "M1");
+		assert.deepEqual(await multi.next(3000), granted("M1"));
+		multi.send({ op: "acquire", queueKey: QUEUE_KEY2, sessionKey: "M2", role: "parent" });
+		assert.deepEqual(await multi.next(3000), { op: "granted", queueKey: QUEUE_KEY2, sessionKey: "M2" });
+
+		acquire(w1, "W1");
+		w2.send({ op: "acquire", queueKey: QUEUE_KEY2, sessionKey: "W2", role: "parent" });
+		await assert.rejects(w1.next(200), /no message from daemon within/);
+
+		multi.close(); // disconnect while holding BOTH leases: both slots must free
+		assert.deepEqual(await w1.next(5000), granted("W1"));
+		assert.deepEqual(await w2.next(5000), { op: "granted", queueKey: QUEUE_KEY2, sessionKey: "W2" });
 	});
 
 	it("idle quantum: a holder that stops requesting yields the slot to a waiter", async () => {
@@ -243,7 +281,7 @@ describe("lease lifecycle and session switch", () => {
 		assert.deepEqual(await a.next(3000), granted("A"));
 		beat(a, "A");
 		beat(a, "A");
-		for (let i = 0; i < 2; i++) assert.deepEqual(await a.next(3000), { op: "ok" }); // drain beat replies
+		for (let i = 0; i < 2; i++) assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }); // drain beat replies
 		acquire(b, "B");
 		assert.deepEqual(await b.next(5000), granted("B"));
 
@@ -254,6 +292,11 @@ describe("lease lifecycle and session switch", () => {
 });
 
 describe("queue policy resolution", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
 	it("applies a provider-name queue key to that provider's endpoint", async () => {
 		const d = startDaemon(
 			{ defaults: { maxStreams: 1 }, queues: { zen: { maxStreams: 2 } } },
