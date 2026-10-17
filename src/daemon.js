@@ -70,9 +70,13 @@ function applyPolicy(queue, policy) {
 	return queue;
 }
 
+function newQueue(queueKey) {
+	return applyPolicy({ queueKey, parentGrantStreak: 0, switches: 0, holders: [], waiting: [] }, policyFor(queueKey));
+}
+
 function queueFor(key) {
 	const queueKey = groupFor(key);
-	if (!queues.has(queueKey)) queues.set(queueKey, applyPolicy({ queueKey, parentGrantStreak: 0, holders: [], waiting: [] }, policyFor(queueKey)));
+	if (!queues.has(queueKey)) queues.set(queueKey, newQueue(queueKey));
 	return queues.get(queueKey);
 }
 
@@ -118,6 +122,7 @@ function grantNext(queue) {
 		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
 		const lease = newLease(queue, waiter.sessionKey, waiter.conn);
 		queue.holders.push(lease);
+		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
 		remove(waiter.conn.queued, waiter);
 		waiter.conn.leases.push(lease);
 		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
@@ -232,6 +237,7 @@ function handle(msg, conn) {
 				queues: [...queues.values()].map((q) => ({
 					queueKey: q.queueKey,
 					maxStreams: q.maxStreams,
+					switches: q.switches,
 					holders: q.holders.map((l) => l.sessionKey),
 					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role, group: w.group })),
 				})),
@@ -322,9 +328,10 @@ function rebuildQueues() {
 		const target = groupFor(key);
 		let moved = rebuilt.get(target);
 		if (!moved) {
-			moved = applyPolicy({ queueKey: target, parentGrantStreak: 0, holders: [], waiting: [] }, policyFor(target));
+			moved = newQueue(target);
 			rebuilt.set(target, moved);
 		}
+		moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
 		for (const lease of queue.holders) {
 			lease.queueKey = target;
 			moved.holders.push(lease);

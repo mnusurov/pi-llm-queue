@@ -205,6 +205,31 @@ describe("lease client", () => {
 		holder.close();
 		d.stop();
 	});
+
+	it("reports queue position and bearers while an acquire waits, and stops once granted", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath });
+		const b = new LeaseClient({ socketPath: d.socketPath });
+		await a.acquire(QUEUE_KEY, "A", "parent");
+
+		const seen: any[] = [];
+		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent", undefined, undefined, (info) => seen.push(info));
+		await sleep(1500);
+		assert.ok(seen.length, "a waiting acquire reports its queue position");
+		assert.equal(seen[0].position, 1);
+		assert.deepEqual(seen[0].holders, ["A"], "the report names the session holding the slot");
+
+		a.release(QUEUE_KEY, "A");
+		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
+		const reports = seen.length;
+		await sleep(2500);
+		assert.equal(seen.length, reports, "reporting stops once the slot is granted");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
 });
 
 describe("daemon autostart", () => {

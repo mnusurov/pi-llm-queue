@@ -36,18 +36,18 @@ function makePi() {
 	};
 }
 
-function makeCtx(sessionId: string, signal?: AbortSignal) {
+function makeCtx(sessionId: string, signal?: AbortSignal, ui: any = { notify: () => {}, setStatus: () => {} }) {
 	return {
 		sessionManager: { getSessionId: () => sessionId },
 		model,
 		signal,
 		modelRegistry: { getRegisteredNativeProvider: () => undefined },
-		ui: { notify: () => {} },
+		ui,
 	};
 }
 
-const start = (pi: ReturnType<typeof makePi>, sessionId: string, signal?: AbortSignal) => {
-	const ctx = makeCtx(sessionId, signal);
+const start = (pi: ReturnType<typeof makePi>, sessionId: string, signal?: AbortSignal, ui?: any) => {
+	const ctx = makeCtx(sessionId, signal, ui);
 	pi.handlers["session_start"].forEach((h) => h({}, ctx));
 	return ctx;
 };
@@ -109,6 +109,33 @@ describe("provider wrapper (queuedStream)", () => {
 			"done",
 			"B's stream proceeds once the slot frees",
 		);
+	});
+
+	it("shows a footer indicator while queued and clears it when the slot is granted", async () => {
+		const a = makePi();
+		const b = makePi();
+		const status: [string, string | undefined][] = [];
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "IND-A");
+		const ctxB = start(b, "IND-B", undefined, {
+			notify: () => {},
+			setStatus: (key: string, text: string | undefined) => status.push([key, text]),
+		});
+		await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its run
+
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // B queues for itself
+		await sleep(1500);
+		const shown = status.filter(([, t]) => t).pop()?.[1] ?? "";
+		assert.ok(shown, "the indicator appears while the session waits");
+		assert.match(shown, /#1/, "the indicator reports the queue position");
+		assert.match(shown, /\d+s/, "the indicator reports the elapsed wait");
+		assert.match(shown, /IND-A/, "the indicator names the slot holder");
+		assert.equal(await Promise.race([eB.then(() => "done"), sleep(4000).then(() => "blocked")]), "done");
+		assert.equal(status[status.length - 1][1], undefined, "the indicator clears in sync with the grant");
+
+		a.handlers["session_shutdown"][0]({}, ctxA);
+		b.handlers["session_shutdown"][0]({}, ctxB);
 	});
 
 	it("streams immediately when the run already holds the slot (no self-queue)", async () => {
