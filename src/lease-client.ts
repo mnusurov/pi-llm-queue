@@ -85,10 +85,20 @@ export class LeaseClient {
 					sock.once("connect", resolve);
 					sock.once("error", reject);
 				});
+				let buffer = "";
 				sock.on("data", (chunk) => {
-					for (const line of chunk.toString().split("\n")) {
+					// Socket reads are not line-aligned: accumulate partial lines, never parse a fragment.
+					buffer += chunk.toString();
+					const lines = buffer.split("\n");
+					buffer = lines.pop() ?? "";
+					for (const line of lines) {
 						if (!line.trim()) continue;
-						const msg = JSON.parse(line);
+						let msg;
+						try {
+							msg = JSON.parse(line);
+						} catch {
+							continue;
+						}
 						// Deliver by match; a reply with no matching request (e.g. a release "ok")
 						// is dropped, never buffered for a later acquire to consume.
 						const at = this.pending.findIndex((p) => p.match(msg));
@@ -168,8 +178,10 @@ export class LeaseClient {
 	 */
 	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
 		if (!(await this.connectDaemon())) return true; // fail-open: stream unqueued
+		this.sock?.ref(); // the reply must keep the process/worker alive while we await it
 		this.send({ op: "renew", queueKey, sessionKey });
 		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
+		this.sock?.unref();
 		return msg.granted !== false;
 	}
 

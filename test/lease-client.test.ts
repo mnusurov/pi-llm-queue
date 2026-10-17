@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -138,6 +139,29 @@ describe("lease client", () => {
 		a.close();
 		b.close();
 		d.stop();
+	});
+
+	it("reassembles a reply split across socket chunks", async () => {
+		// Socket reads are not line-aligned: a grant arriving in two writes must still resolve
+		// the acquire, not die on a JSON fragment.
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-frag-"));
+		const socketPath = join(dir, "frag.sock");
+		const server = createServer((conn) => {
+			conn.once("data", () => {
+				const reply = `${JSON.stringify({ op: "granted", queueKey: QUEUE_KEY, sessionKey: "FRAG" })}\n`;
+				conn.write(reply.slice(0, 12));
+				setTimeout(() => conn.write(reply.slice(12)), 50);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.equal(await raceWithSleep(c.acquire(QUEUE_KEY, "FRAG", "parent"), 2000), "resolved");
+		} finally {
+			c.close();
+			server.close();
+		}
 	});
 
 	it("cancels a queued acquire when the abort signal fires", async () => {
