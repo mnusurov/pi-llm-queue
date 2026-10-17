@@ -78,9 +78,13 @@ queues its requests under the model's baseUrl — or under its group's name, whe
 
 Per-queue fields (all also valid in `defaults`): `maxStreams`, `policy`, `leaseTtlMs`,
 `idleQuantumMs`, `monopolyRequests`, `monopolyMs`, `agingAfterSlots`, `agingAfterMs`,
-`enabled`, `match`. `blockSubagentLaunch` (#6), `queueTimeoutMs`, `failOpen` and
+`enabled`, `match`, `blockSubagentLaunch`. `queueTimeoutMs`, `failOpen` and
 `daemonIdleExitMs` (#8) are documented in the schema and take effect in those tickets; schema
 validation with clear errors is #9.
+
+- **`blockSubagentLaunch`** — force the `subagent` tool's `async: true → false` on this queue so
+  launches serialise. Defaults to `true` when `maxStreams == 1` (`false` otherwise); a disabled
+  (passthrough) queue never blocks.
 
 - **`enabled: false`** — passthrough: the queue grants every session immediately (`status`
   reports `maxStreams: null`), and the extension leaves the provider unwrapped. A disabled

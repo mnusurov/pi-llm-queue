@@ -28,6 +28,8 @@ interface QueueEntry {
 	enabled?: boolean;
 	/** BaseUrls and/or provider names that share this queue (overrides baseUrl keying). */
 	match?: string[];
+	/** Force subagent launches to block the parent (async:false) so they serialise on this queue. */
+	blockSubagentLaunch?: boolean;
 }
 
 function loadJson(path: string): Record<string, any> {
@@ -73,6 +75,21 @@ export function resolveQueueProviders(
 		for (const member of [key, ...(entry?.match ?? [])]) for (const provider of matchingProviders(member, providers)) names.add(provider);
 	}
 	return [...names];
+}
+
+/**
+ * Whether a subagent launch on this model's queue must be forced to async:false.
+ * Per-queue override, then defaults, then the single-slot default (maxStreams == 1 serialises).
+ */
+export function resolveBlockSubagentLaunch(
+	queues: Record<string, QueueEntry>,
+	defaults: { maxStreams?: number; blockSubagentLaunch?: boolean } | undefined,
+	model: { provider: string; baseUrl: string },
+): boolean {
+	const entry = queues[resolveQueueKey(queues, model)];
+	if (!entry || entry.enabled === false) return false; // no active queue (or passthrough): fully parallel, never blocks
+	const maxStreams = entry.maxStreams ?? defaults?.maxStreams ?? 1;
+	return entry.blockSubagentLaunch ?? defaults?.blockSubagentLaunch ?? maxStreams === 1;
 }
 
 /**
@@ -198,6 +215,17 @@ export default function (pi: ExtensionAPI) {
 			const s = await lease.status();
 			ctx.ui.notify(s ? JSON.stringify(s.queues) : "pi-llm-queue: daemon unreachable", "info");
 		},
+	});
+
+	// Serialise subagent launches on single-slot queues: force async:false so the parent blocks
+	// and launches queue one-at-a-time (batch = one workflow call → one wake). No-op when the
+	// subagent tool is absent: tool_call never fires for a tool that isn't installed.
+	pi.on("tool_call", (event, ctx) => {
+		if (event.toolName !== "subagent") return;
+		const model = ctx.model;
+		if (!model) return;
+		if (resolveBlockSubagentLaunch(queues, config.defaults, model) && event.input.async !== false)
+			event.input.async = false;
 	});
 
 	// Registration is deferred to the first session so ctx gives us the model registry

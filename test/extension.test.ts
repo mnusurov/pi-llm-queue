@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { resolveQueueKey, resolveQueueProviders, resolveRole } from "../src/extension.ts";
+import { resolveQueueKey, resolveQueueProviders, resolveRole, resolveBlockSubagentLaunch } from "../src/extension.ts";
 
 describe("provider resolution", () => {
 	const providers = {
@@ -56,6 +56,30 @@ describe("queue key resolution", () => {
 
 	it("leaves a disabled group's members on their endpoint", () => {
 		assert.equal(resolveQueueKey({ gpu: { match: ["strata"], enabled: false } }, strata), "http://gpu.test/v1");
+	});
+});
+
+describe("blockSubagentLaunch policy", () => {
+	const serial = { provider: "s", baseUrl: "http://s.test/v1" };
+	const par = { provider: "p", baseUrl: "http://p.test/v1" };
+	const queues = { serial: { match: ["s"], maxStreams: 1 }, par: { match: ["p"], maxStreams: 4 } };
+
+	it("defaults to true for a single-slot queue and false for a multi-slot queue", () => {
+		assert.equal(resolveBlockSubagentLaunch(queues, {}, serial), true);
+		assert.equal(resolveBlockSubagentLaunch(queues, {}, par), false);
+	});
+	it("treats an omitted maxStreams as 1 (serialised)", () => {
+		assert.equal(resolveBlockSubagentLaunch({ d: { match: ["s"] } }, {}, serial), true);
+	});
+	it("honours a per-queue override in both directions", () => {
+		assert.equal(resolveBlockSubagentLaunch({ serial: { match: ["s"], maxStreams: 1, blockSubagentLaunch: false } }, {}, serial), false);
+		assert.equal(resolveBlockSubagentLaunch({ par: { match: ["p"], maxStreams: 4, blockSubagentLaunch: true } }, {}, par), true);
+	});
+	it("falls back to defaults.blockSubagentLaunch when the queue omits it", () => {
+		assert.equal(resolveBlockSubagentLaunch(queues, { blockSubagentLaunch: false }, serial), false);
+	});
+	it("never blocks a disabled (passthrough) queue", () => {
+		assert.equal(resolveBlockSubagentLaunch({ serial: { match: ["s"], maxStreams: 1, enabled: false } }, {}, serial), false);
 	});
 });
 
