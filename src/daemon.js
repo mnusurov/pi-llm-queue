@@ -154,13 +154,20 @@ function handle(msg, conn) {
 			}
 			return;
 		}
-		// Heartbeat (no keys): keep every lease of this connection alive.
-		// Keyed renew: an activity beat — the holder is using the slot, its quanta restart.
+		// Bare renew: heartbeat, keeps every lease of this connection alive.
+		// Keyed renew: an activity beat — the holder is using the slot, its switch quanta
+		// restart. The reply is authoritative: granted:false tells the client the slot was
+		// switched away (idle/monopoly quantum) and it must re-queue before it streams.
 		case "renew": {
-			for (const lease of conn.leases) {
-				if (msg.sessionKey && lease.sessionKey === msg.sessionKey && lease.queueKey === msg.queueKey) beat(lease, queueFor(lease.queueKey));
-				else lease.expires = Date.now() + queueFor(lease.queueKey).ttlMs;
+			if (msg.sessionKey && msg.queueKey) {
+				const queue = queueFor(msg.queueKey);
+				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
+				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
+				if (granted) beat(lease, queue);
+				send(conn, { op: "ok", queueKey: msg.queueKey, sessionKey: msg.sessionKey, granted });
+				return;
 			}
+			for (const lease of [...conn.leases]) lease.expires = Date.now() + queueFor(lease.queueKey).ttlMs;
 			send(conn, { op: "ok" });
 			return;
 		}
@@ -205,9 +212,10 @@ const server = createServer((conn) => {
 });
 
 // A disconnect is an abort: drop the queued request and release any lease it held.
+// Iterate a copy: release() splices conn.leases, and a client can hold several leases.
 function cleanup(conn) {
-	for (const lease of conn.leases ?? []) release(queueFor(lease.queueKey), lease.sessionKey);
-	for (const w of conn.queued ?? []) remove(w.queue.waiting, w);
+	for (const lease of [...(conn.leases ?? [])]) release(queueFor(lease.queueKey), lease.sessionKey);
+	for (const w of [...(conn.queued ?? [])]) remove(w.queue.waiting, w);
 }
 
 // Two sessions can autostart at once: the loser finds the socket taken and stands down.

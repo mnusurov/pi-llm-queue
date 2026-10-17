@@ -7,14 +7,14 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { QUEUE_KEY, connectClient, sleep } from "./harness.ts";
+import { QUEUE_KEY, closeAllClients, connectClient, sleep, stopAllDaemons } from "./harness.ts";
 
 const STUB_API = "stub-queue-api";
 
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-ext-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { maxStreams: 1 } } }));
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleQuantumMs: 600 }, queues: { stub: { maxStreams: 1 } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
@@ -183,9 +183,90 @@ describe("provider wrapper (queuedStream)", () => {
 		a.handlers["session_shutdown"][0]({}, ctxA);
 		await eB; // B proceeds once A releases
 	});
+
+	it("keeps the slot through the settle grace window, then releases it (wake-chain protection)", async () => {
+		const a = makePi();
+		const b = makePi();
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "GRACE");
+		start(b, "GRACE-B");
+		await a.handlers["agent_start"][0]({}, ctxA);
+		await a.handlers["agent_settled"][0]({}, ctxA); // 3 s grace: a wake chain keeps the slot
+
+		// Keep the run active (a beat every 250 ms) so only the grace window can free the slot.
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any));
+		for (let i = 0; i < 10; i++) {
+			await firstEvent(a.registered["stub"].streamSimple(model, {} as any));
+			await sleep(250);
+		}
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(300).then(() => "blocked")]),
+			"blocked",
+			"the grace window keeps the slot after the run settles",
+		);
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(2000).then(() => "blocked")]),
+			"done",
+			"the slot is released once the grace window expires",
+		);
+	});
+
+	it("releases the held slot immediately on abort", async () => {
+		const ac = new AbortController();
+		const a = makePi();
+		const b = makePi();
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "ABORT", ac.signal);
+		start(b, "ABORT-B");
+		await a.handlers["agent_start"][0]({}, ctxA); // holds the slot
+
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any));
+		assert.equal(await Promise.race([eB.then(() => "done"), sleep(400).then(() => "blocked")]), "blocked");
+		ac.abort();
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(3000).then(() => "blocked")]),
+			"done",
+			"Esc releases the held slot at once",
+		);
+	});
+
+	it("re-queues when the daemon switches the slot away mid-run (quantum preemption)", async () => {
+		const a = makePi();
+		extension(a as any);
+		const ctxA = start(a, "EVICTED");
+		await a.handlers["agent_start"][0]({}, ctxA); // holds the slot
+		const raw = await connectClient(socketPath);
+		raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "RAW", role: "parent" }); // queued behind it
+
+		await sleep(2500); // idle quantum (600 ms) + sweep: the holder is evicted, RAW is granted
+		const stream = a.registered["stub"].streamSimple;
+		const eA = firstEvent(stream(model, {} as any)); // its beat comes back ungranted: must re-queue
+		for (let i = 0; i < 5; i++) {
+			raw.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey: "RAW" }); // RAW keeps its slot
+			await sleep(150);
+		}
+		assert.equal(
+			await Promise.race([eA.then(() => "done"), sleep(700).then(() => "blocked")]),
+			"blocked",
+			"a preempted run re-queues behind the new holder instead of streaming unqueued",
+		);
+
+		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "RAW" });
+		assert.equal(
+			await Promise.race([eA.then(() => "done"), sleep(3000).then(() => "blocked")]),
+			"done",
+			"the preempted run proceeds once the slot frees",
+		);
+		raw.close();
+		a.handlers["session_shutdown"][0]({}, ctxA);
+	});
 });
 
 after(() => {
 	unregisterApiProviders("test-stub");
+	closeAllClients();
+	stopAllDaemons();
 	spawnSync("pkill", ["-f", socketPath]);
 });

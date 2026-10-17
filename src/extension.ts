@@ -99,13 +99,21 @@ export default function (pi: ExtensionAPI) {
 	): AssistantMessageEventStream => {
 		const out = createAssistantMessageEventStream();
 		const queueKey = model.baseUrl;
-		const held = heldQueueKey === queueKey;
+		const wasHeld = heldQueueKey === queueKey;
 		(async () => {
+			let selfQueued = false;
 			try {
-				// Requests outside a run (compaction, classifier, nested calls) queue for themselves.
-				// A held request beats its lease: the run keeps the slot across tool executions.
-				if (held) lease.beat(queueKey, sessionKey);
-				else await lease.acquire(queueKey, sessionKey, role);
+				// Requests outside a run (compaction, classifier, nested calls) queue for themselves
+				// and release when done. A held request beats its lease: the run keeps the slot
+				// across tool executions. A beat answered ungranted means the daemon switched the
+				// slot away (idle/monopoly quantum) — the run re-queues before it streams again.
+				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
+					// slot retained for the run
+				} else {
+					await lease.acquire(queueKey, sessionKey, role, options?.signal);
+					if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
+					else selfQueued = true;
+				}
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
 				for await (const event of impl.streamSimple(model, context, options)) out.push(event);
@@ -135,7 +143,7 @@ export default function (pi: ExtensionAPI) {
 				});
 				out.end();
 			} finally {
-				if (!held) lease.release(queueKey, sessionKey);
+				if (selfQueued) lease.release(queueKey, sessionKey);
 			}
 		})();
 		return out;
@@ -190,7 +198,8 @@ export default function (pi: ExtensionAPI) {
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
 		await lease.acquire(model.baseUrl, sessionKey, role, ctx.signal);
-		heldQueueKey = model.baseUrl;
+		// An abort already released the slot: do not claim a lease we no longer hold.
+		if (!ctx.signal?.aborted) heldQueueKey = model.baseUrl;
 	});
 
 	pi.on("agent_settled", () => {

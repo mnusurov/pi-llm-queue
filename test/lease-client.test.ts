@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { LeaseClient, ensureDaemon } from "../src/lease-client.ts";
-import { DAEMON, QUEUE_KEY, sleep, startDaemon, waitForDaemon } from "./harness.ts";
+import { DAEMON, QUEUE_KEY, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const raceWithSleep = (promise: Promise<void>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
 
 describe("lease client", () => {
+	after(stopAllDaemons);
+
 	it("fails open when the daemon is unreachable", async () => {
 		const lease = new LeaseClient({ socketPath: "/tmp/pi-llm-queue-absent.sock" });
 		const outcome = await raceWithSleep(lease.acquire(QUEUE_KEY, "S", "parent"), 500);

@@ -162,9 +162,15 @@ export class LeaseClient {
 		this.sock?.unref();
 	}
 
-	/** Activity beat: the holder is using the slot, so its idle/monopoly quanta restart. */
-	beat(queueKey: string, sessionKey: string): void {
+	/**
+	 * Activity beat: the holder is using the slot, so its idle/monopoly quanta restart.
+	 * Resolves false when the daemon has switched the slot away — the caller must re-queue.
+	 */
+	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
+		if (!(await this.connectDaemon())) return true; // fail-open: stream unqueued
 		this.send({ op: "renew", queueKey, sessionKey });
+		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
+		return msg.granted !== false;
 	}
 
 	async status(): Promise<any> {
