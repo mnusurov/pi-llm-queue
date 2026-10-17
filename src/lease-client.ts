@@ -182,6 +182,9 @@ export class LeaseClient {
 		let settled = false;
 		const report = async () => {
 			const s = await this.status();
+			// status() unrefs the socket on return; a queued acquire must keep a ref for its whole
+			// window or a headless (--print) process exits while waiting for its slot grant.
+			this.sock?.ref();
 			if (settled) return; // the grant landed mid-poll: never re-arm the indicator after it
 			const q = s?.queues?.find((q: any) => q.queueKey === queueKey);
 			const at = q?.waiting.findIndex((w: any) => w.sessionKey === sessionKey) ?? -1;
