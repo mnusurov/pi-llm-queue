@@ -5,7 +5,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createConnection } from "node:net";
 import { createServer } from "node:http";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -95,8 +95,6 @@ function runPi(label) {
 }
 
 const results = await Promise.all([runPi("A"), runPi("B")]);
-const lockPath = `${join(agentDir, "llm-queue.sock")}.pid`;
-const daemonPid = existsSync(lockPath) ? Number(readFileSync(lockPath, "utf8")) : 0;
 const alive = await new Promise((resolve) => {
 	const sock = createConnection(join(agentDir, "llm-queue.sock"));
 	sock.once("connect", () => {
@@ -110,6 +108,6 @@ server.close();
 
 const ok = requests === 2 && overlaps === 0 && alive && results.every((r) => r.code === 0 && r.out.includes("pong"));
 for (const r of results) console.log(`${r.label}: exit=${r.code} out=${JSON.stringify(r.out.trim().slice(0, 120))}`);
-console.log(`requests=${requests} overlaps=${overlaps} daemon-autostart=${alive} (pid ${daemonPid})`);
+console.log(`requests=${requests} overlaps=${overlaps} daemon-autostart=${alive}`);
 console.log(ok ? "PASS: two pi sessions were strictly serialised" : "FAIL: see counters above");
 process.exit(ok ? 0 : 1);

@@ -61,12 +61,20 @@ describe("config schema validation", () => {
 			'defaults.maxStreams must be a positive integer (got "1")',
 			"defaults.agingAfterSlots must be an integer >= 0 (got -2)",
 			'defaults.failOpen must be true or false (got "yes")',
-			"defaults.leaseTtlMs must be a number > 0 (got 0)",
+			"defaults.leaseTtlMs must be a number >= 1000 (got 0)",
 			"queues.zen.maxStreams must be a positive integer (got 0)",
 			'queues.zen.policy must be one of "priority-aging" or "fifo" (got "lifo")',
 			'queues.zen.match must be an array of strings (got "zen")',
 			"queues.zen.blockSubagentLaunch must be true or false (got 1)",
 		]);
+	});
+
+	it("rejects a leaseTtlMs below the heartbeat/sweep floor, accepts the floor itself", () => {
+		// A TTL under the 1 s client-heartbeat floor steals the slot from a healthy, heartbeating
+		// session over and over (the sweep runs every second), i.e. the KV-cache thrash the tool exists to prevent.
+		for (const ttl of [30, 999]) assert.deepEqual(validateConfig({ defaults: { leaseTtlMs: ttl } }), [`defaults.leaseTtlMs must be a number >= 1000 (got ${ttl})`]);
+		assert.deepEqual(validateConfig({ defaults: { leaseTtlMs: 1000 } }), []);
+		assert.deepEqual(validateConfig({ queues: { zen: { leaseTtlMs: 999 } } }), ["queues.zen.leaseTtlMs must be a number >= 1000 (got 999)"]);
 	});
 
 	it("flags unknown fields and lists the known ones", () => {

@@ -31,16 +31,19 @@ export function closeAllClients(): void {
 	sockets.length = 0;
 }
 
-export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown): Daemon {
+export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown, modelsJsonPath?: string): Daemon {
 	const dir = mkdtempSync(join(tmpdir(), "llm-queue-"));
 	const socketPath = join(dir, "queue.sock");
 	const configPath = join(dir, "config.json");
 	writeFileSync(configPath, JSON.stringify(config));
 	const args = [DAEMON, "--socket", socketPath, "--config", configPath];
-	if (modelsJson !== undefined) {
-		const modelsJsonPath = join(dir, "models.json");
-		writeFileSync(modelsJsonPath, JSON.stringify(modelsJson));
+	if (modelsJsonPath) {
+		// A catalog path the daemon must survive not having (models.json is optional for pi).
 		args.push("--models-json", modelsJsonPath);
+	} else if (modelsJson !== undefined) {
+		const written = join(dir, "models.json");
+		writeFileSync(written, JSON.stringify(modelsJson));
+		args.push("--models-json", written);
 	}
 	const proc = spawn(process.execPath, args, { stdio: "ignore" });
 	proc.unref();

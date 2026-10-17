@@ -2,7 +2,6 @@
 // is unreachable, requests pass through unqueued.
 import { connect, type Socket } from "node:net";
 import { spawn } from "node:child_process";
-import { existsSync, unlinkSync, writeFileSync } from "node:fs";
 
 export type Role = "parent" | "child";
 
@@ -24,29 +23,13 @@ export interface DaemonPaths {
 /** Why an acquire resolved: granted, daemon-unreachable, queue-wait timeout, or aborted. */
 export type AcquireReason = "granted" | "fail-open" | "timeout" | "aborted";
 
-function socketAlive(socketPath: string): Promise<boolean> {
-	return new Promise((resolve) => {
-		const sock = connect(socketPath);
-		const done = (alive: boolean) => {
-			clearTimeout(timer);
-			sock.destroy();
-			resolve(alive);
-		};
-		const timer = setTimeout(() => done(false), 500);
-		sock.once("connect", () => done(true));
-		sock.once("error", () => done(false));
-	});
-}
-
 /**
- * Start the daemon when nothing owns the socket. Detached spawn + lockfile PID;
- * a lockfile whose socket does not answer is stale and gets reclaimed.
+ * Start the daemon when nothing owns the socket. No liveness probe here: the daemon's own
+ * start() resolves the race (a live socket makes the second daemon exit 0, a stale socket file
+ * is reclaimed), so one detached spawn per session start is enough.
  */
 export async function ensureDaemon({ socketPath, daemonPath, configPath, modelsJsonPath }: DaemonPaths): Promise<void> {
 	if (!daemonPath) return;
-	if (await socketAlive(socketPath)) return;
-	const lockPath = `${socketPath}.pid`;
-	if (existsSync(lockPath)) unlinkSync(lockPath); // stale lockfile reclaim
 	const child = spawn(
 		process.execPath,
 		[
@@ -60,7 +43,6 @@ export async function ensureDaemon({ socketPath, daemonPath, configPath, modelsJ
 	);
 	// A failed spawn (bad path, ENOENT) must surface, not vanish silently.
 	child.on("error", (error) => console.error(`pi-llm-queue: daemon spawn failed: ${error.message}`));
-	writeFileSync(lockPath, String(child.pid));
 	child.unref();
 }
 
@@ -73,6 +55,19 @@ export class LeaseClient {
 	private sock: Socket | null = null;
 	private pending: Pending[] = [];
 	private heartbeat: ReturnType<typeof setInterval> | null = null;
+	// Socket ref/unref is one switch, not a counter: ref/unref per call lets any second op
+	// (a beat, a status poll) free the process to exit while a queued acquire is still waiting.
+	// Count outstanding requests instead: ref on 0 -> 1, unref when the last one finishes.
+	private outstanding = 0;
+	private refSocket(): void {
+		if (this.outstanding++ === 0) this.sock?.ref();
+	}
+	private unrefSocket(): void {
+		if (--this.outstanding <= 0) {
+			this.outstanding = 0;
+			this.sock?.unref();
+		}
+	}
 
 	private socketPath: string;
 	private paths: DaemonPaths;
@@ -93,7 +88,7 @@ export class LeaseClient {
 	private async connectDaemon(): Promise<boolean> {
 		if (this.sock) return true;
 		await ensureDaemon(this.paths);
-		for (let attempt = 0; attempt < (this.paths.daemonPath ? 20 : 1); attempt++) {
+		for (let attempt = 0; attempt < (this.paths.daemonPath ? 60 : 1); attempt++) {
 			try {
 				const sock = connect(this.socketPath);
 				await new Promise((resolve, reject) => {
@@ -101,9 +96,14 @@ export class LeaseClient {
 					sock.once("error", reject);
 				});
 				let buffer = "";
+				const decoder = new TextDecoder("utf8");
 				sock.on("data", (chunk) => {
 					// Socket reads are not line-aligned: accumulate partial lines, never parse a fragment.
-					buffer += chunk.toString();
+					buffer += decoder.decode(chunk as BufferSource, { stream: true });
+					if (buffer.length > 1e5) {
+						sock.destroy(); // a peer that never sends a newline must not grow memory without bound
+						return;
+					}
 					const lines = buffer.split("\n");
 					buffer = lines.pop() ?? "";
 					for (const line of lines) {
@@ -166,7 +166,7 @@ export class LeaseClient {
 			if (!this.failOpen) this.unreachable();
 			return "fail-open";
 		}
-		this.sock?.ref(); // a queued request must keep pi alive
+		this.refSocket();
 		this.send({ op: "acquire", queueKey, sessionKey, role, group });
 		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
 		const entry: Pending = { match: granted, resolve: () => {} };
@@ -182,9 +182,6 @@ export class LeaseClient {
 		let settled = false;
 		const report = async () => {
 			const s = await this.status();
-			// status() unrefs the socket on return; a queued acquire must keep a ref for its whole
-			// window or a headless (--print) process exits while waiting for its slot grant.
-			this.sock?.ref();
 			if (settled) return; // the grant landed mid-poll: never re-arm the indicator after it
 			const q = s?.queues?.find((q: any) => q.queueKey === queueKey);
 			const at = q?.waiting.findIndex((w: any) => w.sessionKey === sessionKey) ?? -1;
@@ -236,7 +233,7 @@ export class LeaseClient {
 		if (firstPoll) clearTimeout(firstPoll);
 		if (poll) clearInterval(poll);
 		settled = true;
-		this.sock?.unref();
+		this.unrefSocket();
 		// A daemon that died mid-wait resolves the pending acquire as fail-open: honour failOpen here too.
 		if (reason === "fail-open" && !this.failOpen) this.unreachable();
 		return reason;
@@ -244,7 +241,6 @@ export class LeaseClient {
 
 	release(queueKey: string, sessionKey: string): void {
 		this.send({ op: "release", queueKey, sessionKey });
-		this.sock?.unref();
 	}
 
 	/** Re-tier a live queued waiter (from /queue promote|demote); fire-and-forget. */
@@ -253,28 +249,30 @@ export class LeaseClient {
 	}
 
 	/**
-	 * Activity beat: the holder is using the slot, so its idle/monopoly quanta restart.
+	 * Activity beat: the holder is using the slot, so its idle/monopoly quanta restart and the
+	 * daemon marks the lease in flight (a request in flight is never switched away). `done: true`
+	 * reports the stream over: it clears the in-flight flag without counting a new request.
 	 * Resolves false when the daemon has switched the slot away — the caller must re-queue.
 	 */
-	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
+	async beat(queueKey: string, sessionKey: string, done = false): Promise<boolean> {
 		if (!(await this.connectDaemon())) {
 			if (!this.failOpen) this.unreachable();
 			return true; // fail-open: stream unqueued
 		}
-		this.sock?.ref(); // the reply must keep the process/worker alive while we await it
-		this.send({ op: "renew", queueKey, sessionKey });
+		this.refSocket(); // the reply must keep the process/worker alive while we await it
+		this.send({ op: "renew", queueKey, sessionKey, done });
 		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
-		this.sock?.unref();
+		this.unrefSocket();
 		if (msg.op === "fail-open" && !this.failOpen) this.unreachable(); // daemon died mid-beat
 		return msg.granted !== false;
 	}
 
 	async status(): Promise<any> {
 		if (!(await this.connectDaemon())) return null;
-		this.sock?.ref();
+		this.refSocket();
 		this.send({ op: "status" });
 		const msg = await this.read((m) => m.op === "status");
-		this.sock?.unref();
+		this.unrefSocket();
 		return msg;
 	}
 

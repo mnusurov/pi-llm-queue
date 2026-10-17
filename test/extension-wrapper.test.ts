@@ -14,7 +14,7 @@ const STUB_API = "stub-queue-api";
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-ext-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleQuantumMs: 600 }, queues: { stub: { maxStreams: 1 } } }));
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleQuantumMs: 600 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
@@ -26,13 +26,15 @@ const model = { api: STUB_API, baseUrl: QUEUE_KEY, provider: "stub", id: "m" } a
 function makePi() {
 	const handlers: Record<string, ((e: any, ctx: any) => void)[]> = {};
 	const registered: Record<string, any> = {};
+	const commands: Record<string, any> = {};
 	return {
 		handlers,
 		registered,
+		commands,
 		on: (event: string, handler: (e: any, ctx: any) => void) => (handlers[event] ??= []).push(handler),
 		registerProvider: (name: string, config: any) => (registered[name] = config),
 		unregisterProvider: (name: string) => delete registered[name],
-		registerCommand: (_name: string, _config: any) => {},
+		registerCommand: (name: string, config: any) => (commands[name] = config),
 	};
 }
 
@@ -291,6 +293,23 @@ describe("provider wrapper (queuedStream)", () => {
 		raw.close();
 		a.handlers["session_shutdown"][0]({}, ctxA);
 	});
+	it("prints passthrough for a disabled queue instead of a null slot count", async () => {
+		const a = makePi();
+		extension(a as any);
+		start(a, "QUEUE");
+		const raw = await connectClient(socketPath);
+		raw.send({ op: "acquire", queueKey: "free-api", sessionKey: "FREE", role: "parent" }); // the passthrough queue
+		assert.equal((await raw.next(3000)).op, "granted");
+
+		const notes: string[] = [];
+		const ctx = makeCtx("QUEUE", undefined, { notify: (text: string) => notes.push(text), setStatus: () => {} });
+		await a.commands["queue"].handler("", ctx);
+		assert.match(notes.join("\n"), /free-api: slot FREE \(1\/passthrough\)/, "status must not read as a daemon bug");
+
+		raw.send({ op: "release", queueKey: "free-api", sessionKey: "FREE" });
+		raw.close();
+		a.handlers["session_shutdown"][0]({}, ctx);
+	});
 });
 
 describe("config hot-reload (provider set)", () => {
@@ -300,7 +319,7 @@ describe("config hot-reload (provider set)", () => {
 		start(a, "RELOAD");
 		assert.ok(a.registered["stub"], "wrapped before the edit");
 
-		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { enabled: false } } }));
+		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { enabled: false }, "free-api": { enabled: false } } }));
 		await sleep(600); // reload debounce
 		assert.equal(a.registered["stub"], undefined, "a disabled provider is unregistered: passthrough, no pi restart");
 	});

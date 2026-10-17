@@ -1,6 +1,6 @@
 // pi-llm-queue extension: wraps configured providers so a session holds the endpoint's slot for
 // its whole run, keeping the KV cache warm for one session at a time.
-import { existsSync, readFileSync, watch } from "node:fs";
+import { existsSync, watch } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
@@ -13,7 +13,7 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role } from "./lease-client.ts";
-import { loadValidConfig } from "./config.js";
+import { loadValidConfig, readJson, groupKeyFor, queueEntryFor } from "./config.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -35,14 +35,6 @@ interface QueueEntry {
 	blockSubagentLaunch?: boolean;
 }
 
-function loadJson(path: string): Record<string, any> {
-	try {
-		return JSON.parse(readFileSync(path, "utf8"));
-	} catch {
-		return {};
-	}
-}
-
 /** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
 function matchingProviders(key: string, providers: Record<string, any>): string[] {
 	if (providers[key]) return [key];
@@ -52,14 +44,14 @@ function matchingProviders(key: string, providers: Record<string, any>): string[
 /**
  * Queue key for a model: the group whose `match` names its provider or endpoint (so one
  * endpoint can be split per provider, and several endpoints merged), else its baseUrl.
+ * The daemon resolves the same rule through the shared `groupKeyFor`.
  */
-export function resolveQueueKey(queues: Record<string, QueueEntry>, model: { provider: string; baseUrl: string }): string {
-	for (const [name, entry] of Object.entries(queues)) {
-		if (entry?.enabled === false) continue;
-		const match = entry?.match ?? [];
-		if (match.includes(model.provider) || match.includes(model.baseUrl)) return name;
-	}
-	return model.baseUrl;
+export function resolveQueueKey(
+	queues: Record<string, QueueEntry>,
+	model: { provider: string; baseUrl: string },
+	providers: Record<string, any> = {},
+): string {
+	return groupKeyFor(queues, providers, model);
 }
 
 /**
@@ -83,13 +75,16 @@ export function resolveQueueProviders(
 /**
  * Whether a subagent launch on this model's queue must be forced to async:false.
  * Per-queue override, then defaults, then the single-slot default (maxStreams == 1 serialises).
+ * The entry is resolved the way the daemon resolves policy: group key, endpoint key, then a
+ * provider-name key naming the model's provider.
  */
 export function resolveBlockSubagentLaunch(
 	queues: Record<string, QueueEntry>,
 	defaults: { maxStreams?: number; blockSubagentLaunch?: boolean } | undefined,
 	model: { provider: string; baseUrl: string },
+	providers: Record<string, any> = {},
 ): boolean {
-	const entry = queues[resolveQueueKey(queues, model)];
+	const entry = queueEntryFor(queues, providers, model);
 	if (!entry || entry.enabled === false) return false; // no active queue (or passthrough): fully parallel, never blocks
 	const maxStreams = entry.maxStreams ?? defaults?.maxStreams ?? 1;
 	return entry.blockSubagentLaunch ?? defaults?.blockSubagentLaunch ?? maxStreams === 1;
@@ -108,15 +103,16 @@ export function resolveRole(env: Record<string, string | undefined>): Role {
 }
 
 export default function (pi: ExtensionAPI) {
-	const modelsJson = loadJson(MODELS_JSON_PATH).providers ?? {};
+	const modelsJson = readJson(MODELS_JSON_PATH).providers ?? {};
 	// Startup config load: any failure falls back to defaults and surfaces through ui.notify at
 	// session_start (ui does not exist at module load).
 	const loaded = loadValidConfig(CONFIG_PATH);
 	let config = loaded.config;
 	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
-	// Heartbeat at a third of the lease TTL (floor 1 s): a live session never loses its slot.
-	const heartbeatMs = Math.max(1000, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
+	// Heartbeat at a third of the lease TTL: a live session never loses its slot. The floor must stay
+	// under the leaseTtlMs floor (1000 ms), or a sweep landing between two beats evicts a healthy holder.
+	const heartbeatMs = Math.max(250, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
 
 	const lease = new LeaseClient({
 		socketPath: SOCKET_PATH,
@@ -189,7 +185,7 @@ export default function (pi: ExtensionAPI) {
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const out = createAssistantMessageEventStream();
-		const queueKey = resolveQueueKey(queues, model);
+		const queueKey = resolveQueueKey(queues, model, modelsJson);
 		const wasHeld = heldQueueKey === queueKey;
 		(async () => {
 			let selfQueued = false;
@@ -239,6 +235,9 @@ export default function (pi: ExtensionAPI) {
 				out.end();
 			} finally {
 				if (selfQueued) lease.release(queueKey, sessionKey);
+				// The stream is over: report completion so the daemon can switch the slot again. Without
+				// this the lease stays in-flight until its TTL reclaims it, and a waiter never gets its turn.
+				else if (heldQueueKey === queueKey) lease.beat(queueKey, sessionKey, true).catch(() => {});
 			}
 		})();
 		return out;
@@ -264,7 +263,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const lines = s.queues.map((q: any) => {
 				const depth = (role: string) => q.waiting.filter((w: any) => w.role === role).length;
-				return `${q.queueKey}: slot ${q.holders.join(", ") || "free"} (${q.holders.length}/${q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")} · switches ${q.switches}`;
+				return `${q.queueKey}: slot ${q.holders.join(", ") || "free"} (${q.holders.length}/${q.maxStreams === null ? "passthrough" : q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")} · switches ${q.switches}`;
 			});
 			ctx.ui.notify(lines.length ? lines.join("\n") : "pi-llm-queue: no queues", "info");
 		},
@@ -277,7 +276,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.toolName !== "subagent") return;
 		const model = ctx.model;
 		if (!model) return;
-		if (resolveBlockSubagentLaunch(queues, config.defaults, model) && event.input.async !== false)
+		if (resolveBlockSubagentLaunch(queues, config.defaults, model, modelsJson) && event.input.async !== false)
 			event.input.async = false;
 	});
 
@@ -319,7 +318,6 @@ export default function (pi: ExtensionAPI) {
 	// shortcut: leaseTtlMs (client heartbeat period), failOpen and queueTimeoutMs are read once at
 	// connect and take effect only on pi restart; the daemon hot-reloads its own leaseTtlMs.
 	const watchConfig = (ctx: ExtensionContext) => {
-		if (!existsSync(CONFIG_PATH)) return;
 		let debounce: ReturnType<typeof setTimeout> | null = null;
 		// Watch the directory, not the file: an atomic-save editor replaces the file and a
 		// file watcher goes dead; a config created after startup needs a watcher too.
@@ -368,7 +366,7 @@ export default function (pi: ExtensionAPI) {
 		if (!model || !providers.includes(model.provider)) return;
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
-		const queueKey = resolveQueueKey(queues, model);
+		const queueKey = resolveQueueKey(queues, model, modelsJson);
 		const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued);
 		clearQueued();
 		if (reason === "timeout") ctx.ui.notify(TIMEOUT_WARNING, "warning");

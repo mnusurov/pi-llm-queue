@@ -4,7 +4,7 @@
 import { createConnection, createServer } from "node:net";
 import { existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
-import { loadValidConfig } from "./config.js";
+import { loadValidConfig, groupKeyFor, queueEntryFor } from "./config.js";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -25,7 +25,17 @@ const loaded = loadValidConfig(configPath ?? "");
 for (const e of loaded.errors) console.error(`pi-llm-queue daemon: config: ${e}`);
 let config = loaded.config;
 let defaults = config.defaults ?? {};
-const modelsJson = modelsJsonPath ? JSON.parse(readFileSync(modelsJsonPath, "utf8")).providers ?? {} : {};
+// models.json is optional for pi: a missing catalog is an empty one, never a startup crash (the
+// extension spawns the daemon detached, so a crash would be silent). A present-but-unreadable
+// catalog is reported: provider-name queue keys and group members would silently resolve to nothing.
+let modelsJson = {};
+if (modelsJsonPath && existsSync(modelsJsonPath)) {
+	try {
+		modelsJson = JSON.parse(readFileSync(modelsJsonPath, "utf8")).providers ?? {};
+	} catch (error) {
+		console.error(`pi-llm-queue daemon: models.json unreadable (${error.message}): provider-name queue keys resolve to nothing`);
+	}
+}
 
 function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
@@ -52,25 +62,16 @@ function scheduleIdleExit() {
 }
 
 // Queue keys are endpoint baseUrls. A provider-name key applies to that provider's
-// baseUrl; a baseUrl key wins when both name the same endpoint.
+// baseUrl; a baseUrl key wins when both name the same endpoint. Resolution lives in
+// src/config.js so the extension and the daemon share one rule.
 function policyFor(key) {
-	const queues_ = config.queues ?? {};
-	if (queues_[key]) return queues_[key];
-	for (const [name, entry] of Object.entries(queues_)) {
-		if (!name.includes("://") && modelsJson[name]?.baseUrl === key) return entry;
-	}
-	return {};
+	return queueEntryFor(config.queues ?? {}, modelsJson, { baseUrl: key }) ?? {};
 }
 
 // Explicit resource groups: queues.<name>.match lists baseUrls and/or provider names that
 // share one queue, overriding baseUrl keying so endpoints can be merged or re-slotted.
-// A disabled group is passthrough, so it must not re-key its members.
 function groupFor(key) {
-	for (const [name, entry] of Object.entries(config.queues ?? {})) {
-		const match = entry?.enabled === false ? undefined : entry?.match;
-		if (Array.isArray(match) && match.some((m) => m === key || modelsJson[m]?.baseUrl === key)) return name;
-	}
-	return key;
+	return groupKeyFor(config.queues ?? {}, modelsJson, { baseUrl: key });
 }
 
 // Queue policy, re-applied on hot-reload. `enabled: false` is passthrough: unlimited slots,
@@ -107,7 +108,7 @@ function queueFor(key) {
 // The same object lives in conn.leases, so a client heartbeat refreshes it in place.
 function newLease(queue, sessionKey, conn) {
 	const now = Date.now();
-	return { queueKey: queue.queueKey, sessionKey, conn, expires: now + queue.ttlMs, activeAt: now, grantedAt: now, requests: 0 };
+	return { queueKey: queue.queueKey, sessionKey, conn, expires: now + queue.ttlMs, activeAt: now, grantedAt: now, requests: 0, inFlight: 0 };
 }
 
 function leaseOf(queue, sessionKey) {
@@ -115,11 +116,21 @@ function leaseOf(queue, sessionKey) {
 }
 
 // A model request by the holder: restarts its idle quantum and counts toward its monopoly.
-function beat(lease, queue) {
+// The daemon cannot see the HTTP stream, so a beat is the request-start signal and a `done` beat
+// is its end. The count is a counter, not a flag: concurrent same-session requests (a run plus a
+// compaction) share one lease, and the first completion must not open the slot under the other.
+// `done` is a completion report, not a request: it refreshes the TTL and decrements the count
+// without counting toward the monopoly.
+function beat(lease, queue, done) {
 	const now = Date.now();
 	lease.expires = now + queue.ttlMs;
+	if (done) {
+		lease.inFlight = Math.max(0, lease.inFlight - 1);
+		return;
+	}
 	lease.activeAt = now;
 	lease.requests++;
+	lease.inFlight++;
 }
 
 // Pick the next waiter: an aged child (longest-waiting) jumps the queue; otherwise the
@@ -168,19 +179,30 @@ function release(queue, sessionKey) {
 
 // Evict holders whose lease expired (crashed session) or whose switch quantum ran out,
 // and only when someone is waiting: an unmonopolised idle slot costs nobody anything.
+// A request in flight is never switched away on the quanta — that is the serialisation promise:
+// the stream would keep running while the waiter started on the same endpoint. Its grace is the
+// TTL: a live client heartbeats, so an in-flight lease survives; a client that died mid-stream
+// stops heartbeating and the TTL reclaims the slot.
 function sweep() {
 	const now = Date.now();
 	for (const queue of queues.values()) {
 		if (!queue.waiting.length) continue;
 		for (const lease of [...queue.holders]) {
-			if (now > lease.expires || now - lease.activeAt > queue.idleMs || lease.requests >= queue.monopolyRequests || now - lease.grantedAt > queue.monopolyMs)
-				release(queue, lease.sessionKey);
+			const evict =
+				now > lease.expires ||
+				(!lease.inFlight && (now - lease.activeAt > queue.idleMs || lease.requests >= queue.monopolyRequests || now - lease.grantedAt > queue.monopolyMs));
+			if (evict) release(queue, lease.sessionKey);
 		}
 	}
 }
 setInterval(sweep, 1000).unref();
 
 function handle(msg, conn) {
+	// A keyless acquire would create an unnamed queue that silently holds a slot.
+	if ((msg.op === "acquire" || msg.op === "release" || msg.op === "cancel") && !msg.queueKey) {
+		send(conn, { op: "error", reason: `${msg.op} requires queueKey` });
+		return;
+	}
 	// Every keyed op is resolved through groups first: a group's members all address one queue.
 	// Replies always echo the key the client asked with — clients match replies on their own key.
 	const requestedKey = msg.queueKey;
@@ -235,7 +257,7 @@ function handle(msg, conn) {
 				const queue = queueFor(msg.queueKey);
 				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
 				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
-				if (granted) beat(lease, queue);
+				if (granted) beat(lease, queue, msg.done === true);
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
@@ -280,8 +302,15 @@ const server = createServer((conn) => {
 		idleTimer = null;
 	}
 	let buffer = "";
+	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the key.
+	const decoder = new TextDecoder("utf8");
 	conn.on("data", (chunk) => {
-		buffer += chunk.toString();
+		buffer += decoder.decode(chunk, { stream: true });
+		// A peer that never sends a newline must not grow the daemon's memory without bound.
+		if (buffer.length > 1e5) {
+			conn.destroy();
+			return;
+		}
 		const lines = buffer.split("\n");
 		buffer = lines.pop();
 		for (const line of lines) {

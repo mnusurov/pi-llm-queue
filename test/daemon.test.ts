@@ -3,8 +3,9 @@ import { spawn } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { connect } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -137,6 +138,8 @@ describe("lease lifecycle and session switch", () => {
 	};
 	const acquire = (c: Client, sessionKey: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
+	// A real request beats at the stream start and reports completion when the stream ends.
+	const done = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey, done: true });
 	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
 	const QUEUE_KEY2 = "http://model.test/v2";
 
@@ -148,7 +151,7 @@ describe("lease lifecycle and session switch", () => {
 	});
 
 	it("reclaims a crashed session's lease after the TTL and grants the next waiter", async () => {
-		const d = startQuanta({ leaseTtlMs: 300 });
+		const d = startQuanta({ leaseTtlMs: 1000 });
 		const a = await open(d); // live socket, abandoned lease: never renews
 		const b = await open(d);
 
@@ -161,7 +164,7 @@ describe("lease lifecycle and session switch", () => {
 	});
 
 	it("keeps a lease alive while its client heartbeats, and reclaims it when heartbeats stop", async () => {
-		const d = startQuanta({ leaseTtlMs: 400 });
+		const d = startQuanta({ leaseTtlMs: 1000 });
 		const a = await open(d);
 		const b = await open(d);
 
@@ -170,12 +173,12 @@ describe("lease lifecycle and session switch", () => {
 		acquire(b, "B");
 
 		for (let i = 0; i < 10; i++) {
-			await sleep(150); // ~3.7 TTLs of heartbeats
+			await sleep(150); // ~1.5 TTLs of heartbeats
 			a.send({ op: "renew" });
 		}
 		await assert.rejects(b.next(300), /no message from daemon within/, "heartbeats keep A's slot");
 
-		for (let i = 0; i < 6; i++) await sleep(150); // heartbeats stop: the TTL reclaims
+		for (let i = 0; i < 8; i++) await sleep(150); // heartbeats stop: the TTL reclaims
 		assert.deepEqual(await b.next(5000), granted("B"));
 	});
 
@@ -255,6 +258,7 @@ describe("lease lifecycle and session switch", () => {
 
 		for (let i = 0; i < 3; i++) {
 			beat(a, "A");
+			done(a, "A"); // the request ends: the slot becomes switchable again
 			await sleep(150);
 		}
 		assert.deepEqual(await b.next(5000), granted("B"));
@@ -272,6 +276,7 @@ describe("lease lifecycle and session switch", () => {
 		for (let i = 0; i < 10; i++) {
 			await sleep(150); // keeps TTL and idle alive: only the time quantum can switch
 			beat(a, "A");
+			done(a, "A");
 		}
 		assert.deepEqual(await b.next(5000), granted("B"));
 	});
@@ -283,15 +288,93 @@ describe("lease lifecycle and session switch", () => {
 
 		acquire(a, "A");
 		assert.deepEqual(await a.next(3000), granted("A"));
-		beat(a, "A");
-		beat(a, "A");
-		for (let i = 0; i < 2; i++) assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }); // drain beat replies
+		for (let i = 0; i < 2; i++) {
+			beat(a, "A");
+			done(a, "A");
+			for (let j = 0; j < 2; j++) assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }); // drain beat + completion replies
+		}
 		acquire(b, "B");
 		assert.deepEqual(await b.next(5000), granted("B"));
 
 		b.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "B" });
 		acquire(a, "A"); // A's next run re-acquires: the monopoly count resets on grant
 		assert.deepEqual(await a.next(5000), granted("A"));
+	});
+	// Finding 1: the daemon cannot see the stream, so the client's beat is the request-start
+	// signal and its done-beat is the end. A request in flight must never be switched away —
+	// that is the serialisation promise the whole tool exists for.
+	it("the monopoly quantum passes over a request in flight and grants the waiter on completion", async () => {
+		const d = startQuanta({ monopolyMs: 400, monopolyRequests: 1 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A"); // the stream starts
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true });
+		acquire(b, "B");
+		await assert.rejects(b.next(1500), /no message from daemon within/, "a request in flight is not preempted");
+
+		done(a, "A"); // the stream ends
+		assert.deepEqual(await b.next(5000), granted("B"), "the waiter is granted once the in-flight request completes");
+	});
+
+	it("a holder that dies mid-stream is reclaimed after the TTL grace and grants the next waiter", async () => {
+		const d = startQuanta({ leaseTtlMs: 1000 });
+		const a = await open(d); // socket open, never renews: a client killed mid-stream
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A"); // in flight, never completed
+		await a.next(3000);
+		acquire(b, "B");
+		await assert.rejects(b.next(300), /no message from daemon within/, "B waits behind the in-flight lease");
+
+		assert.deepEqual(await b.next(5000), granted("B"), "the TTL is the in-flight grace: a silent client loses the slot");
+	});
+
+	it("every switch quantum passes over a request in flight", async () => {
+		const d = startQuanta({ idleQuantumMs: 0, monopolyRequests: 1, monopolyMs: 0 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A");
+		await a.next(3000);
+		acquire(b, "B");
+
+		for (let i = 0; i < 6; i++) {
+			await sleep(250);
+			a.send({ op: "renew" }); // heartbeat only: keeps the TTL, touches no quantum
+		}
+		b.send({ op: "status" });
+		const queue = (await b.next(3000)).queues.find((q: any) => q.queueKey === QUEUE_KEY);
+		assert.deepEqual(queue.holders, ["A"], "an in-flight request is never evicted on the idle, request-count or elapsed-time quantum");
+		assert.equal(queue.switches, 0, "no session switch happened while the request was in flight");
+	});
+
+	it("concurrent same-session requests share one lease: the first completion does not open the slot", async () => {
+		// A run plus an out-of-run request (compaction) on one session and one queue share the lease.
+		// A boolean flag would let the first done-beat preempt the stream that is still running.
+		const d = startQuanta({ monopolyMs: 400, monopolyRequests: 1 });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		beat(a, "A");
+		beat(a, "A"); // the nested request starts on the same lease
+		await a.next(3000);
+		await a.next(3000);
+		acquire(b, "B");
+
+		done(a, "A"); // the nested request ends; the run's stream is still in flight
+		await assert.rejects(b.next(1500), /no message from daemon within/, "one completion does not free the lease");
+
+		done(a, "A"); // the run's stream ends
+		assert.deepEqual(await b.next(5000), granted("B"), "the slot opens when the last in-flight request completes");
 	});
 });
 
@@ -476,6 +559,38 @@ describe("queue policy resolution", () => {
 		c.close();
 		d.stop();
 	});
+
+	it("rejects a keyless acquire instead of creating an unnamed queue that holds a slot", async () => {
+		const d = startDaemon();
+		const c = await connectClient(d.socketPath);
+		for (const op of ["acquire", "release", "cancel"]) c.send({ op, sessionKey: "X", role: "parent" });
+		for (const op of ["acquire", "release", "cancel"]) {
+			const reply = await c.next(3000);
+			assert.equal(reply.op, "error");
+			assert.match(reply.reason, /queueKey/);
+			assert.ok(reply.reason.startsWith(op), `the error names the op (${JSON.stringify(reply)})`);
+		}
+		c.send({ op: "status" });
+		assert.deepEqual((await c.next(3000)).queues, [], "no unnamed queue appeared for the keyless request");
+		c.close();
+		d.stop();
+	});
+
+	it("starts and serves with a provider catalog that does not exist", async () => {
+		// models.json is optional for pi, and the extension always passes --models-json.
+		const missing = join(mkdtempSync(join(tmpdir(), "llm-queue-nomodels-")), "models.json");
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: {} }, undefined, missing);
+		let exitCode: number | null = null;
+		d.proc.on("exit", (code) => (exitCode = code));
+
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.equal((await c.next(3000)).op, "granted", "the daemon serves requests normally without a catalog");
+		await sleep(400);
+		assert.equal(exitCode, null, "a missing models.json must not kill the daemon");
+		c.close();
+		d.stop();
+	});
 });
 
 describe("per-endpoint queues, groups and hot-reload", () => {
@@ -523,6 +638,22 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 
 		a.close();
 		b.close();
+		d.stop();
+	});
+
+	it("resolves a raw endpoint key through the same group rule the extension uses", async () => {
+		// One endpoint, two providers, one group per provider: the daemon's endpoint-level rule and
+		// the extension's provider-level rule are one implementation (src/config.js groupKeyFor).
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { g1: { match: ["strata"], maxStreams: 1 }, g2: { match: ["llama"], maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		a.send({ op: "status" });
+		const status = await a.next(3000);
+		assert.deepEqual(status.queues.map((q: any) => q.queueKey), ["g1"], "the endpoint's first matching group owns the raw client's slot");
+
+		a.close();
 		d.stop();
 	});
 
@@ -827,5 +958,55 @@ describe("config schema validation at the daemon seam", () => {
 
 		c.close();
 		proc.kill();
+	});
+});
+
+// Socket framing (finding 13): a unix-socket peer's writes are not line- or character-aligned,
+// and a peer that never sends a newline must not grow the daemon without bound.
+describe("connection framing and buffer bounds", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	it("parses a message split inside a multi-byte character", async () => {
+		const d = startDaemon();
+		await waitForDaemon(d.socketPath);
+		const payload = Buffer.from(`${JSON.stringify({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "café✅" })}\n`);
+		const split = payload.indexOf(0xc3) + 1; // between the two bytes of "é"
+		const raw = await connect(d.socketPath);
+		const decoder = new TextDecoder();
+		const reply = new Promise<any>((resolve, reject) => {
+			let buffer = "";
+			raw.on("data", (chunk) => {
+				buffer += decoder.decode(chunk as BufferSource, { stream: true });
+				const line = buffer.split("\n")[0];
+				if (line) resolve(JSON.parse(line));
+			});
+			setTimeout(() => reject(new Error("no reply from daemon")), 3000);
+		});
+
+		raw.write(payload.subarray(0, split));
+		await sleep(100);
+		raw.write(payload.subarray(split));
+		assert.equal((await reply).sessionKey, "café✅", "the key survives the split byte-for-byte");
+
+		raw.destroy();
+		d.stop();
+	});
+
+	it("drops a connection that never sends a newline and keeps serving", async () => {
+		const d = startDaemon();
+		await waitForDaemon(d.socketPath);
+		const flood = await connect(d.socketPath);
+		flood.on("error", () => {}); // the daemon destroys the connection mid-write: EPIPE is the expected outcome
+		flood.write("x".repeat(200_000)); // no newline: the daemon must cap the line buffer
+		await new Promise<void>((resolve) => flood.once("close", resolve));
+
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "status" });
+		assert.equal((await c.next(3000)).op, "status", "the daemon stays healthy after an oversized peer");
+		c.close();
+		d.stop();
 	});
 });
