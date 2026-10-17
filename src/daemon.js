@@ -28,6 +28,24 @@ function send(conn, msg) {
 
 const queues = new Map();
 
+// Idle-exit: the daemon self-terminates `daemonIdleExitMs` after the last client disconnects,
+// so no orphan lingers. A client that reconnects within the grace cancels the exit, so quick
+// relaunches (a session restarting) keep the warm daemon. `Infinity` disables idle-exit.
+let clientCount = 0;
+let idleTimer = null;
+function scheduleIdleExit() {
+	const ms = defaults.daemonIdleExitMs ?? 60000;
+	if (!isFinite(ms)) return;
+	clearTimeout(idleTimer);
+	idleTimer = setTimeout(() => {
+		try {
+			unlinkSync(socketPath);
+		} catch {}
+		process.exit(0);
+	}, ms);
+	idleTimer.unref();
+}
+
 // Queue keys are endpoint baseUrls. A provider-name key applies to that provider's
 // baseUrl; a baseUrl key wins when both name the same endpoint.
 function policyFor(key) {
@@ -251,6 +269,11 @@ function handle(msg, conn) {
 const server = createServer((conn) => {
 	conn.leases = [];
 	conn.queued = [];
+	clientCount++;
+	if (idleTimer) {
+		clearTimeout(idleTimer);
+		idleTimer = null;
+	}
 	let buffer = "";
 	conn.on("data", (chunk) => {
 		buffer += chunk.toString();
@@ -275,8 +298,11 @@ const server = createServer((conn) => {
 // A disconnect is an abort: drop the queued request and release any lease it held.
 // Iterate a copy: release() splices conn.leases, and a client can hold several leases.
 function cleanup(conn) {
+	if (conn.cleaned) return; // close and error both fire cleanup: count the disconnect once
+	conn.cleaned = true;
 	for (const lease of [...(conn.leases ?? [])]) release(queueFor(lease.queueKey), lease.sessionKey);
 	for (const w of [...(conn.queued ?? [])]) remove(w.queue.waiting, w);
+	if (--clientCount <= 0) scheduleIdleExit();
 }
 
 // Two sessions can autostart at once: the loser finds the socket taken and stands down.
@@ -369,3 +395,6 @@ if (configPath) {
 }
 
 start();
+// Arm idle-exit at startup too: a daemon spawned by ensureDaemon whose client never reaches it
+// (connect fails, fail-open) must not hold the socket forever with zero clients.
+scheduleIdleExit();

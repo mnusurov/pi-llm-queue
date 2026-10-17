@@ -15,7 +15,14 @@ export interface DaemonPaths {
 	modelsJsonPath?: string;
 	/** Heartbeat period; must stay well under the daemon's leaseTtlMs. */
 	heartbeatMs?: number;
+	/** Daemon unreachable → pass through unqueued (default true). false → a request hard-errors. */
+	failOpen?: boolean;
+	/** Parent queue-wait cap; on expiry the request passes through with a warning. Child is always unlimited. */
+	queueTimeoutMs?: number;
 }
+
+/** Why an acquire resolved: granted, daemon-unreachable, queue-wait timeout, or aborted. */
+export type AcquireReason = "granted" | "fail-open" | "timeout" | "aborted";
 
 function socketAlive(socketPath: string): Promise<boolean> {
 	return new Promise((resolve) => {
@@ -69,10 +76,18 @@ export class LeaseClient {
 
 	private socketPath: string;
 	private paths: DaemonPaths;
+	private failOpen: boolean;
 
 	constructor(paths: DaemonPaths) {
 		this.paths = paths;
 		this.socketPath = paths.socketPath;
+		this.failOpen = paths.failOpen ?? true;
+	}
+
+	// failOpen: false and the daemon is gone → the request hard-errors (the queue is a
+	// single point of failure by the operator's explicit choice).
+	private unreachable(): never {
+		throw new Error("pi-llm-queue: daemon unreachable and failOpen is false");
 	}
 
 	private async connectDaemon(): Promise<boolean> {
@@ -146,23 +161,24 @@ export class LeaseClient {
 		group?: string,
 		signal?: AbortSignal,
 		onQueued?: (info: { position: number; holders: string[] }) => void,
-	): Promise<void> {
-		if (!(await this.connectDaemon())) return;
+	): Promise<AcquireReason> {
+		if (!(await this.connectDaemon())) {
+			if (!this.failOpen) this.unreachable();
+			return "fail-open";
+		}
 		this.sock?.ref(); // a queued request must keep pi alive
 		this.send({ op: "acquire", queueKey, sessionKey, role, group });
 		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
 		const entry: Pending = { match: granted, resolve: () => {} };
-		const onAbort = () => {
-			const at = this.pending.indexOf(entry);
-			if (at >= 0) this.pending.splice(at, 1);
-			this.send({ op: "cancel", queueKey, sessionKey });
-			entry.resolve({ op: "aborted" });
-		};
+		// A child must never pass through unqueued (it would defeat serialisation), so the
+		// queue-wait cap applies to parents only; a child's default is unlimited.
+		const timeoutMs = role === "child" ? Infinity : this.paths.queueTimeoutMs ?? Infinity;
 		// A queued acquire stays unanswered by design, so the indicator reads its position
 		// from status polls: a short grace (an idle slot grants instantly) then every 2 s.
 		// shortcut: position is enqueue order, not priority-grant order; upgrade when the
 		// daemon pushes queued acks.
 		let poll: ReturnType<typeof setInterval> | null = null;
+		let timer: ReturnType<typeof setTimeout> | null = null;
 		let settled = false;
 		const report = async () => {
 			const s = await this.status();
@@ -179,11 +195,23 @@ export class LeaseClient {
 				}, 300)
 			: null;
 		firstPoll?.unref();
-		await new Promise<void>((resolve) => {
-			entry.resolve = () => {
+		const reason = await new Promise<AcquireReason>((resolve) => {
+			let done = false;
+			const finish = (r: AcquireReason) => {
+				if (done) return;
+				done = true;
+				if (timer) clearTimeout(timer);
 				signal?.removeEventListener("abort", onAbort);
-				resolve();
+				resolve(r);
 			};
+			const onAbort = () => {
+				const at = this.pending.indexOf(entry);
+				if (at >= 0) this.pending.splice(at, 1);
+				this.send({ op: "cancel", queueKey, sessionKey });
+				finish("aborted");
+			};
+			// Grant delivery passes the granted msg; a daemon death mid-wait passes {op:"fail-open"}.
+			entry.resolve = (msg: any) => finish(msg && msg.op === "fail-open" ? "fail-open" : "granted");
 			this.pending.push(entry);
 			if (signal) {
 				if (signal.aborted) {
@@ -192,11 +220,23 @@ export class LeaseClient {
 				}
 				signal.addEventListener("abort", onAbort, { once: true });
 			}
+			if (isFinite(timeoutMs)) {
+				timer = setTimeout(() => {
+					const at = this.pending.indexOf(entry);
+					if (at >= 0) this.pending.splice(at, 1);
+					this.send({ op: "cancel", queueKey, sessionKey }); // drop from the queue, then pass through
+					finish("timeout");
+				}, timeoutMs);
+				timer.unref();
+			}
 		});
 		if (firstPoll) clearTimeout(firstPoll);
 		if (poll) clearInterval(poll);
 		settled = true;
 		this.sock?.unref();
+		// A daemon that died mid-wait resolves the pending acquire as fail-open: honour failOpen here too.
+		if (reason === "fail-open" && !this.failOpen) this.unreachable();
+		return reason;
 	}
 
 	release(queueKey: string, sessionKey: string): void {
@@ -214,11 +254,15 @@ export class LeaseClient {
 	 * Resolves false when the daemon has switched the slot away — the caller must re-queue.
 	 */
 	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
-		if (!(await this.connectDaemon())) return true; // fail-open: stream unqueued
+		if (!(await this.connectDaemon())) {
+			if (!this.failOpen) this.unreachable();
+			return true; // fail-open: stream unqueued
+		}
 		this.sock?.ref(); // the reply must keep the process/worker alive while we await it
 		this.send({ op: "renew", queueKey, sessionKey });
 		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
 		this.sock?.unref();
+		if (msg.op === "fail-open" && !this.failOpen) this.unreachable(); // daemon died mid-beat
 		return msg.granted !== false;
 	}
 

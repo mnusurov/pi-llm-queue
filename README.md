@@ -46,7 +46,9 @@ the session-switch quanta (release / idle / monopoly) are implemented (#3). Prio
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
 `/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
 `enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` is
-implemented (#6); `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` in #8) and config hot-reload
+implemented (#6); `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` implemented in #8) and config hot-reload
 (daemon + extension) are implemented (#5). Observability (#7) — the queued footer indicator, the
 `/queue` status (slot holder, per-tier queue depth, session-switch counts) and JSON status — is
-implemented. Fail-open hardening + idle-exit (#8) and packaging (#9) are not built.
+implemented. Fail-open hardening + idle-exit (#8) — `failOpen` (default true), the `queueTimeoutMs`
+parent queue-wait cap (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
+packaging (#9) is not built.

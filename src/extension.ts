@@ -22,6 +22,8 @@ const SOCKET_PATH = join(AGENT_DIR, "llm-queue.sock");
 const DAEMON_PATH = decodeURIComponent(new URL("daemon.js", import.meta.url).pathname);
 // Wake chains (parent woken by a child) must not thrash the slot: spec says 2-5 s.
 const GRACE_MS = 3000;
+// Shown when a parent's queue wait exceeds queueTimeoutMs and the request passes through unqueued.
+const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — passing through unqueued";
 
 interface QueueEntry {
 	maxStreams?: number;
@@ -117,6 +119,8 @@ export default function (pi: ExtensionAPI) {
 		configPath: CONFIG_PATH,
 		modelsJsonPath: MODELS_JSON_PATH,
 		heartbeatMs,
+		failOpen: config.defaults?.failOpen,
+		queueTimeoutMs: config.defaults?.queueTimeoutMs,
 	});
 	const envRole: Role = resolveRole(process.env);
 	const group = process.env.PI_QUEUE_GROUP;
@@ -192,10 +196,13 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal, showQueued);
+					const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal, showQueued);
 					clearQueued();
-					if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
-					else selfQueued = true;
+					if (reason === "timeout") ui?.notify(TIMEOUT_WARNING, "warning");
+					if (reason === "granted") {
+						if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
+						else selfQueued = true;
+					}
 				}
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
@@ -304,8 +311,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Hot-reload: a config edit re-resolves the wrapped provider set (pi applies provider
 	// registration immediately); the daemon reloads the same file for queue policy.
-	// shortcut: leaseTtlMs changes only take effect on pi restart (the client heartbeat period
-	// is fixed at connect).
+	// shortcut: leaseTtlMs (client heartbeat period), failOpen and queueTimeoutMs are read once at
+	// connect and take effect only on pi restart; the daemon hot-reloads its own leaseTtlMs.
 	const watchConfig = (ctx: ExtensionContext) => {
 		if (!existsSync(CONFIG_PATH)) return;
 		let debounce: ReturnType<typeof setTimeout> | null = null;
@@ -360,10 +367,11 @@ export default function (pi: ExtensionAPI) {
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
 		const queueKey = resolveQueueKey(queues, model);
-		await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued);
+		const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued);
 		clearQueued();
-		// An abort already released the slot: do not claim a lease we no longer hold.
-		if (!ctx.signal?.aborted) heldQueueKey = queueKey;
+		if (reason === "timeout") ctx.ui.notify(TIMEOUT_WARNING, "warning");
+		// Only a grant claims a lease: a timeout/abort/fail-open must not mark the slot held.
+		if (reason === "granted") heldQueueKey = queueKey;
 	});
 
 	pi.on("agent_settled", () => {

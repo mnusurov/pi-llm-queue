@@ -723,3 +723,36 @@ describe("observability: status counters", () => {
 		d.stop();
 	});
 });
+
+// Idle-exit (#8): the daemon self-terminates after daemonIdleExitMs with zero clients, and a
+// reconnect within the grace cancels the exit. Process-level: asserts the spawned daemon exits.
+describe("daemon idle-exit", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	const exited = (proc: import("node:child_process").ChildProcess, ms: number) =>
+		new Promise<boolean>((resolve) => {
+			proc.once("exit", () => resolve(true));
+			setTimeout(() => resolve(false), ms);
+		});
+
+	it("self-terminates after daemonIdleExitMs once the last client disconnects", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 300 }, queues: {} });
+		const c = await connectClient(d.socketPath);
+		c.close(); // last client leaves: the idle timer arms
+		assert.ok(await exited(d.proc, 4000), "the daemon exits after daemonIdleExitMs with no clients");
+	});
+
+	it("survives a quick relaunch within the idle grace", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 900 }, queues: {} });
+		const c1 = await connectClient(d.socketPath);
+		c1.close();
+		await sleep(400); // within the grace window
+		const c2 = await connectClient(d.socketPath); // relaunch cancels the pending exit
+		c2.send({ op: "status" });
+		assert.equal((await c2.next(3000)).op, "status", "the daemon survived the idle grace");
+		c2.close();
+	});
+});
