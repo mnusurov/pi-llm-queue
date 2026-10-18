@@ -12,7 +12,7 @@ import type {
 	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LeaseClient, type Role } from "./lease-client.ts";
+import { LeaseClient, type Role, type AcquireReason } from "./lease-client.ts";
 import { loadValidConfig, readJson, groupKeyFor, queueEntryFor, SCHEMA_VERSION } from "./config.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -166,9 +166,29 @@ export default function (pi: ExtensionAPI) {
 		ui: ExtensionContext["ui"] | null = null;
 		queuedInfo: (QueueWait & { startedAt: number }) | null = null;
 		indicatorTimer: ReturnType<typeof setInterval> | null = null;
+		// True between agent_start and agent_settled: a run owns the slot, so a stream that ends must
+		// not re-arm the grace release the run will re-arm at settle instead.
+		runActive = false;
+		// The run's acquire started at agent_start, still awaiting the grant. pi does not await the
+		// handler, so the first stream can arrive first; it must join this acquire, not queue again.
+		private pendingAcquire: { queueKey: string; promise: Promise<AcquireReason> } | null = null;
 
 		constructor(sessionKey: string) {
 			this.sessionKey = sessionKey;
+		}
+
+		/** Acquire this queue's slot once: a concurrent call for the same queue shares the request. */
+		acquire(queueKey: string, signal?: AbortSignal): Promise<AcquireReason> {
+			if (this.pendingAcquire?.queueKey !== queueKey) {
+				const promise = acquireFor(this, queueKey, signal);
+				this.pendingAcquire = { queueKey, promise };
+				promise
+					.finally(() => {
+						if (this.pendingAcquire?.promise === promise) this.pendingAcquire = null;
+					})
+					.catch(() => {}); // the awaiters see the rejection; this tap only clears state
+			}
+			return this.pendingAcquire.promise;
 		}
 
 		/** Footer indicator while this session waits for a slot: position, elapsed wait, who holds. */
@@ -199,12 +219,19 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		/** Cancel a pending grace-window release: a run starting inside it keeps the slot. */
+		/** Cancel a pending grace-window release: a run or stream starting inside it keeps the slot. */
 		cancelPendingRelease() {
 			if (this.releaseTimer) {
 				clearTimeout(this.releaseTimer);
 				this.releaseTimer = null;
 			}
+		}
+
+		/** Release the slot unless a run claims it within the grace window. */
+		armGraceRelease() {
+			this.cancelPendingRelease();
+			this.releaseTimer = setTimeout(() => this.release(), GRACE_MS);
+			this.releaseTimer.unref();
 		}
 
 		release() {
@@ -220,8 +247,19 @@ export default function (pi: ExtensionAPI) {
 		if (!state) sessions.set(key, (state = new SessionState(key)));
 		return state;
 	};
-	// Requests without options.sessionId (direct/non-agent calls) fall back to the newest session.
+	// A request without options.sessionId (direct call, compaction, classifier) has no session to
+	// name. It belongs to whichever session holds this endpoint's slot (only that session is using
+	// the endpoint right now; a parallel agent_start that lost the race cannot misattribute it), and
+	// the most recently started session otherwise.
+	// shortcut: with no slot holder, a sessionless request joins the newest session; upgrade to a
+	// per-session direct-call bucket if a sessionless caller ever needs its own lease state.
 	let newestSessionKey = "";
+
+	const sessionKeyFor = (queueKey: string, options?: SimpleStreamOptions): string => {
+		if (options?.sessionId) return options.sessionId;
+		for (const state of sessions.values()) if (state.heldQueueKey === queueKey) return state.sessionKey;
+		return newestSessionKey;
+	};
 
 	// Every session acquires the same way: show the footer while waiting, warn once the parent
 	// wait passes queueTimeoutMs (the request stays queued).
@@ -239,12 +277,17 @@ export default function (pi: ExtensionAPI) {
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const out = createAssistantMessageEventStream();
-		// The agent tags every request with its session id, so two sessions in one process keep
-		// separate leases; a request without one (direct call) uses the most recent session.
-		const sessionKey = options?.sessionId ?? newestSessionKey;
-		const state = ensureState(sessionKey);
 		const queueKey = resolveQueueKey(queues, model, modelsJson);
+		// The agent tags every request with its session id, so two sessions in one process keep
+		// separate leases; a request without one (direct call) resolves to the slot's holder.
+		const sessionKey = sessionKeyFor(queueKey, options);
+		const state = ensureState(sessionKey);
 		const wasHeld = state.heldQueueKey === queueKey;
+		// A stream landing inside the settle grace window means the session is active again: cancel
+		// the pending release, or the slot frees mid-stream and another session grabs it (#55).
+		// A run re-arms at agent_settled; a lone request (no run) re-arms here when it finishes.
+		const inGrace = state.releaseTimer !== null;
+		state.cancelPendingRelease();
 		(async () => {
 			let selfQueued = false;
 			try {
@@ -255,7 +298,12 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					const reason = await acquireFor(state, queueKey, options?.signal);
+					// Join the run's in-flight acquire for this queue if there is one: pi does not await
+					// agent_start, so the first stream lands before the grant. Queuing again would
+					// enqueue the session twice and release after every stream (#55). If agent_start
+					// claimed this same acquire, it sets heldQueueKey and the finally below leaves the
+					// lease to the run.
+					const reason = await state.acquire(queueKey, options?.signal);
 					state.clearQueued();
 					if (reason === "granted") {
 						if (wasHeld) state.heldQueueKey = queueKey; // the run re-took its slot
@@ -302,7 +350,10 @@ export default function (pi: ExtensionAPI) {
 				});
 				out.end();
 			} finally {
-				if (selfQueued) lease.release(queueKey, sessionKey);
+				// A run claimed the slot meanwhile (agent_start set heldQueueKey): leave the lease to it.
+				if (selfQueued && state.heldQueueKey !== queueKey) lease.release(queueKey, sessionKey);
+				// No run is coming to re-arm: this lone request resumed the session, so restart the grace.
+				else if (inGrace && !state.runActive) state.armGraceRelease();
 			}
 		})();
 		return out;
@@ -446,24 +497,25 @@ export default function (pi: ExtensionAPI) {
 	// release at once on abort.
 	pi.on("agent_start", async (_event, ctx) => {
 		const sessionKey = ctx.sessionManager.getSessionId();
-		newestSessionKey = sessionKey;
 		const state = ensureState(sessionKey);
 		state.cancelPendingRelease(); // a run starting inside the grace window keeps the slot
 		const model = ctx.model;
 		if (!model || !providers.includes(model.provider)) return;
+		state.runActive = true; // a stream ending after this must not re-arm the grace; settle will
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
 		const queueKey = resolveQueueKey(queues, model, modelsJson);
-		const reason = await acquireFor(state, queueKey, ctx.signal);
+		const reason = await state.acquire(queueKey, ctx.signal);
 		state.clearQueued();
-		// Only a grant claims a lease: an abort/fail-open must not mark the slot held.
+		// Only a grant claims a lease: an abort/fail-open must not mark the slot held. A stream that
+		// joined this acquire shares the grant and must not release it per-stream (#55).
 		if (reason === "granted") state.heldQueueKey = queueKey;
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		const state = ensureState(ctx.sessionManager.getSessionId());
-		state.releaseTimer = setTimeout(() => state.release(), GRACE_MS);
-		state.releaseTimer.unref();
+		state.runActive = false;
+		state.armGraceRelease();
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
