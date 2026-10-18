@@ -1,6 +1,6 @@
 // pi-llm-queue extension: wraps configured providers so a session holds the endpoint's slot for
 // its whole run, keeping the KV cache warm for one session at a time.
-import { existsSync, watch } from "node:fs";
+import { existsSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
@@ -13,7 +13,7 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role } from "./lease-client.ts";
-import { loadValidConfig, readJson, groupKeyFor, queueEntryFor } from "./config.js";
+import { loadValidConfig, readJson, groupKeyFor, queueEntryFor, SCHEMA_VERSION } from "./config.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -33,6 +33,48 @@ interface QueueEntry {
 	match?: string[];
 	/** Force subagent launches to block the parent (async:false) so they serialise on this queue. */
 	blockSubagentLaunch?: boolean;
+}
+
+const LOCAL_DOMAIN = /\.(local|lan|home\.arpa)$/;
+
+/**
+ * Self-hosted endpoint: loopback, RFC1918, link-local, or a local/mDNS domain. Public IPs and
+ * other hostnames are cloud. A provider with no baseUrl (pure cloud API) is not self-hosted.
+ */
+export function isLocalEndpoint(baseUrl?: string): boolean {
+	if (!baseUrl) return false;
+	let host: string;
+	try {
+		host = new URL(baseUrl).hostname.replace(/^\[|\]$/g, "");
+	} catch {
+		return false;
+	}
+	if (host === "localhost" || LOCAL_DOMAIN.test(host)) return true;
+	const v4 = /^(\d{1,3})\.(\d{1,3})\./.exec(host);
+	if (v4) {
+		const [a, b] = [Number(v4[1]), Number(v4[2])];
+		return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);
+	}
+	return host === "::1";
+}
+
+/**
+ * Starter config for a fresh install: one queue per endpoint baseUrl (deduplicated, sorted),
+ * self-hosted enabled with the default single slot, cloud as passthrough, native-owned providers
+ * excluded. Null when there is nothing to scaffold: no self-hosted, non-native endpoint.
+ */
+export function buildStarterConfig(providers: Record<string, any>, isNativeOwned: (name: string) => boolean) {
+	const collected: Record<string, { enabled: boolean }> = {};
+	for (const [name, provider] of Object.entries(providers ?? {})) {
+		const baseUrl = provider?.baseUrl;
+		if (!baseUrl || baseUrl in collected || isNativeOwned(name)) continue;
+		collected[baseUrl] = { enabled: isLocalEndpoint(baseUrl) };
+	}
+	const keys = Object.keys(collected).sort();
+	if (!keys.some((key) => collected[key].enabled)) return null;
+	const queues: Record<string, { enabled: boolean }> = {};
+	for (const key of keys) queues[key] = collected[key];
+	return { schemaVersion: SCHEMA_VERSION, queues };
 }
 
 /** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
@@ -343,12 +385,41 @@ export default function (pi: ExtensionAPI) {
 		watcher.unref();
 	};
 
+	// Fresh install: no config file means the queue is inert. Write a starter built from the user's
+	// own models.json so the very first launch queues, then reload it and register in this session.
+	const scaffoldStarterConfig = (ctx: ExtensionContext) => {
+		if (existsSync(CONFIG_PATH)) return;
+		const starter = buildStarterConfig(modelsJson, (name) => !!ctx.modelRegistry.getRegisteredNativeProvider?.(name));
+		if (!starter) return;
+		const tmp = `${CONFIG_PATH}.tmp-${process.pid}`;
+		try {
+			writeFileSync(tmp, `${JSON.stringify(starter, null, 2)}\n`);
+			// rename overwrites, so the create-if-missing guard is checked right before it; a racing
+			// first-launch is last-writer-wins with identical content.
+			if (existsSync(CONFIG_PATH)) return;
+			renameSync(tmp, CONFIG_PATH);
+		} catch {
+			return; // unwritable agent dir: stay inert as before
+		} finally {
+			try {
+				unlinkSync(tmp);
+			} catch {}
+		}
+		const next = loadValidConfig(CONFIG_PATH);
+		if (next.errors.length) return;
+		config = next.config;
+		queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+		const enabled = Object.values(queues).filter((entry) => entry?.enabled !== false).length;
+		ctx.ui.notify(`pi-llm-queue: created ${CONFIG_PATH} — ${enabled} self-hosted endpoint(s) queued. Tune "enabled" / "maxStreams" there, see status with /queue.`, "info");
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		sessionKey = ctx.sessionManager.getSessionId();
 		ui = ctx.ui;
 		if (configErrors.length) ctx.ui.notify(`pi-llm-queue: config rejected, running with defaults:\n${configErrors.join("\n")}`, "error");
 		if (!registered) {
 			registered = true;
+			scaffoldStarterConfig(ctx);
 			registerQueuedProviders(ctx);
 			watchConfig(ctx);
 		}
