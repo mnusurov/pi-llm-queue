@@ -113,6 +113,47 @@ describe("provider wrapper (queuedStream)", () => {
 		);
 	});
 
+	it("keeps two sessions in one process on separate leases (holder A, waiter B)", async () => {
+		// One extension instance, two sessions: module-level singleton state would collapse them.
+		const pi = makePi();
+		extension(pi as any);
+		const ctxA = start(pi, "ONE-A");
+		const ctxB = start(pi, "ONE-B");
+		await pi.handlers["agent_start"][0]({}, ctxA); // A acquires the slot
+		const startedB = pi.handlers["agent_start"][0]({}, ctxB); // B queues behind A
+		await sleep(200);
+
+		const raw = await connectClient(socketPath);
+		const statusOf = async () => {
+			raw.send({ op: "status" });
+			const s = await raw.next(2000);
+			return s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
+		};
+		let q = await statusOf();
+		assert.deepEqual(q.holders, ["ONE-A"], "A holds the slot");
+		assert.deepEqual(
+			q.waiting.map((w: any) => w.sessionKey),
+			["ONE-B"],
+			"B queues behind A",
+		);
+
+		// A's held request beats under its own session key and streams at once — not re-queued under B.
+		const eA = firstEvent(pi.registered["stub"].streamSimple(model, {} as any, { sessionId: "ONE-A" } as any));
+		assert.equal(
+			await Promise.race([eA.then(() => "done"), sleep(700).then(() => "blocked")]),
+			"done",
+			"A's held request streams immediately",
+		);
+
+		q = await statusOf();
+		assert.deepEqual(q.holders, ["ONE-A"], "B did not evict A");
+
+		pi.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn
+		await startedB;
+		raw.close();
+		pi.handlers["session_shutdown"][0]({}, ctxB);
+	});
+
 	it("shows a footer indicator while queued and clears it when the slot is granted", async () => {
 		const a = makePi();
 		const b = makePi();

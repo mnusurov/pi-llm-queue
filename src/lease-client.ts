@@ -130,7 +130,10 @@ export class LeaseClient {
 				});
 				this.sock = sock;
 				sock.unref(); // never keep pi's process alive through the lease connection
-				// Lease heartbeat: a live session must never lose its slot to the TTL.
+				// Lease heartbeat: a live session must never lose its slot to the TTL. Renew is
+				// connection-wide, so it only refreshes the leases still on this socket; a session's
+				// lease leaves the socket the moment it releases (shutdown/abort/settle), so a dead
+				// session can never be kept alive past its TTL as a zombie (#53 defect 4).
 				this.heartbeat ??= setInterval(() => this.send({ op: "renew" }), this.paths.heartbeatMs ?? 10000);
 				this.heartbeat.unref();
 				return true;
