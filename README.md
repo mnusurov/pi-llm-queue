@@ -31,10 +31,30 @@ That single command is the whole install:
 2. **Daemon autostart** — the extension spawns the daemon on demand (detached,
    `~/.pi/agent/llm-queue.sock`, stale-socket reclaim, idle-exit after the
    last client leaves). Nothing to run manually, no launch agent, no systemd unit.
-3. **Config file** — `~/.pi/agent/llm-queue.json` is optional: a missing (or empty) file
-   queues nothing, because queue keys are what select the providers to wrap. Create it to
-   activate the queue — the simplest is `{}` plus a `queues` entry per provider/endpoint
-   (reference below). Hot-reloads on save.
+3. **Config file** — `~/.pi/agent/llm-queue.json` is created for you on the first launch (see
+   [Auto-starter](#auto-starter-first-launch) below) and hot-reloads on save. An empty file
+   queues nothing, because queue keys are what select the providers to wrap; add a `queues`
+   entry per provider/endpoint to widen the queue (reference below).
+
+### Auto-starter (first launch)
+
+On the first session start after install, when `~/.pi/agent/llm-queue.json` is absent, the
+extension generates a starter config from your `~/.pi/agent/models.json` and notifies you — the
+queue is live from that first session, no manual config needed.
+
+- **Self-hosted endpoints are queued** (enabled, `maxStreams: 1` → strict serialisation). A
+  provider is self-hosted when its baseUrl host is loopback (`localhost`, `127.x`, `::1`),
+  RFC1918 (`10.x`, `192.168.x`, `172.16–31.x`), link-local (`169.254.x`), or a local/mDNS domain
+  (`*.local`, `*.lan`, `*.home.arpa`).
+- **Cloud endpoints are written as passthrough** (`enabled: false`) — public IPs, other hostnames,
+  and providers with no baseUrl. They stay fully parallel; flip `enabled: true` to queue them.
+- **Native-owned providers are excluded** (providers owned by native extensions are left unqueued).
+- **Generated file shape**: `schemaVersion: 1`, one endpoint-keyed `queues` entry per baseUrl
+  (deduplicated, sorted), no `defaults` block.
+
+It is created only when there is at least one self-hosted, non-native endpoint, and it is never
+overwritten once it exists. To disable the queue permanently, set every key to `enabled: false` —
+deleting the file is not a permanent disable, because it regenerates on the next launch when absent.
 
 Recommended pi setting (`~/.pi/agent/settings.json`) so queue wait behind a long prefill does
 not trip pi's HTTP idle timeout:
@@ -155,4 +175,5 @@ implemented (#6); `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` implemented
 implemented. Fail-open hardening + idle-exit (#8) — `failOpen` (default true), the `queueTimeoutMs`
 parent queue-wait cap (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
 packaging + docs (#9) — npm package, versioned config schema validation, install/config/env/dev docs —
-is implemented; e2e cache-warmth validation (#10) is human-run.
+is implemented; e2e cache-warmth validation (#10) is human-run; the auto-starter (#37/#38) — a
+starter `llm-queue.json` scaffolded from `models.json` on first launch — is implemented.
