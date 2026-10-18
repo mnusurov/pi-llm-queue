@@ -25,10 +25,11 @@ from the user's own `~/.pi/agent/models.json`:
   (`localhost`, `127.x`, `::1`), RFC1918 (`10.x`, `192.168.x`, `172.16–31.x`), link-local
   (`169.254.x`), or a local/mDNS domain (`*.local`, `*.lan`, `*.home.arpa`). Everything else is
   cloud.
-- **Cloud passthrough.** Cloud endpoints (public IPs, other hostnames, providers with no baseUrl)
-  are written `enabled: false` — fully parallel, untouched. Queueing a shared cloud API has no
-  KV-cache benefit and would only add latency, so the starter queues only what the cache-warmth
-  goal actually targets.
+- **Cloud passthrough.** Cloud endpoints (public IPs, other hostnames) are written `enabled: false`
+  — fully parallel, untouched. Queueing a shared cloud API has no KV-cache benefit and would only
+  add latency, so the starter queues only what the cache-warmth goal actually targets. Providers
+  with no baseUrl (pure cloud APIs) are omitted from the file entirely — no key, so they stay
+  unwrapped.
 - **Native exclusion.** Providers owned by native extensions are excluded from the starter.
 - **Create-if-missing, never overwrite.** Write only when the file is absent; the create guard is
   re-checked immediately before an atomic rename, so a racing first launch is last-writer-wins
@@ -37,8 +38,9 @@ from the user's own `~/.pi/agent/models.json`:
   sorted), no `defaults` block.
 - **Notify.** Surface the created path and the queued-endpoint count through `ui.notify` so the
   user knows a file appeared and where to tune it.
-- **Stable disable path.** Set every key to `enabled: false`. Deleting the file is not a
-  permanent disable — it regenerates on the next launch when absent.
+- **Stable disable path.** Set every key to `enabled: false`. Deleting the file is not a permanent
+  disable while at least one self-hosted, non-native endpoint exists — it regenerates on the next
+  launch when absent (with no such endpoint, the starter returns null and a deleted file stays gone).
 
 ## Consequences
 

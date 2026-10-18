@@ -42,19 +42,22 @@ On the first session start after install, when `~/.pi/agent/llm-queue.json` is a
 extension generates a starter config from your `~/.pi/agent/models.json` and notifies you — the
 queue is live from that first session, no manual config needed.
 
-- **Self-hosted endpoints are queued** (enabled, `maxStreams: 1` → strict serialisation). A
+- **Self-hosted endpoints are queued** (enabled, default single slot → strict serialisation). A
   provider is self-hosted when its baseUrl host is loopback (`localhost`, `127.x`, `::1`),
   RFC1918 (`10.x`, `192.168.x`, `172.16–31.x`), link-local (`169.254.x`), or a local/mDNS domain
   (`*.local`, `*.lan`, `*.home.arpa`).
-- **Cloud endpoints are written as passthrough** (`enabled: false`) — public IPs, other hostnames,
-  and providers with no baseUrl. They stay fully parallel; flip `enabled: true` to queue them.
+- **Cloud endpoints are written as passthrough** (`enabled: false`) — public IPs and other
+  hostnames. They stay fully parallel; flip `enabled: true` to queue them. Providers with no
+  baseUrl (pure cloud APIs) are omitted from the file entirely — add a provider-name key to queue
+  one.
 - **Native-owned providers are excluded** (providers owned by native extensions are left unqueued).
 - **Generated file shape**: `schemaVersion: 1`, one endpoint-keyed `queues` entry per baseUrl
   (deduplicated, sorted), no `defaults` block.
 
 It is created only when there is at least one self-hosted, non-native endpoint, and it is never
 overwritten once it exists. To disable the queue permanently, set every key to `enabled: false` —
-deleting the file is not a permanent disable, because it regenerates on the next launch when absent.
+deleting the file is not a permanent disable while such an endpoint exists, because it regenerates
+on the next launch when absent.
 
 Recommended pi setting (`~/.pi/agent/settings.json`) so queue wait behind a long prefill does
 not trip pi's HTTP idle timeout:
