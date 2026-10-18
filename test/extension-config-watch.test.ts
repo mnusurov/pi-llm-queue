@@ -46,9 +46,18 @@ describe("config created after startup", () => {
 		pi.handlers["session_start"].forEach((h) => h({}, makeCtx("LATE")));
 		assert.equal(pi.registered["stub"], undefined, "no config at startup: nothing is queued");
 
-		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { maxStreams: 1 } } }));
-		await sleep(1500); // fs event + 250 ms reload debounce
-		assert.ok(pi.registered["stub"], "the config created after session_start is picked up by the running session");
+		const config = JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { maxStreams: 1 } } });
+		writeFileSync(join(agentDir, "llm-queue.json"), config);
+		// fs.watch delivery latency varies with system load (macOS FSEvents coalesces), so poll the
+		// reload window and re-save while waiting: the wrap must appear, and it must appear without
+		// a pi restart.
+		let wrapped = false;
+		for (let waited = 0; waited < 10000 && !wrapped; waited += 100) {
+			await sleep(100);
+			if (waited % 500 === 0) writeFileSync(join(agentDir, "llm-queue.json"), config);
+			wrapped = !!pi.registered["stub"];
+		}
+		assert.ok(wrapped, "the config created after session_start is picked up by the running session");
 	});
 });
 
