@@ -56,6 +56,15 @@ const start = (pi: ReturnType<typeof makePi>, sessionId: string, signal?: AbortS
 
 const firstEvent = (stream: AsyncIterable<any>) => (async () => { for await (const e of stream) return e; })();
 
+// The single queue the stub provider maps to, straight from the daemon.
+const queueStatus = async () => {
+	const raw = await connectClient(socketPath);
+	raw.send({ op: "status" });
+	const s = await raw.next(2000);
+	raw.close();
+	return s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
+};
+
 describe("provider wrapper (queuedStream)", () => {
 	let daemon: ChildProcess;
 
@@ -123,13 +132,7 @@ describe("provider wrapper (queuedStream)", () => {
 		const startedB = pi.handlers["agent_start"][0]({}, ctxB); // B queues behind A
 		await sleep(200);
 
-		const raw = await connectClient(socketPath);
-		const statusOf = async () => {
-			raw.send({ op: "status" });
-			const s = await raw.next(2000);
-			return s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
-		};
-		let q = await statusOf();
+		let q = await queueStatus();
 		assert.deepEqual(q.holders, ["ONE-A"], "A holds the slot");
 		assert.deepEqual(
 			q.waiting.map((w: any) => w.sessionKey),
@@ -145,12 +148,50 @@ describe("provider wrapper (queuedStream)", () => {
 			"A's held request streams immediately",
 		);
 
-		q = await statusOf();
+		q = await queueStatus();
 		assert.deepEqual(q.holders, ["ONE-A"], "B did not evict A");
 
 		pi.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn
 		await startedB;
-		raw.close();
+		pi.handlers["session_shutdown"][0]({}, ctxB);
+	});
+
+	it("joins the run's in-flight acquire instead of double-queuing the session (#55)", async () => {
+		// pi does not await agent_start, so a run's first request can land before the grant. It must
+		// join the run's acquire; queueing again releases the slot after every stream (KV re-prefill).
+		const pi = makePi();
+		extension(pi as any);
+		const ctxA = start(pi, "RACE-A");
+		const ctxB = start(pi, "RACE-B");
+
+		const startedA = pi.handlers["agent_start"][0]({}, ctxA); // in flight, not awaited
+		const eA = firstEvent(pi.registered["stub"].streamSimple(model, {} as any, { sessionId: "RACE-A" } as any));
+		const eB = firstEvent(pi.registered["stub"].streamSimple(model, {} as any, { sessionId: "RACE-B" } as any));
+		await startedA;
+
+		let q = await queueStatus();
+		assert.deepEqual(q.holders, ["RACE-A"], "A holds the slot");
+		assert.deepEqual(
+			q.waiting.map((w: any) => w.sessionKey),
+			["RACE-B"],
+			"only B queues: A did not enqueue a second time",
+		);
+
+		await eA; // A's request ran under the run's own lease
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(400).then(() => "blocked")]),
+			"blocked",
+			"B stays blocked while A's run holds the slot",
+		);
+		q = await queueStatus();
+		assert.deepEqual(q.holders, ["RACE-A"], "A's stream did not release the run's slot");
+
+		pi.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(3000).then(() => "blocked")]),
+			"done",
+			"B proceeds once the run releases",
+		);
 		pi.handlers["session_shutdown"][0]({}, ctxB);
 	});
 
@@ -266,22 +307,61 @@ describe("provider wrapper (queuedStream)", () => {
 		await a.handlers["agent_start"][0]({}, ctxA);
 		await a.handlers["agent_settled"][0]({}, ctxA); // 3 s grace: a wake chain keeps the slot
 
-		// Keep the run active (a beat every 250 ms) so only the grace window can free the slot.
 		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any));
-		for (let i = 0; i < 10; i++) {
-			await firstEvent(a.registered["stub"].streamSimple(model, {} as any));
-			await sleep(250);
-		}
 		assert.equal(
 			await Promise.race([eB.then(() => "done"), sleep(300).then(() => "blocked")]),
 			"blocked",
 			"the grace window keeps the slot after the run settles",
 		);
+
+		// A parent woken by its child starts a new run inside the grace: the slot is kept.
+		await a.handlers["agent_start"][0]({}, ctxA);
 		assert.equal(
-			await Promise.race([eB.then(() => "done"), sleep(2000).then(() => "blocked")]),
+			await Promise.race([eB.then(() => "done"), sleep(500).then(() => "blocked")]),
+			"blocked",
+			"a run starting inside the grace keeps the slot",
+		);
+
+		// The woken run settles with no further activity: the slot frees once the grace expires.
+		await a.handlers["agent_settled"][0]({}, ctxA);
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(4000).then(() => "blocked")]),
 			"done",
 			"the slot is released once the grace window expires",
 		);
+		a.handlers["session_shutdown"][0]({}, ctxA);
+	});
+
+	it("keeps the slot when a request lands inside the settle grace window (#55)", async () => {
+		const a = makePi();
+		const b = makePi();
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "GRACE2");
+		start(b, "GRACE2-B");
+		await a.handlers["agent_start"][0]({}, ctxA);
+		await a.handlers["agent_settled"][0]({}, ctxA); // 3 s grace armed
+
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any));
+		await sleep(2000); // still inside the grace
+
+		// A lone request (compaction/classifier) arrives in the grace: it must not have its slot
+		// released mid-stream; the release is re-armed for the quiet period that follows (defect 3).
+		await firstEvent(a.registered["stub"].streamSimple(model, {} as any, { sessionId: "GRACE2" } as any));
+		await sleep(1500); // past the original deadline (~3 s from settle)
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(300).then(() => "blocked")]),
+			"blocked",
+			"the in-grace request kept the slot past the original grace deadline",
+		);
+
+		// No further activity: the re-armed grace releases the slot once the session goes quiet.
+		assert.equal(
+			await Promise.race([eB.then(() => "done"), sleep(4000).then(() => "blocked")]),
+			"done",
+			"the re-armed grace releases the slot once the session goes quiet",
+		);
+		a.handlers["session_shutdown"][0]({}, ctxA);
 	});
 
 	it("releases the held slot immediately on abort", async () => {
