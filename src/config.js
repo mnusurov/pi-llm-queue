@@ -22,9 +22,6 @@ const FIELDS = {
 	// Floor: the client heartbeats at max(250, leaseTtlMs/3), and the sweep runs every second.
 	// A shorter TTL means a heartbeating session loses its slot to a waiter over and over.
 	leaseTtlMs: { kind: "posNum", min: 1000 },
-	idleQuantumMs: { kind: "nonNegNum" },
-	monopolyRequests: { kind: "posInt" },
-	monopolyMs: { kind: "nonNegNum" },
 	agingAfterSlots: { kind: "nonNegInt" },
 	agingAfterMs: { kind: "nonNegNum" },
 	enabled: { kind: "bool", queuesOnly: true },

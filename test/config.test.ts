@@ -14,9 +14,6 @@ describe("config schema validation", () => {
 					maxStreams: 1,
 					policy: "priority-aging",
 					leaseTtlMs: 30000,
-					idleQuantumMs: 120000,
-					monopolyRequests: 12,
-					monopolyMs: 180000,
 					agingAfterSlots: 3,
 					agingAfterMs: 60000,
 					failOpen: true,
@@ -82,6 +79,17 @@ describe("config schema validation", () => {
 		assert.equal(errors.length, 2);
 		assert.match(errors[0], /^defaults\.maxstream is an unknown field \(known: .*maxStreams.*policy.*\)$/);
 		assert.match(errors[1], /^queues\.zen\.matchez is an unknown field \(known: .*match.*\)$/);
+	});
+
+	// #49 removed the session-switch quanta outright: a config carrying them is rejected and
+	// the daemon serves defaults, so no preemption can be re-enabled from config.
+	it("rejects the removed session-switch quanta as unknown fields", () => {
+		assert.deepEqual(validateConfig({ defaults: { idleQuantumMs: 120000, monopolyRequests: 12, monopolyMs: 180000 } }), [
+			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+		]);
+		assert.match(validateConfig({ queues: { zen: { idleQuantumMs: 1 } } })[0], /^queues\.zen\.idleQuantumMs is an unknown field/);
 	});
 
 	it("flags defaults-only fields set per queue", () => {

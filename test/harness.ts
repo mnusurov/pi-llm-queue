@@ -31,12 +31,12 @@ export function closeAllClients(): void {
 	sockets.length = 0;
 }
 
-export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown, modelsJsonPath?: string): Daemon {
+export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown, modelsJsonPath?: string, sweepMs?: number): Daemon {
 	const dir = mkdtempSync(join(tmpdir(), "llm-queue-"));
 	const socketPath = join(dir, "queue.sock");
 	const configPath = join(dir, "config.json");
 	writeFileSync(configPath, JSON.stringify(config));
-	const args = [DAEMON, "--socket", socketPath, "--config", configPath];
+	const args = [DAEMON, "--socket", socketPath, "--config", configPath, ...(sweepMs ? ["--sweep-ms", String(sweepMs)] : [])];
 	if (modelsJsonPath) {
 		// A catalog path the daemon must survive not having (models.json is optional for pi).
 		args.push("--models-json", modelsJsonPath);

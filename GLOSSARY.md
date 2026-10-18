@@ -30,7 +30,8 @@ _Avoid_: approval, assign
 
 **Switch**:
 One handover of a slot from one session to another — the event that re-prefills the KV cache.
-_Avoid_: preemption (use for the cause), context switch
+Made only by a voluntary release, an abort, a disconnect, or a dead client's TTL (ADR 0002).
+_Avoid_: preemption, context switch
 
 **Passthrough**:
 A request streaming to the endpoint without holding a slot: queue disabled, fail-open, or a
@@ -45,8 +46,8 @@ daemon when it stops being refreshed.
 _Avoid_: lock, ticket
 
 **Beat**:
-A client's report of one model request against a lease — starts the request, ends it with a
-`done`, and is the daemon's only view of stream activity.
+A keyed lease refresh: the holder's report that it is using the slot. The daemon's only view of
+stream activity, and its reply is the authoritative grant state.
 _Avoid_: ping, signal
 
 **Heartbeat**:
@@ -54,8 +55,8 @@ A keyless lease refresh that keeps a live session's leases alive without countin
 _Avoid_: keepalive, ping
 
 **In-flight**:
-The count of requests a lease has started and not yet reported as `done`; a lease with
-in-flight above zero is never switched away by a quantum.
+A request whose stream is running on the slot. The daemon cannot see the stream and tracks nothing
+for it: a live holder is never switched away, so an in-flight request is safe by that rule.
 _Avoid_: busy, active
 
 **TTL**:
@@ -75,23 +76,14 @@ Anti-starvation: the longest-waiting child jumps the tier order once it has wait
 or enough parents have been granted in a row.
 _Avoid_: starvation boost, promotion
 
-**Quantum**:
-The per-holder budget after which an idle slot is offered to a waiter: an idle quantum of
-silence, a request count, and an elapsed monopoly time.
-_Avoid_: quota, limit
-
-**Monopoly**:
-The quantum pair (request count / elapsed time) that ends a holder's unbroken run on the slot.
-_Avoid_: fairness window
-
 **Grace**:
 The short window after a run settles during which a new run by the same session keeps the slot
 without a switch.
 _Avoid_: cooldown, buffer
 
 **Sweep**:
-The daemon's once-a-second pass that evicts expired or quantum-exhausted leases, and only when
-someone is waiting.
+The daemon's once-a-second pass that evicts leases whose TTL has lapsed, whether or not anyone is
+waiting, so `/queue` never reports a ghost holder.
 _Avoid_: GC, reaper
 
 ### Roles and config

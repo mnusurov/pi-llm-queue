@@ -11,7 +11,7 @@ JSON. Every message is one JSON object on a single line.
 | `release` | `queueKey`*, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`*, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`) |
-| `renew`   | — (heartbeat) or `queueKey`*, `sessionKey` (activity beat), `done` (stream completed) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
+| `renew`   | — (heartbeat) or `queueKey`*, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,switches,holders,waiting}]}` |
 
 \* `acquire`, `release` and `cancel` require `queueKey`: a keyless one would create an unnamed
@@ -37,48 +37,35 @@ keeps its leases alive with a bare `renew` heartbeat (the extension sends one ev
 a session that dies without heartbeating has its lease reclaimed by the daemon and the next
 waiter is granted.
 
-The slot is held per session across a whole run. A session switch happens only on:
+The slot is held per session across a whole run, and **a live holder is never preempted**
+(ADR 0002). A session switch happens only on:
 
 - **release** — the run settled (the extension releases 3 s after `agent_settled`, so a parent
   woken by its child keeps the slot), the session shut down, the request aborted, or the socket died;
-- **idle quantum** (`idleQuantumMs`, default 120 s) — the holder sent no activity beat, i.e. made
-  no model request, for that long. Long tool executions stay covered: every request beats the lease;
-- **monopoly quantum** (`monopolyRequests` requests / `monopolyMs` seconds, default 12 / 180 s) —
-  a session with no request in flight is preempted so a waiting session gets its turn; the count
-  resets on the next grant.
+- **TTL expiry** — the client stopped heartbeating, i.e. it died: a session killed mid-stream, a
+  process that vanished, a heartbeat starved by a tool that blocks the event loop.
 
-Quanta are checked once a second and only evict when someone is waiting: an idle slot nobody
-wants is not worth a context switch. A keyed `renew` (activity beat) refreshes the TTL, restarts
-the idle quantum, counts one request toward the monopoly and counts the lease **in flight**; re-
-`acquire`ing a slot the session already holds counts the same way. A beat's reply is
-authoritative: `granted: false` means the slot was switched away, and the client must re-queue
-before it streams again — a preempted run never streams unqueued. A bare `renew` (no keys)
+A keyed `renew` (activity beat) refreshes the TTL, and its reply is authoritative: `granted: false`
+means the slot is gone (released, disconnected, TTL-expired) and the client must re-queue before it
+streams again — a run that lost its slot never streams unqueued. A bare `renew` (no keys)
 heartbeats every lease of the connection.
 
-**A request in flight is never switched away.** The daemon cannot see the HTTP stream, so the
-beat is its start signal and a keyed `renew` with `done: true` is its end (the extension sends
-one when the stream finishes). The count is a counter, not a flag: concurrent same-session
-requests (a run plus a compaction) share one lease, and the first completion must not open the
-slot under the other. While the count is above zero the idle, request-count and elapsed-time
-quanta all pass the lease over — a preempted holder would keep streaming while the waiter started
-on the same endpoint, which is exactly the overlap the tool exists to prevent. The in-flight
-grace is the TTL: a live client heartbeats, so an in-flight lease survives as long as its stream
-does; a client killed mid-stream stops heartbeating and the TTL reclaims the slot for the next
-waiter. A `done` beat refreshes the TTL and decrements the count without counting a new request.
+The daemon sweeps every `--sweep-ms` (default 1000 ms) and evicts every lease whose TTL lapsed,
+whether or not anyone is waiting: an expired lease is a dead client, and `/queue` must never report
+it as a holder.
 
-shortcut: a tool execution longer than `idleQuantumMs` (default 120 s) with a session waiting
-will lose the slot mid-run; raise `idleQuantumMs` for that queue if your tools run longer.
+shortcut: a child that stalls while holding the slot keeps it until it is stopped, its socket
+closes, or its TTL lapses (a dead client) — the queue never takes the slot back. That is the
+"hold for the whole run" contract; `queueTimeoutMs` remains the parent-side escape hatch.
 
-shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its in-flight lease never
-expires and a waiter waits for the whole stream. That is the serialisation promise, not a bug —
-raise `httpIdleTimeoutMs` (recommended 900000) so the waiter's client stays patient, and cap
-long generations per queue with `monopolyRequests` / `monopolyMs` once the stream ends.
+shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its lease never expires and a
+waiter waits for the whole stream. That is the serialisation promise, not a bug — raise
+`httpIdleTimeoutMs` (recommended 900000) so the waiter's client stays patient.
 
-The daemon counts every **session switch** — every grant of a queued waiter, whether the slot was
-released by its holder or evicted by a quantum — as the event that re-prefills the KV cache, and
-reports the per-queue count as `switches` in `status`. `/queue` prints it with the slot holder and
-the per-tier queue depth; the footer indicator reads the same status (a queued `acquire` stays
-unanswered, so the client polls `status` every 2 s for its position).
+The daemon counts every **session switch** — every grant of a queued waiter — as the event that
+re-prefills the KV cache, and reports the per-queue count as `switches` in `status`. `/queue`
+prints it with the slot holder and the per-tier queue depth; the footer indicator reads the same
+status (a queued `acquire` stays unanswered, so the client polls `status` every 2 s for its position).
 
 ## Queues and config
 
@@ -87,7 +74,7 @@ unanswered, so the client polls `status` every 2 s for its position).
 
 ```json
 {
-  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "idleQuantumMs": 120000, "monopolyRequests": 12, "monopolyMs": 180000, "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 60000 },
+  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 60000 },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
     "zen": { "maxStreams": 3, "policy": "fifo" },
@@ -107,9 +94,8 @@ queues its requests under the model's baseUrl — or under its group's name, whe
 The group/entry resolution rule is one implementation (`groupKeyFor`, `queueEntryFor` in
 `src/config.js`) shared by the extension and the daemon.
 
-Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `idleQuantumMs`,
-`monopolyRequests`,
-`monopolyMs`, `agingAfterSlots`, `agingAfterMs`, `blockSubagentLaunch` (all also valid in
+Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAfterSlots`,
+`agingAfterMs`, `blockSubagentLaunch` (all also valid in
 `defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
 `failOpen` (default `true`) and `queueTimeoutMs`
 are client-side (`defaults` only); `daemonIdleExitMs` (default `60000`) is daemon-side
@@ -161,9 +147,9 @@ read once at connect and are the fields that need a pi restart.
 - Turn-based affinity: the extension acquires at `agent_start` and releases after the run
   settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
   a held slot at once and cancels a still-queued request. Requests outside a run (compaction,
-  classifier, nested calls) queue for themselves. Every request the run makes beats its lease,
-  so the slot survives tool executions, and reports completion (`done`) when its stream ends, so
-  the next waiter gets its turn; the client heartbeats `renew` on a timer so a live session never
+  classifier, nested calls) queue for themselves. Every request the run makes beats its lease, so
+  the slot survives tool executions and a beat answered `granted: false` re-queues the run; the
+  client heartbeats `renew` on a timer so a live session never
   loses the slot to the TTL.
 - Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
   `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,

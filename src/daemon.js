@@ -14,6 +14,8 @@ const arg = (name) => {
 const socketPath = arg("--socket");
 const configPath = arg("--config");
 const modelsJsonPath = arg("--models-json");
+// Sweep interval: 1 s in production, a short tick in tests so a TTL-bound test costs milliseconds.
+const sweepMs = Number(arg("--sweep-ms") ?? 1000);
 if (!socketPath) {
 	console.error("usage: daemon.js --socket <path> [--config <path>] [--models-json <path>]");
 	process.exit(1);
@@ -79,13 +81,10 @@ function groupFor(key) {
 function applyPolicy(queue, policy) {
 	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
 	queue.maxStreams = policy.enabled === false ? Infinity : pick("maxStreams", 1);
-	// Session-switch knobs: a lease dies without heartbeats; a holder yields to a waiter when
-	// it goes idle, or when its monopoly quantum (N requests / M s) runs out. "fifo" opts a
+	// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49), so the
+	// slot moves on voluntary release, abort, disconnect, or TTL expiry alone. "fifo" opts a
 	// queue out of parent/child tiering and aging (external multi-slot queues).
 	queue.ttlMs = pick("leaseTtlMs", 30000);
-	queue.idleMs = pick("idleQuantumMs", 120000);
-	queue.monopolyRequests = pick("monopolyRequests", 12);
-	queue.monopolyMs = pick("monopolyMs", 180000);
 	// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after
 	// this many consecutive parent grants, or after waiting this long.
 	queue.agingAfterSlots = pick("agingAfterSlots", 3);
@@ -104,33 +103,14 @@ function queueFor(key) {
 	return queues.get(queueKey);
 }
 
-// A lease is the holder's record: TTL deadline, last model request, grant time, request count.
-// The same object lives in conn.leases, so a client heartbeat refreshes it in place.
+// A lease is the holder's record: its TTL deadline. The same object lives in conn.leases, so a
+// client heartbeat refreshes it in place.
 function newLease(queue, sessionKey, conn) {
-	const now = Date.now();
-	return { queueKey: queue.queueKey, sessionKey, conn, expires: now + queue.ttlMs, activeAt: now, grantedAt: now, requests: 0, inFlight: 0 };
+	return { queueKey: queue.queueKey, sessionKey, conn, expires: Date.now() + queue.ttlMs };
 }
 
 function leaseOf(queue, sessionKey) {
 	return queue.holders.find((l) => l.sessionKey === sessionKey);
-}
-
-// A model request by the holder: restarts its idle quantum and counts toward its monopoly.
-// The daemon cannot see the HTTP stream, so a beat is the request-start signal and a `done` beat
-// is its end. The count is a counter, not a flag: concurrent same-session requests (a run plus a
-// compaction) share one lease, and the first completion must not open the slot under the other.
-// `done` is a completion report, not a request: it refreshes the TTL and decrements the count
-// without counting toward the monopoly.
-function beat(lease, queue, done) {
-	const now = Date.now();
-	lease.expires = now + queue.ttlMs;
-	if (done) {
-		lease.inFlight = Math.max(0, lease.inFlight - 1);
-		return;
-	}
-	lease.activeAt = now;
-	lease.requests++;
-	lease.inFlight++;
 }
 
 // Pick the next waiter: an aged child (longest-waiting) jumps the queue; otherwise the
@@ -177,25 +157,16 @@ function release(queue, sessionKey) {
 	grantNext(queue);
 }
 
-// Evict holders whose lease expired (crashed session) or whose switch quantum ran out,
-// and only when someone is waiting: an unmonopolised idle slot costs nobody anything.
-// A request in flight is never switched away on the quanta — that is the serialisation promise:
-// the stream would keep running while the waiter started on the same endpoint. Its grace is the
-// TTL: a live client heartbeats, so an in-flight lease survives; a client that died mid-stream
-// stops heartbeating and the TTL reclaims the slot.
+// Evict holders whose lease expired: a crashed session stops heartbeating and loses its slot.
+// A live holder is never preempted (#49) — every switch re-prefills the KV cache, and a
+// child-to-child preemption benefits nobody. The sweep is unconditional so `/queue` never
+// reports a ghost holder, whether or not anyone is waiting.
 function sweep() {
 	const now = Date.now();
-	for (const queue of queues.values()) {
-		if (!queue.waiting.length) continue;
-		for (const lease of [...queue.holders]) {
-			const evict =
-				now > lease.expires ||
-				(!lease.inFlight && (now - lease.activeAt > queue.idleMs || lease.requests >= queue.monopolyRequests || now - lease.grantedAt > queue.monopolyMs));
-			if (evict) release(queue, lease.sessionKey);
-		}
-	}
+	for (const queue of queues.values())
+		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey);
 }
-setInterval(sweep, 1000).unref();
+setInterval(sweep, sweepMs).unref();
 
 function handle(msg, conn) {
 	// A keyless acquire would create an unnamed queue that silently holds a slot.
@@ -212,7 +183,7 @@ function handle(msg, conn) {
 			const queue = queueFor(msg.queueKey);
 			const held = leaseOf(queue, msg.sessionKey);
 			if (held) {
-				beat(held, queue); // re-acquiring a held slot is a model request
+				held.expires = Date.now() + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
@@ -249,15 +220,15 @@ function handle(msg, conn) {
 			return;
 		}
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
-		// Keyed renew: an activity beat — the holder is using the slot, its switch quanta
-		// restart. The reply is authoritative: granted:false tells the client the slot was
-		// switched away (idle/monopoly quantum) and it must re-queue before it streams.
+		// Keyed renew: an activity beat — the holder is using the slot, so its TTL refreshes. The
+		// reply is authoritative: granted:false tells the client the slot is gone (TTL expiry, a
+		// release, a disconnect) and it must re-queue before it streams.
 		case "renew": {
 			if (msg.sessionKey && msg.queueKey) {
 				const queue = queueFor(msg.queueKey);
 				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
 				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
-				if (granted) beat(lease, queue, msg.done === true);
+				if (granted) lease.expires = Date.now() + queue.ttlMs;
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}

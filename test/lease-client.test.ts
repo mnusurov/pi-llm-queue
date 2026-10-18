@@ -144,7 +144,7 @@ describe("lease client", () => {
 	});
 
 	it("heartbeats keep a held lease alive past its TTL", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 1000 }, queues: {} });
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 1000 }, queues: {} }, undefined, undefined, 50);
 		await waitForDaemon(d.socketPath);
 		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: 100 });
 		const b = new LeaseClient({ socketPath: d.socketPath });
@@ -153,7 +153,7 @@ describe("lease client", () => {
 		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
 
-		await sleep(1500); // ~1.5 TTLs: A's heartbeat must keep its slot
+		await sleep(1200); // ~1.2 TTLs with 24 sweep ticks: A's heartbeat must keep its slot
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "heartbeats must keep A's lease");
 
 		a.release(QUEUE_KEY, "A");
@@ -168,7 +168,7 @@ describe("lease client", () => {
 		// The extension heartbeats at max(250, leaseTtlMs/3). At the 1000 ms floor a 1 s floor would
 		// equal the TTL, so a sweep landing between two beats would evict a healthy holder.
 		const TTL = 1000;
-		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: TTL }, queues: {} });
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: TTL }, queues: {} }, undefined, undefined, 50);
 		await waitForDaemon(d.socketPath);
 		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: Math.max(250, Math.floor(TTL / 3)) });
 		const b = new LeaseClient({ socketPath: d.socketPath });
@@ -177,7 +177,7 @@ describe("lease client", () => {
 		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
 
-		await sleep(4000); // ~4 TTLs at the floor, with the sweep running every second
+		await sleep(1400); // ~4 TTLs at the floor, with the sweep ticking every 50 ms
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "the heartbeat stays under the TTL: the holder keeps its slot");
 
 		a.release(QUEUE_KEY, "A");

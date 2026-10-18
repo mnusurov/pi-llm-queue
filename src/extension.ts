@@ -234,8 +234,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				// Requests outside a run (compaction, classifier, nested calls) queue for themselves
 				// and release when done. A held request beats its lease: the run keeps the slot
-				// across tool executions. A beat answered ungranted means the daemon switched the
-				// slot away (idle/monopoly quantum) — the run re-queues before it streams again.
+				// across tool executions. A beat answered ungranted means the daemon no longer grants
+				// the slot (TTL expiry, a release, a disconnect) — the run re-queues before it streams again.
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
@@ -277,9 +277,6 @@ export default function (pi: ExtensionAPI) {
 				out.end();
 			} finally {
 				if (selfQueued) lease.release(queueKey, sessionKey);
-				// The stream is over: report completion so the daemon can switch the slot again. Without
-				// this the lease stays in-flight until its TTL reclaims it, and a waiter never gets its turn.
-				else if (heldQueueKey === queueKey) lease.beat(queueKey, sessionKey, true).catch(() => {});
 			}
 		})();
 		return out;
