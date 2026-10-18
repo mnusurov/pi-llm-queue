@@ -151,70 +151,87 @@ export default function (pi: ExtensionAPI) {
 	const roleOverride = new Map<string, Role>();
 	const currentRole = (sessionKey: string): Role => roleOverride.get(sessionKey) ?? envRole;
 
-	interface SessionState {
-		heldQueueKey: string | null;
-		releaseTimer: ReturnType<typeof setTimeout> | null;
-		// Footer indicator while this session waits for a slot: queue position + elapsed wait,
-		// refreshed every second, cleared in sync with the grant.
-		ui: ExtensionContext["ui"] | null;
-		queuedInfo: { position: number; holders: string[]; startedAt: number } | null;
-		indicatorTimer: ReturnType<typeof setInterval> | null;
+	/** What a waiting session shows in the footer: its queue position and the holders ahead of it. */
+	interface QueueWait {
+		position: number;
+		holders: string[];
 	}
+
 	// A pi process runs several sessions (a parent and its subagent children); a lease is per
-	// session, so the held key, release timer and footer indicator must be per session too.
+	// session, so the held key, release timer and footer indicator all live on one SessionState.
+	class SessionState {
+		readonly sessionKey: string;
+		heldQueueKey: string | null = null;
+		releaseTimer: ReturnType<typeof setTimeout> | null = null;
+		ui: ExtensionContext["ui"] | null = null;
+		queuedInfo: (QueueWait & { startedAt: number }) | null = null;
+		indicatorTimer: ReturnType<typeof setInterval> | null = null;
+
+		constructor(sessionKey: string) {
+			this.sessionKey = sessionKey;
+		}
+
+		/** Footer indicator while this session waits for a slot: position, elapsed wait, who holds. */
+		render() {
+			this.ui?.setStatus(
+				"llm-queue",
+				this.queuedInfo
+					? `llm-queue #${this.queuedInfo.position} · ${Math.round((Date.now() - this.queuedInfo.startedAt) / 1000)}s · behind ${this.queuedInfo.holders.join(", ") || "?"}`
+					: undefined,
+			);
+		}
+
+		showQueued(info: QueueWait) {
+			this.queuedInfo = { ...info, startedAt: this.queuedInfo?.startedAt ?? Date.now() };
+			this.indicatorTimer ??= setInterval(() => this.render(), 1000);
+			this.indicatorTimer.unref();
+			this.render();
+		}
+
+		clearQueued() {
+			if (this.indicatorTimer) {
+				clearInterval(this.indicatorTimer);
+				this.indicatorTimer = null;
+			}
+			if (this.queuedInfo) {
+				this.queuedInfo = null;
+				this.render();
+			}
+		}
+
+		/** Cancel a pending grace-window release: a run starting inside it keeps the slot. */
+		cancelPendingRelease() {
+			if (this.releaseTimer) {
+				clearTimeout(this.releaseTimer);
+				this.releaseTimer = null;
+			}
+		}
+
+		release() {
+			this.cancelPendingRelease();
+			if (this.heldQueueKey) lease.release(this.heldQueueKey, this.sessionKey);
+			this.heldQueueKey = null;
+		}
+	}
+
 	const sessions = new Map<string, SessionState>();
 	const ensureState = (key: string): SessionState => {
 		let state = sessions.get(key);
-		if (!state) sessions.set(key, (state = { heldQueueKey: null, releaseTimer: null, ui: null, queuedInfo: null, indicatorTimer: null }));
+		if (!state) sessions.set(key, (state = new SessionState(key)));
 		return state;
 	};
 	// Requests without options.sessionId (direct/non-agent calls) fall back to the newest session.
 	let newestSessionKey = "";
 
-	const renderIndicator = (key: string) => {
-		const state = ensureState(key);
-		state.ui?.setStatus(
-			"llm-queue",
-			state.queuedInfo
-				? `llm-queue #${state.queuedInfo.position} · ${Math.round((Date.now() - state.queuedInfo.startedAt) / 1000)}s · behind ${state.queuedInfo.holders.join(", ") || "?"}`
-				: undefined,
-		);
-	};
-
-	const showQueued = (key: string, info: { position: number; holders: string[] }) => {
-		const state = ensureState(key);
-		state.queuedInfo = { ...info, startedAt: state.queuedInfo?.startedAt ?? Date.now() };
-		state.indicatorTimer ??= setInterval(() => renderIndicator(key), 1000);
-		state.indicatorTimer.unref();
-		renderIndicator(key);
-	};
-
-	const clearQueued = (key: string) => {
-		const state = ensureState(key);
-		if (state.indicatorTimer) {
-			clearInterval(state.indicatorTimer);
-			state.indicatorTimer = null;
-		}
-		if (state.queuedInfo) {
-			state.queuedInfo = null;
-			renderIndicator(key);
-		}
-	};
+	// Every session acquires the same way: show the footer while waiting, warn once the parent
+	// wait passes queueTimeoutMs (the request stays queued).
+	const acquireFor = (state: SessionState, queueKey: string, signal?: AbortSignal) =>
+		lease.acquire(queueKey, state.sessionKey, currentRole(state.sessionKey), group, signal, (info) => state.showQueued(info), () => state.ui?.notify(TIMEOUT_WARNING, "warning"));
 
 	let providers: string[] = [];
 	// Only what we registered: unregistering a native-owned provider would drop the built-in.
 	let registeredProviders = new Set<string>();
 	let registered = false;
-
-	const releaseSlot = (sessionKey: string) => {
-		const state = ensureState(sessionKey);
-		if (state.releaseTimer) {
-			clearTimeout(state.releaseTimer);
-			state.releaseTimer = null;
-		}
-		if (state.heldQueueKey) lease.release(state.heldQueueKey, sessionKey);
-		state.heldQueueKey = null;
-	};
 
 	const queuedStream = (
 		model: Model<Api>,
@@ -238,8 +255,8 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					const reason = await lease.acquire(queueKey, sessionKey, currentRole(sessionKey), group, options?.signal, (info) => showQueued(sessionKey, info), () => state.ui?.notify(TIMEOUT_WARNING, "warning"));
-					clearQueued(sessionKey);
+					const reason = await acquireFor(state, queueKey, options?.signal);
+					state.clearQueued();
 					if (reason === "granted") {
 						if (wasHeld) state.heldQueueKey = queueKey; // the run re-took its slot
 						else selfQueued = true;
@@ -431,32 +448,28 @@ export default function (pi: ExtensionAPI) {
 		const sessionKey = ctx.sessionManager.getSessionId();
 		newestSessionKey = sessionKey;
 		const state = ensureState(sessionKey);
-		if (state.releaseTimer) {
-			clearTimeout(state.releaseTimer); // a run starting inside the grace window keeps the slot
-			state.releaseTimer = null;
-		}
+		state.cancelPendingRelease(); // a run starting inside the grace window keeps the slot
 		const model = ctx.model;
 		if (!model || !providers.includes(model.provider)) return;
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
-		ctx.signal?.addEventListener("abort", () => releaseSlot(sessionKey), { once: true });
+		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
 		const queueKey = resolveQueueKey(queues, model, modelsJson);
-		const reason = await lease.acquire(queueKey, sessionKey, currentRole(sessionKey), group, ctx.signal, (info) => showQueued(sessionKey, info), () => ctx.ui.notify(TIMEOUT_WARNING, "warning"));
-		clearQueued(sessionKey);
+		const reason = await acquireFor(state, queueKey, ctx.signal);
+		state.clearQueued();
 		// Only a grant claims a lease: an abort/fail-open must not mark the slot held.
 		if (reason === "granted") state.heldQueueKey = queueKey;
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
-		const sessionKey = ctx.sessionManager.getSessionId();
-		const state = ensureState(sessionKey);
-		state.releaseTimer = setTimeout(() => releaseSlot(sessionKey), GRACE_MS);
+		const state = ensureState(ctx.sessionManager.getSessionId());
+		state.releaseTimer = setTimeout(() => state.release(), GRACE_MS);
 		state.releaseTimer.unref();
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		const sessionKey = ctx.sessionManager.getSessionId();
-		releaseSlot(sessionKey);
-		clearQueued(sessionKey); // a shutdown while queued must not leave the indicator up
-		sessions.delete(sessionKey);
+		const state = ensureState(ctx.sessionManager.getSessionId());
+		state.release();
+		state.clearQueued(); // a shutdown while queued must not leave the indicator up
+		sessions.delete(state.sessionKey);
 	});
 }
