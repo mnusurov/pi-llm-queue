@@ -35,8 +35,7 @@ idle yield (ADR 0002 + ADR 0003).
 _Avoid_: preemption, context switch
 
 **Passthrough**:
-A request streaming to the endpoint without holding a slot: queue disabled, fail-open, or a
-parent whose queue wait timed out.
+A request streaming to the endpoint without holding a slot: queue disabled, or fail-open.
 _Avoid_: bypass, fallback
 
 **Yield**:
@@ -97,7 +96,7 @@ _Avoid_: GC, reaper
 ### Roles and config
 
 **Parent**:
-An interactive pi session; queues with a bounded queue wait and a tier above children.
+An interactive pi session; queues with a warn-only queue wait and a tier above children.
 _Avoid_: interactive session, main session
 
 **Child**:

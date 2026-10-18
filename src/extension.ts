@@ -231,7 +231,7 @@ export default function (pi: ExtensionAPI) {
 				// In-flight keyed beat: while streaming, send a keyed beat every heartbeatMs so the
 				// daemon sees activity and never idle-yields the slot. Between streams (tool exec,
 				// blocked subagent) no keyed beats — the daemon idle-yields the holder when waiters exist.
-				const activityBeat = heldQueueKey === queueKey
+				const activityBeat = (heldQueueKey === queueKey || selfQueued)
 					? setInterval(() => lease.beat(queueKey, sessionKey), heartbeatMs)
 					: null;
 				activityBeat?.unref();
