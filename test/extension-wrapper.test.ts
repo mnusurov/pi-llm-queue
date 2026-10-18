@@ -14,7 +14,7 @@ const STUB_API = "stub-queue-api";
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-ext-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleQuantumMs: 600 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
@@ -133,10 +133,10 @@ describe("provider wrapper (queuedStream)", () => {
 		assert.match(shown, /#1/, "the indicator reports the queue position");
 		assert.match(shown, /\d+s/, "the indicator reports the elapsed wait");
 		assert.match(shown, /IND-A/, "the indicator names the slot holder");
+		a.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn (a live holder is never preempted)
 		assert.equal(await Promise.race([eB.then(() => "done"), sleep(4000).then(() => "blocked")]), "done");
 		assert.equal(status[status.length - 1][1], undefined, "the indicator clears in sync with the grant");
 
-		a.handlers["session_shutdown"][0]({}, ctxA);
 		b.handlers["session_shutdown"][0]({}, ctxB);
 	});
 
@@ -201,7 +201,7 @@ describe("provider wrapper (queuedStream)", () => {
 		const sB = b.registered["stub"].streamSimple(model, {} as any); // queued behind A
 		const eB = firstEvent(sB);
 
-		// A keeps requesting (each request beats the lease) for ~2 idle quanta: B must not steal the slot.
+		// A keeps requesting for ~1.2 s while B waits: a live holder is never preempted (#49).
 		for (let i = 0; i < 8; i++) {
 			await firstEvent(stream(model, {} as any));
 			await sleep(150);
@@ -263,7 +263,7 @@ describe("provider wrapper (queuedStream)", () => {
 		);
 	});
 
-	it("re-queues when the daemon switches the slot away mid-run (quantum preemption)", async () => {
+	it("re-queues when the slot is gone mid-run instead of streaming unqueued", async () => {
 		const a = makePi();
 		extension(a as any);
 		const ctxA = start(a, "EVICTED");
@@ -271,7 +271,12 @@ describe("provider wrapper (queuedStream)", () => {
 		const raw = await connectClient(socketPath);
 		raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "RAW", role: "parent" }); // queued behind it
 
-		await sleep(2500); // idle quantum (600 ms) + sweep: the holder is evicted, RAW is granted
+		// The lease is gone (TTL expiry of a starved heartbeat, a disconnect release: the daemon
+		// answers a beat ungranted). Here a release on its sessionKey takes the slot for RAW.
+		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "EVICTED" });
+		assert.deepEqual(await raw.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "RAW" }, "the freed slot goes to the waiter");
+		assert.deepEqual(await raw.next(3000), { op: "ok" });
+
 		const stream = a.registered["stub"].streamSimple;
 		const eA = firstEvent(stream(model, {} as any)); // its beat comes back ungranted: must re-queue
 		for (let i = 0; i < 5; i++) {
@@ -281,14 +286,14 @@ describe("provider wrapper (queuedStream)", () => {
 		assert.equal(
 			await Promise.race([eA.then(() => "done"), sleep(700).then(() => "blocked")]),
 			"blocked",
-			"a preempted run re-queues behind the new holder instead of streaming unqueued",
+			"a run that lost its slot re-queues behind the new holder instead of streaming unqueued",
 		);
 
 		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "RAW" });
 		assert.equal(
 			await Promise.race([eA.then(() => "done"), sleep(3000).then(() => "blocked")]),
 			"done",
-			"the preempted run proceeds once the slot frees",
+			"the run that lost its slot proceeds once the slot frees",
 		);
 		raw.close();
 		a.handlers["session_shutdown"][0]({}, ctxA);

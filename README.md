@@ -99,8 +99,6 @@ to upgrade pi-llm-queue instead of failing silently.
 | `agingAfterSlots` | `3` | Boost a waiting child after this many consecutive parent grants. |
 | `agingAfterMs` | `60000` | Boost a waiting child after this long waiting. |
 | `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim). Minimum `1000`. |
-| `idleQuantumMs` | `120000` | A holder with no model request for this long yields to a waiter — never while a request is in flight. |
-| `monopolyRequests` / `monopolyMs` | `12` / `180000` | A holder is preempted after N requests or M seconds — never while a request is in flight. |
 | `enabled` | `true` | `false` = passthrough: provider unwrapped, fully parallel. |
 | `match` | — | Explicit resource group: baseUrls and/or provider names sharing one queue. |
 | `blockSubagentLaunch` | `maxStreams == 1` | Force `subagent` launches to `async: false` on this queue. |
@@ -145,6 +143,8 @@ Neutral, string-only — zero hard dependency on pi-subagents; any runner can de
 - Turn-based session affinity: slot held per session across a run
   (`agent_start` → `agent_settled`), lease with TTL, released on settle.
 - Priority: interactive parent > subagent child, with aging anti-starvation.
+- No preemption (ADR 0002): a live holder keeps the slot until it releases it, aborts,
+  disconnects, or its TTL lapses; a switch always re-prefills the KV cache.
 - Role detection: `PI_QUEUE_ROLE` contract, `PI_SUBAGENT_CHILD` /
   `PI_SUBAGENT_PARENT_SESSION` as optional hints, `PI_QUEUE_GROUP` grouping label;
   zero hard dependency on pi-subagents. `/queue promote|demote` overrides the tier.
@@ -167,8 +167,9 @@ once per child. `blockSubagentLaunch` defaults to `true` when `maxStreams == 1`
 The hook is a no-op when the `subagent` tool is absent (pi-subagents not installed).
 
 Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
-provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and
-the session-switch quanta (release / idle / monopoly) are implemented (#3). Priority tiers
+provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and the
+session switch on release are implemented (#3); the session-switch quanta (#3) were removed by
+#49 — see ADR 0002. Priority tiers
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
 `/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
 `enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` is

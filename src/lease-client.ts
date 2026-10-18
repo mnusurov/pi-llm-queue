@@ -249,18 +249,17 @@ export class LeaseClient {
 	}
 
 	/**
-	 * Activity beat: the holder is using the slot, so its idle/monopoly quanta restart and the
-	 * daemon marks the lease in flight (a request in flight is never switched away). `done: true`
-	 * reports the stream over: it clears the in-flight flag without counting a new request.
-	 * Resolves false when the daemon has switched the slot away — the caller must re-queue.
+	 * Activity beat: the holder is using the slot, so its TTL refreshes.
+	 * Resolves false when the daemon no longer grants the slot (TTL expiry, a release, a
+	 * disconnect) — the caller must re-queue.
 	 */
-	async beat(queueKey: string, sessionKey: string, done = false): Promise<boolean> {
+	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
 		if (!(await this.connectDaemon())) {
 			if (!this.failOpen) this.unreachable();
 			return true; // fail-open: stream unqueued
 		}
 		this.refSocket(); // the reply must keep the process/worker alive while we await it
-		this.send({ op: "renew", queueKey, sessionKey, done });
+		this.send({ op: "renew", queueKey, sessionKey });
 		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
 		this.unrefSocket();
 		if (msg.op === "fail-open" && !this.failOpen) this.unreachable(); // daemon died mid-beat
