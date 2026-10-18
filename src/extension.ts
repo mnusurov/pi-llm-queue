@@ -50,7 +50,7 @@ export function isLocalEndpoint(baseUrl?: string): boolean {
 		return false;
 	}
 	if (host === "localhost" || LOCAL_DOMAIN.test(host)) return true;
-	const v4 = /^(\d{1,3})\.(\d{1,3})\./.exec(host);
+	const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.\d{1,3}$/.exec(host);
 	if (v4) {
 		const [a, b] = [Number(v4[1]), Number(v4[2])];
 		return a === 127 || a === 10 || (a === 192 && b === 168) || (a === 172 && b >= 16 && b <= 31) || (a === 169 && b === 254);

@@ -113,7 +113,7 @@ describe("self-hosted endpoint detection", () => {
 		for (const url of ["http://gpu.local:8000/v1", "http://llama.lan:8000/v1", "http://server.home.arpa:8000/v1"]) assert.equal(isLocalEndpoint(url), true, url);
 	});
 	it("treats public IPs and other hostnames as cloud", () => {
-		for (const url of ["https://api.openai.com/v1", "https://8.8.8.8/v1", "https://172.15.0.1:8000/v1", "https://169.253.1.1/v1"]) assert.equal(isLocalEndpoint(url), false, url);
+		for (const url of ["https://api.openai.com/v1", "https://8.8.8.8/v1", "https://172.15.0.1:8000/v1", "https://169.253.1.1/v1", "http://10.0.0.1.nip.io:8080/v1", "http://127.0.0.1.example.com:8080/v1"]) assert.equal(isLocalEndpoint(url), false, url);
 	});
 	it("treats a missing baseUrl as cloud", () => {
 		assert.equal(isLocalEndpoint(undefined), false);
