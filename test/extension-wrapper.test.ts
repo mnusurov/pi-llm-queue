@@ -293,7 +293,7 @@ describe("provider wrapper (queuedStream)", () => {
 		assert.equal(
 			await Promise.race([eA.then(() => "done"), sleep(3000).then(() => "blocked")]),
 			"done",
-			"the preempted run proceeds once the slot frees",
+			"the run that lost its slot proceeds once the slot frees",
 		);
 		raw.close();
 		a.handlers["session_shutdown"][0]({}, ctxA);

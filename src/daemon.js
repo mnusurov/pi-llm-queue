@@ -17,7 +17,7 @@ const modelsJsonPath = arg("--models-json");
 // Sweep interval: 1 s in production, a short tick in tests so a TTL-bound test costs milliseconds.
 const sweepMs = Number(arg("--sweep-ms") ?? 1000);
 if (!socketPath) {
-	console.error("usage: daemon.js --socket <path> [--config <path>] [--models-json <path>]");
+	console.error("usage: daemon.js --socket <path> [--config <path>] [--models-json <path>] [--sweep-ms <ms>]");
 	process.exit(1);
 }
 

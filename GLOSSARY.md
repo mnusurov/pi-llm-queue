@@ -51,7 +51,7 @@ stream activity, and its reply is the authoritative grant state.
 _Avoid_: ping, signal
 
 **Heartbeat**:
-A keyless lease refresh that keeps a live session's leases alive without counting a request.
+A keyless lease refresh that keeps a live session's leases alive.
 _Avoid_: keepalive, ping
 
 **In-flight**:
@@ -82,7 +82,7 @@ without a switch.
 _Avoid_: cooldown, buffer
 
 **Sweep**:
-The daemon's once-a-second pass that evicts leases whose TTL has lapsed, whether or not anyone is
+The daemon's periodic pass (`--sweep-ms`, default 1 s) that evicts leases whose TTL has lapsed, whether or not anyone is
 waiting, so `/queue` never reports a ghost holder.
 _Avoid_: GC, reaper
 
