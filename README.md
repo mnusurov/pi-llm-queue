@@ -84,8 +84,8 @@ to upgrade pi-llm-queue instead of failing silently.
 {
   "defaults": { "maxStreams": 1, "policy": "priority-aging", "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 60000 },
   "queues": {
-    "http://192.168.1.100:8001/v1": { "maxStreams": 1, "blockSubagentLaunch": true },
-    "zen": { "maxStreams": 3, "policy": "fifo", "blockSubagentLaunch": false },
+    "http://192.168.1.100:8001/v1": { "maxStreams": 1, "idleYieldMs": 30000 },
+    "zen": { "maxStreams": 3, "policy": "fifo" },
     "free-api": { "enabled": false },
     "one-gpu": { "match": ["http://192.168.1.100:8001/v1", "http://192.168.1.100:8002/v1"] }
   }
@@ -101,9 +101,9 @@ to upgrade pi-llm-queue instead of failing silently.
 | `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim). Minimum `1000`. |
 | `enabled` | `true` | `false` = passthrough: provider unwrapped, fully parallel. |
 | `match` | — | Explicit resource group: baseUrls and/or provider names sharing one queue. |
-| `blockSubagentLaunch` | `maxStreams == 1` | Force `subagent` launches to `async: false` on this queue. |
+| `idleYieldMs` | `30000` | Idle-yield threshold: an activity-flagged holder silent this long with a waiter queued yields the slot. `0` disables. |
 | `failOpen` | `true` | Daemon unreachable → pass through. `false` → hard-error. `defaults` only. |
-| `queueTimeoutMs` | unlimited | Parent queue-wait cap → pass through with warning. Child is always unlimited. `defaults` only. |
+| `queueTimeoutMs` | unlimited | Parent queue-wait warning threshold → visible warning, stays queued. Child is always unlimited. `defaults` only. |
 | `daemonIdleExitMs` | `60000` | Daemon self-exit after the last client disconnects. `defaults` only. |
 
 ## Role contract (env vars)
@@ -128,8 +128,8 @@ Neutral, string-only — zero hard dependency on pi-subagents; any runner can de
   Real cache-warmth validation against llama.cpp is a separate human ticket (#10).
 - **Serial subagents.** This repo's own implementing sessions run on a local model: launch
   subagents sequentially and wait for each to hand back control — never fire parallel model
-  requests. On `maxStreams: 1` queues the extension enforces this (`async: true → false`);
-  batch a group as one workflow call so the parent is woken once, not per child.
+  requests. Serialisation of children is the queue's job (child tier, unbounded wait); batch a
+  group as one workflow call so the parent is woken once, not per child.
 - **Model guidance for implementing sessions.** Use a strong coding model for implementation
   sessions; keep prompts append-only so the session's prefix stays cache-warm; run the queue
   daemon while implementing so sessions share the endpoint instead of thrashing it. Tests and
@@ -144,11 +144,11 @@ Neutral, string-only — zero hard dependency on pi-subagents; any runner can de
   (`agent_start` → `agent_settled`), lease with TTL, released on settle.
 - Priority: interactive parent > subagent child, with aging anti-starvation.
 - No preemption (ADR 0002): a live holder keeps the slot until it releases it, aborts,
-  disconnects, or its TTL lapses; a switch always re-prefills the KV cache.
+  disconnects, its TTL lapses, or it is idle-yielded under contention (ADR 0003); a switch
+  always re-prefills the KV cache.
 - Role detection: `PI_QUEUE_ROLE` contract, `PI_SUBAGENT_CHILD` /
   `PI_SUBAGENT_PARENT_SESSION` as optional hints, `PI_QUEUE_GROUP` grouping label;
   zero hard dependency on pi-subagents. `/queue promote|demote` overrides the tier.
-- `blockSubagentLaunch: true` by default for `maxStreams: 1` queues.
 - Batched subagent launches (one workflow call → one parent wake) as the
   documented pattern; `wakeBatching` is roadmap.
 - Observability: `/queue` command + live TUI indicator.
@@ -157,14 +157,12 @@ Neutral, string-only — zero hard dependency on pi-subagents; any runner can de
 
 ## Subagent launches (batch pattern)
 
-On a single-slot queue (`maxStreams: 1`) the extension's `tool_call` hook rewrites
-the `subagent` tool's `async: true → false`, so the orchestrator blocks on each
-launch and parallel launches become a serial queue. Launch one batch as a single
+On a single-slot queue (`maxStreams: 1`) children queue behind the parent (child tier,
+unbounded wait) and serialise through the queue. Launch one batch as a single
 workflow call (one `subagent` call with a `workflow`/`tasks`/`chain` argument): the
 parent is woken once at the end, so its large context is re-prefilled once, not
-once per child. `blockSubagentLaunch` defaults to `true` when `maxStreams == 1`
-(`false` otherwise); override per queue with `queues.<name>.blockSubagentLaunch`.
-The hook is a no-op when the `subagent` tool is absent (pi-subagents not installed).
+once per child. Idle-yield (ADR 0003) ensures a blocked parent yields the slot to its
+children when it stops streaming; the parent re-queues after the batch completes.
 
 Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
 provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and the
@@ -172,12 +170,14 @@ session switch on release are implemented (#3); the session-switch quanta (#3) w
 #49 — see ADR 0002. Priority tiers
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
 `/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
-`enabled: false` passthrough, the config schema (all fields accepted; `blockSubagentLaunch` is
-implemented (#6); `queueTimeoutMs` / `failOpen` / `daemonIdleExitMs` implemented in #8) and config hot-reload
+`enabled: false` passthrough, the config schema (all fields accepted; `queueTimeoutMs` / `failOpen` /
+`daemonIdleExitMs` implemented in #8) and config hot-reload
 (daemon + extension) are implemented (#5). Observability (#7) — the queued footer indicator, the
 `/queue` status (slot holder, per-tier queue depth, session-switch counts) and JSON status — is
 implemented. Fail-open hardening + idle-exit (#8) — `failOpen` (default true), the `queueTimeoutMs`
-parent queue-wait cap (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
+parent queue-wait warning (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
 packaging + docs (#9) — npm package, versioned config schema validation, install/config/env/dev docs —
 is implemented; e2e cache-warmth validation (#10) is human-run; the auto-starter (#37/#38) — a
-starter `llm-queue.json` scaffolded from `models.json` on first launch — is implemented.
+starter `llm-queue.json` scaffolded from `models.json` on first launch — is implemented. Idle-yield
+(#51) — an idle Holder yields its Slot when Waiters exist, `blockSubagentLaunch` deleted,
+`queueTimeoutMs` warn-only — is implemented (ADR 0003).

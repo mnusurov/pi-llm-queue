@@ -21,7 +21,7 @@ describe("config schema validation", () => {
 					daemonIdleExitMs: 60000,
 				},
 				queues: {
-					"http://gpu.test/v1": { maxStreams: 1, blockSubagentLaunch: true },
+					"http://gpu.test/v1": { maxStreams: 1, idleYieldMs: 30000 },
 					zen: { maxStreams: 3, policy: "fifo", enabled: true, match: ["zen"] },
 					"free-api": { enabled: false },
 				},
@@ -52,7 +52,7 @@ describe("config schema validation", () => {
 	it("names the path and expected type for every bad field", () => {
 		const errors = validateConfig({
 			defaults: { maxStreams: "1", agingAfterSlots: -2, failOpen: "yes", leaseTtlMs: 0 },
-			queues: { zen: { maxStreams: 0, policy: "lifo", match: "zen", blockSubagentLaunch: 1 } },
+			queues: { zen: { maxStreams: 0, policy: "lifo", match: "zen", idleYieldMs: -1 } },
 		});
 		assert.deepEqual(errors, [
 			'defaults.maxStreams must be a positive integer (got "1")',
@@ -62,7 +62,7 @@ describe("config schema validation", () => {
 			"queues.zen.maxStreams must be a positive integer (got 0)",
 			'queues.zen.policy must be one of "priority-aging" or "fifo" (got "lifo")',
 			'queues.zen.match must be an array of strings (got "zen")',
-			"queues.zen.blockSubagentLaunch must be true or false (got 1)",
+			"queues.zen.idleYieldMs must be a number >= 0 (got -1)",
 		]);
 	});
 
@@ -85,9 +85,9 @@ describe("config schema validation", () => {
 	// the daemon serves defaults, so no preemption can be re-enabled from config.
 	it("rejects the removed session-switch quanta as unknown fields", () => {
 		assert.deepEqual(validateConfig({ defaults: { idleQuantumMs: 120000, monopolyRequests: 12, monopolyMs: 180000 } }), [
-			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
-			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
-			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, blockSubagentLaunch, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
 		]);
 		assert.match(validateConfig({ queues: { zen: { idleQuantumMs: 1 } } })[0], /^queues\.zen\.idleQuantumMs is an unknown field/);
 	});

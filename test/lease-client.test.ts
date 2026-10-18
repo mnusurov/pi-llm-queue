@@ -315,7 +315,7 @@ describe("lease client", () => {
 		holder.close();
 	});
 
-	it("passes a parent through with a timeout after queueTimeoutMs; a child waits unlimited", async () => {
+	it("warns a parent past queueTimeoutMs but keeps it queued; a child waits unlimited", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
 		await waitForDaemon(d.socketPath);
 		const holder = new LeaseClient({ socketPath: d.socketPath });
@@ -323,14 +323,19 @@ describe("lease client", () => {
 
 		const parent = new LeaseClient({ socketPath: d.socketPath, queueTimeoutMs: 300 });
 		const child = new LeaseClient({ socketPath: d.socketPath, queueTimeoutMs: 300 });
-		const p = parent.acquire(QUEUE_KEY, "P", "parent");
+		let warned = false;
+		const p = parent.acquire(QUEUE_KEY, "P", "parent", undefined, undefined, undefined, () => { warned = true; });
 		const c = child.acquire(QUEUE_KEY, "C", "child");
 
-		assert.equal(await p, "timeout", "a parent passes through with a timeout reason after queueTimeoutMs");
-		assert.equal(await raceWithSleep(c, 400), "pending", "child default is unlimited: queueTimeoutMs never applies to a child");
+		await sleep(400); // past queueTimeoutMs
+		assert.ok(warned, "the parent is warned past queueTimeoutMs");
+		assert.equal(await raceWithSleep(p, 200), "pending", "the parent stays queued past queueTimeoutMs (warn-only)");
+		assert.equal(await raceWithSleep(c, 200), "pending", "child default is unlimited: queueTimeoutMs never applies to a child");
 
 		holder.release(QUEUE_KEY, "H");
-		assert.equal(await raceWithSleep(c, 3000), "resolved", "the child is granted once the slot frees");
+		assert.equal(await raceWithSleep(p, 3000), "resolved", "the parent is granted once the slot frees");
+		parent.release(QUEUE_KEY, "P");
+		assert.equal(await raceWithSleep(c, 3000), "resolved", "the child is granted once the parent releases");
 
 		parent.close();
 		child.close();

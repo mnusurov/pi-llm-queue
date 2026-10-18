@@ -16,12 +16,12 @@ export interface DaemonPaths {
 	heartbeatMs?: number;
 	/** Daemon unreachable → pass through unqueued (default true). false → a request hard-errors. */
 	failOpen?: boolean;
-	/** Parent queue-wait cap; on expiry the request passes through with a warning. Child is always unlimited. */
+	/** Parent queue-wait warning threshold; on expiry the parent is warned but stays queued. Child is always unlimited. */
 	queueTimeoutMs?: number;
 }
 
-/** Why an acquire resolved: granted, daemon-unreachable, queue-wait timeout, or aborted. */
-export type AcquireReason = "granted" | "fail-open" | "timeout" | "aborted";
+/** Why an acquire resolved: granted, daemon-unreachable, or aborted. */
+export type AcquireReason = "granted" | "fail-open" | "aborted";
 
 /**
  * Start the daemon when nothing owns the socket. No liveness probe here: the daemon's own
@@ -161,13 +161,14 @@ export class LeaseClient {
 		group?: string,
 		signal?: AbortSignal,
 		onQueued?: (info: { position: number; holders: string[] }) => void,
+		onTimeout?: () => void,
 	): Promise<AcquireReason> {
 		if (!(await this.connectDaemon())) {
 			if (!this.failOpen) this.unreachable();
 			return "fail-open";
 		}
 		this.refSocket();
-		this.send({ op: "acquire", queueKey, sessionKey, role, group });
+		this.send({ op: "acquire", queueKey, sessionKey, role, group, activity: true });
 		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
 		const entry: Pending = { match: granted, resolve: () => {} };
 		// A child must never pass through unqueued (it would defeat serialisation), so the
@@ -222,10 +223,8 @@ export class LeaseClient {
 			}
 			if (isFinite(timeoutMs)) {
 				timer = setTimeout(() => {
-					const at = this.pending.indexOf(entry);
-					if (at >= 0) this.pending.splice(at, 1);
-					this.send({ op: "cancel", queueKey, sessionKey }); // drop from the queue, then pass through
-					finish("timeout");
+					// Warn-only: the parent is notified but stays queued — idle-yield self-heals a stuck queue.
+					onTimeout?.();
 				}, timeoutMs);
 				timer.unref();
 			}

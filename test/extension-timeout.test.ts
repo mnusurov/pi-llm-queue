@@ -81,7 +81,7 @@ describe("queueTimeoutMs visible warning", () => {
 		"test-timeout",
 	);
 
-	it("passes a queued parent through with a visible warning after queueTimeoutMs (no hard error)", async () => {
+	it("warns a queued parent past queueTimeoutMs and keeps it queued (no passthrough)", async () => {
 		const a = makePi();
 		const b = makePi();
 		const notices: [string, string][] = [];
@@ -93,13 +93,16 @@ describe("queueTimeoutMs visible warning", () => {
 		await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its whole run
 
 		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // B queues behind A
-		const outcome = await Promise.race([eB.then((ev) => ev.type), sleep(3000).then(() => "blocked")]);
+		const outcome = await Promise.race([eB.then((ev) => ev.type), sleep(2000).then(() => "blocked")]);
 
-		assert.equal(outcome, "start", "B passes through unqueued after queueTimeoutMs (no hard error)");
+		assert.equal(outcome, "blocked", "B stays queued past queueTimeoutMs (warn-only, no passthrough)");
 		const warning = notices.find(([text, level]) => level === "warning" && text.includes("queueTimeoutMs"));
 		assert.ok(warning, "a visible warning is shown when the queue wait exceeds queueTimeoutMs");
 
+		// Release A: B is granted and streams.
 		a.handlers["session_shutdown"][0]({}, ctxA);
+		const granted = await Promise.race([eB.then((ev) => ev.type), sleep(3000).then(() => "blocked")]);
+		assert.equal(granted, "start", "B is granted and streams once the slot frees");
 	});
 });
 

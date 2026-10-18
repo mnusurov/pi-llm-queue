@@ -23,16 +23,14 @@ const SOCKET_PATH = join(AGENT_DIR, "llm-queue.sock");
 const DAEMON_PATH = decodeURIComponent(new URL("daemon.js", import.meta.url).pathname);
 // Wake chains (parent woken by a child) must not thrash the slot: spec says 2-5 s.
 const GRACE_MS = 3000;
-// Shown when a parent's queue wait exceeds queueTimeoutMs and the request passes through unqueued.
-const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — passing through unqueued";
+// Shown when a parent's queue wait exceeds queueTimeoutMs; the request stays queued.
+const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — still waiting";
 
 interface QueueEntry {
 	maxStreams?: number;
 	enabled?: boolean;
 	/** BaseUrls and/or provider names that share this queue (overrides baseUrl keying). */
 	match?: string[];
-	/** Force subagent launches to block the parent (async:false) so they serialise on this queue. */
-	blockSubagentLaunch?: boolean;
 }
 
 const LOCAL_DOMAIN = /\.(local|lan|home\.arpa)$/;
@@ -112,24 +110,6 @@ export function resolveQueueProviders(
 		for (const member of [key, ...(entry?.match ?? [])]) for (const provider of matchingProviders(member, providers)) names.add(provider);
 	}
 	return [...names];
-}
-
-/**
- * Whether a subagent launch on this model's queue must be forced to async:false.
- * Per-queue override, then defaults, then the single-slot default (maxStreams == 1 serialises).
- * The entry is resolved the way the daemon resolves policy: group key, endpoint key, then a
- * provider-name key naming the model's provider.
- */
-export function resolveBlockSubagentLaunch(
-	queues: Record<string, QueueEntry>,
-	defaults: { maxStreams?: number; blockSubagentLaunch?: boolean } | undefined,
-	model: { provider: string; baseUrl: string },
-	providers: Record<string, any> = {},
-): boolean {
-	const entry = queueEntryFor(queues, providers, model);
-	if (!entry || entry.enabled === false) return false; // no active queue (or passthrough): fully parallel, never blocks
-	const maxStreams = entry.maxStreams ?? defaults?.maxStreams ?? 1;
-	return entry.blockSubagentLaunch ?? defaults?.blockSubagentLaunch ?? maxStreams === 1;
 }
 
 /**
@@ -239,9 +219,8 @@ export default function (pi: ExtensionAPI) {
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
-					const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal, showQueued);
+					const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, options?.signal, showQueued, () => ui?.notify(TIMEOUT_WARNING, "warning"));
 					clearQueued();
-					if (reason === "timeout") ui?.notify(TIMEOUT_WARNING, "warning");
 					if (reason === "granted") {
 						if (wasHeld) heldQueueKey = queueKey; // the run re-took its slot
 						else selfQueued = true;
@@ -249,7 +228,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
-				for await (const event of impl.streamSimple(model, context, options)) out.push(event);
+				// In-flight keyed beat: while streaming, send a keyed beat every heartbeatMs so the
+				// daemon sees activity and never idle-yields the slot. Between streams (tool exec,
+				// blocked subagent) no keyed beats — the daemon idle-yields the holder when waiters exist.
+				const activityBeat = heldQueueKey === queueKey
+					? setInterval(() => lease.beat(queueKey, sessionKey), heartbeatMs)
+					: null;
+				activityBeat?.unref();
+				try {
+					for await (const event of impl.streamSimple(model, context, options)) out.push(event);
+				} finally {
+					if (activityBeat) clearInterval(activityBeat);
+				}
 				out.end();
 			} catch (error) {
 				out.push({
@@ -311,13 +301,7 @@ export default function (pi: ExtensionAPI) {
 	// Serialise subagent launches on single-slot queues: force async:false so the parent blocks
 	// and launches queue one-at-a-time (batch = one workflow call → one wake). No-op when the
 	// subagent tool is absent: tool_call never fires for a tool that isn't installed.
-	pi.on("tool_call", (event, ctx) => {
-		if (event.toolName !== "subagent") return;
-		const model = ctx.model;
-		if (!model) return;
-		if (resolveBlockSubagentLaunch(queues, config.defaults, model, modelsJson) && event.input.async !== false)
-			event.input.async = false;
-	});
+	// REMOVED by #51: idle-yield replaces this. Serialisation of children is the queue's job.
 
 	// Registration is deferred to the first session so ctx gives us the model registry
 	// (native-provider detection) and ui.notify (unmatched keys, api mismatches).
@@ -435,10 +419,9 @@ export default function (pi: ExtensionAPI) {
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", releaseSlot, { once: true });
 		const queueKey = resolveQueueKey(queues, model, modelsJson);
-		const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued);
+		const reason = await lease.acquire(queueKey, sessionKey, currentRole(), group, ctx.signal, showQueued, () => ctx.ui.notify(TIMEOUT_WARNING, "warning"));
 		clearQueued();
-		if (reason === "timeout") ctx.ui.notify(TIMEOUT_WARNING, "warning");
-		// Only a grant claims a lease: a timeout/abort/fail-open must not mark the slot held.
+		// Only a grant claims a lease: an abort/fail-open must not mark the slot held.
 		if (reason === "granted") heldQueueKey = queueKey;
 	});
 
