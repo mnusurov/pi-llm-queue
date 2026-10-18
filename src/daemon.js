@@ -90,6 +90,7 @@ function applyPolicy(queue, policy) {
 	queue.agingAfterSlots = pick("agingAfterSlots", 3);
 	queue.agingAfterMs = pick("agingAfterMs", 60000);
 	queue.policy = pick("policy", "priority-aging");
+	queue.idleYieldMs = pick("idleYieldMs", 30000);
 	return queue;
 }
 
@@ -105,8 +106,8 @@ function queueFor(key) {
 
 // A lease is the holder's record: its TTL deadline. The same object lives in conn.leases, so a
 // client heartbeat refreshes it in place.
-function newLease(queue, sessionKey, conn) {
-	return { queueKey: queue.queueKey, sessionKey, conn, expires: Date.now() + queue.ttlMs };
+function newLease(queue, sessionKey, conn, activity) {
+	return { queueKey: queue.queueKey, sessionKey, conn, expires: Date.now() + queue.ttlMs, activity: !!activity, lastActivityAt: Date.now() };
 }
 
 function leaseOf(queue, sessionKey) {
@@ -134,7 +135,7 @@ function grantNext(queue) {
 		const waiter = pickNext(queue);
 		remove(queue.waiting, waiter);
 		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
-		const lease = newLease(queue, waiter.sessionKey, waiter.conn);
+		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity);
 		queue.holders.push(lease);
 		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
 		remove(waiter.conn.queued, waiter);
@@ -148,7 +149,7 @@ function remove(list, item) {
 	if (at >= 0) list.splice(at, 1);
 }
 
-function release(queue, sessionKey) {
+function release(queue, sessionKey, reason) {
 	const lease = leaseOf(queue, sessionKey);
 	if (lease) {
 		remove(queue.holders, lease);
@@ -163,8 +164,16 @@ function release(queue, sessionKey) {
 // reports a ghost holder, whether or not anyone is waiting.
 function sweep() {
 	const now = Date.now();
-	for (const queue of queues.values())
+	for (const queue of queues.values()) {
 		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey);
+		// Idle-yield: an activity-flagged holder silent past idleYieldMs with waiters present yields
+		// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
+		if (queue.idleYieldMs > 0 && queue.waiting.length > 0) {
+			for (const lease of [...queue.holders]) {
+				if (lease.activity && now - lease.lastActivityAt > queue.idleYieldMs) release(queue, lease.sessionKey, "idle");
+			}
+		}
+	}
 }
 setInterval(sweep, sweepMs).unref();
 
@@ -188,7 +197,7 @@ function handle(msg, conn) {
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
-				const lease = newLease(queue, msg.sessionKey, conn);
+				const lease = newLease(queue, msg.sessionKey, conn, msg.activity);
 				queue.holders.push(lease);
 				conn.leases.push(lease);
 				// A direct grant counts toward the parent-grant streak too: a parent that never
@@ -197,7 +206,7 @@ function handle(msg, conn) {
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
-			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now() };
+			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
 			return;
@@ -228,7 +237,7 @@ function handle(msg, conn) {
 				const queue = queueFor(msg.queueKey);
 				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
 				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
-				if (granted) lease.expires = Date.now() + queue.ttlMs;
+				if (granted) { lease.expires = Date.now() + queue.ttlMs; lease.lastActivityAt = Date.now(); }
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}

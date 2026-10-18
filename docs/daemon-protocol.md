@@ -7,7 +7,7 @@ JSON. Every message is one JSON object on a single line.
 
 | op        | fields                                        | response                                                        |
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `acquire` | `queueKey`*, `sessionKey`, `role`, `group`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
+| `acquire` | `queueKey`*, `sessionKey`, `role`, `group`, `activity`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
 | `release` | `queueKey`*, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`*, `sessionKey`                     | — (no reply) — drop a queued request the client aborted          |
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`) |
@@ -25,7 +25,12 @@ queued request without closing the socket — this is how Esc cancels a request 
 waiting for a slot.
 
 `role` is `parent` (interactive) or `child` (subagent); `group` is an optional `PI_QUEUE_GROUP`
-label carried through to `status`. The scheduler grants by tier — parent over child, FIFO within a
+label carried through to `status`. `activity` is an optional boolean capability flag: a client
+that sends `activity: true` in `acquire` opts into idle-yield tracking (the daemon records
+`lastActivityAt` on its lease and may yield it under contention). A client that omits it (old
+client) is never idle-yielded.
+
+The scheduler grants by tier — parent over child, FIFO within a
 tier — with aging anti-starvation: the longest-waiting child jumps the queue once it has waited
 `agingAfterMs`, or once `agingAfterSlots` parents have been granted in a row.
 
@@ -43,7 +48,10 @@ The slot is held per session across a whole run, and **a live holder is never pr
 - **release** — the run settled (the extension releases 3 s after `agent_settled`, so a parent
   woken by its child keeps the slot), the session shut down, the request aborted, or the socket died;
 - **TTL expiry** — the client stopped heartbeating, i.e. it died: a session killed mid-stream, a
-  process that vanished, a heartbeat starved by a tool that blocks the event loop.
+  process that vanished, a heartbeat starved by a tool that blocks the event loop;
+- **idle yield** (ADR 0003) — an activity-flagged holder sent no keyed beat for `idleYieldMs`
+  and a waiter is queued: the daemon releases the slot and grants the next waiter. A lone holder
+  is never disturbed; an unflagged (old-client) lease is never yielded.
 
 A keyed `renew` (activity beat) refreshes the TTL, and its reply is authoritative: `granted: false`
 means the slot is gone (released, disconnected, TTL-expired) and the client must re-queue before it
@@ -55,8 +63,9 @@ whether or not anyone is waiting: an expired lease is a dead client, and `/queue
 it as a holder.
 
 shortcut: a child that stalls while holding the slot keeps it until it is stopped, its socket
-closes, or its TTL lapses (a dead client) — the queue never takes the slot back. That is the
-"hold for the whole run" contract; `queueTimeoutMs` remains the parent-side escape hatch.
+closes, its TTL lapses (a dead client), or it is idle-yielded (ADR 0003, activity-flagged
+leases only) — the queue never takes the slot back from an *active* holder. That is the
+"hold for the whole run" contract; `queueTimeoutMs` remains the parent-side warning.
 
 shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its lease never expires and a
 waiter waits for the whole stream. That is the serialisation promise, not a bug — raise
@@ -95,7 +104,7 @@ The group/entry resolution rule is one implementation (`groupKeyFor`, `queueEntr
 `src/config.js`) shared by the extension and the daemon.
 
 Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAfterSlots`,
-`agingAfterMs`, `blockSubagentLaunch` (all also valid in
+`agingAfterMs`, `idleYieldMs` (all also valid in
 `defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
 `failOpen` (default `true`) and `queueTimeoutMs`
 are client-side (`defaults` only); `daemonIdleExitMs` (default `60000`) is daemon-side
@@ -109,9 +118,10 @@ startup, or keeps the last good config on hot-reload. A missing config
 file is all defaults with no error; a half-written file (invalid JSON) is a silent no-op that
 keeps the last good config.
 
-- **`blockSubagentLaunch`** — force the `subagent` tool's `async: true → false` on this queue so
-  launches serialise. Defaults to `true` when `maxStreams == 1` (`false` otherwise); a disabled
-  (passthrough) queue never blocks.
+- **`idleYieldMs`** — idle-yield threshold (default `30000`, `0` disables): an activity-flagged
+  holder that sends no keyed beat for this long, with a waiter queued, is released and the next
+  waiter is granted. A lone holder is never disturbed; an unflagged (old-client) lease is never
+  yielded. Valid in `defaults` and per-queue.
 
 - **`enabled: false`** — passthrough: the queue grants every session immediately (`status`
   reports `maxStreams: null`, printed as `passthrough` by `/queue`), and the extension leaves the provider unwrapped. A disabled
@@ -161,9 +171,11 @@ read once at connect and are the fields that need a pi restart.
 - Fail-open: daemon unreachable → the request goes through unqueued (`failOpen: true`, the
   default). A client whose daemon dies mid-wait is released to its request. With
   `failOpen: false` the request hard-errors instead (the queue becomes a single point of failure).
-- Queue-wait cap: a parent `acquire` older than `queueTimeoutMs` is dropped from the queue and
-  passes through unqueued with a visible warning (no hard error). A child's wait is always
-  unlimited — a subagent never passes through unqueued, which would defeat serialisation.
+- Queue-wait warning: a parent `acquire` older than `queueTimeoutMs` is warned (visible
+  `ui.notify`) but stays queued — passthrough is removed. With idle-yield a stuck queue
+  self-heals; passing through behind a live streaming child would re-create the stampede. A
+  child's wait is always unlimited — a subagent never passes through unqueued, which would
+  defeat serialisation.
 - Idle-exit: the daemon self-terminates `daemonIdleExitMs` (default 60 s) after the last client
   disconnects, unlinking its socket, so no orphan process lingers. A client that reconnects
   within the grace cancels the exit, so a quick relaunch keeps the warm daemon. A daemon that

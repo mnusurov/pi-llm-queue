@@ -26,7 +26,7 @@ const FIELDS = {
 	agingAfterMs: { kind: "nonNegNum" },
 	enabled: { kind: "bool", queuesOnly: true },
 	match: { kind: "strings", queuesOnly: true },
-	blockSubagentLaunch: { kind: "bool" },
+	idleYieldMs: { kind: "nonNegNum" },
 	failOpen: { kind: "bool", defaultsOnly: true },
 	queueTimeoutMs: { kind: "posNum", defaultsOnly: true },
 	daemonIdleExitMs: { kind: "nonNegNum", defaultsOnly: true },

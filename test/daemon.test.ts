@@ -920,3 +920,157 @@ describe("connection framing and buffer bounds", () => {
 		d.stop();
 	});
 });
+
+// Idle-yield (#51): an activity-flagged holder silent past idleYieldMs with waiters present
+// yields the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
+describe("idle-yield under contention", () => {
+	const daemons: Daemon[] = [];
+	const clients: Client[] = [];
+	const start = (idleYieldMs: number, sweepMs = 50) => {
+		const d = startDaemon({ defaults: { maxStreams: 1, idleYieldMs }, queues: {} }, undefined, undefined, sweepMs);
+		daemons.push(d);
+		return d;
+	};
+	const open = async (d: Daemon) => {
+		const c = await connectClient(d.socketPath);
+		clients.push(c);
+		return c;
+	};
+	const acquire = (c: Client, sessionKey: string, activity = true) =>
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent", activity });
+	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+
+	after(() => {
+		for (const c of clients) c.close();
+		for (const d of daemons) d.stop();
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	it("yields an idle activity-flagged holder when a waiter is queued", async () => {
+		const d = start(300);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// A is silent past idleYieldMs: the sweep yields it, B is granted.
+		assert.deepEqual(await b.next(2000), granted("B"), "idle holder yielded, waiter granted");
+		// A's next beat answers granted:false (the slot is gone).
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "yielded holder learns via beat");
+	});
+
+	it("keyed beats during a long stream prevent idle-yield", async () => {
+		const d = start(500);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// Simulate a long stream: keyed beats every 200 ms for 1.5 s (3× idleYieldMs).
+		for (let i = 0; i < 8; i++) {
+			await sleep(200);
+			beat(a, "A");
+			await a.next(3000); // consume the ok reply
+		}
+		await assert.rejects(b.next(200), /no message from daemon within/, "beats keep the holder");
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await b.next(3000), granted("B"), "waiter granted on voluntary release");
+	});
+
+	it("never yields a lone idle holder (no waiters)", async () => {
+		const d = start(300);
+		const a = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+
+		await sleep(600); // 2× idleYieldMs of silence, no waiters
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }, "lone idle holder keeps its slot");
+	});
+
+	it("never yields an unflagged (old-client) lease", async () => {
+		const d = start(300);
+		const a = await open(d);
+		const b = await open(d);
+
+		// Old client: no activity flag on acquire.
+		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		await sleep(600); // 2× idleYieldMs of silence: unflagged lease is never yielded
+		await assert.rejects(b.next(200), /no message from daemon within/, "unflagged holder never yielded");
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await b.next(3000), granted("B"));
+	});
+
+	it("idleYieldMs 0 disables idle-yield", async () => {
+		const d = start(0);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		await sleep(600); // idleYieldMs 0: never yields
+		await assert.rejects(b.next(200), /no message from daemon within/, "idleYieldMs 0 disables yield");
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await b.next(3000), granted("B"));
+	});
+
+	it("a yielded holder re-acquires and queues behind the new holder", async () => {
+		const d = start(300);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// A is idle-yielded, B is granted.
+		assert.deepEqual(await b.next(2000), granted("B"));
+
+		// A re-acquires: queues behind B (B holds the slot).
+		acquire(a, "A", true);
+		await assert.rejects(a.next(200), /no message from daemon within/, "yielded holder re-queues");
+
+		// B releases: A is granted.
+		b.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "B" });
+		assert.deepEqual(await a.next(3000), granted("A"), "re-queued holder wins on release");
+	});
+
+	it("idle-yield counts as a switch in status", async () => {
+		const d = start(300);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// Idle-yield: A yields, B is granted (1 switch).
+		assert.deepEqual(await b.next(2000), granted("B"));
+
+		a.send({ op: "status" });
+		const status = await a.next(3000);
+		assert.equal(status.queues[0].switches, 1, "idle-yield handover counts as a switch");
+	});
+});

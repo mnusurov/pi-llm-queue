@@ -30,13 +30,19 @@ _Avoid_: approval, assign
 
 **Switch**:
 One handover of a slot from one session to another — the event that re-prefills the KV cache.
-Made only by a voluntary release, an abort, a disconnect, or a dead client's TTL (ADR 0002).
+Made by a voluntary release, an abort, a disconnect, a dead client's TTL, or a daemon-initiated
+idle yield (ADR 0002 + ADR 0003).
 _Avoid_: preemption, context switch
 
 **Passthrough**:
-A request streaming to the endpoint without holding a slot: queue disabled, fail-open, or a
-parent whose queue wait timed out.
+A request streaming to the endpoint without holding a slot: queue disabled, or fail-open.
 _Avoid_: bypass, fallback
+
+**Yield**:
+A daemon-initiated release of an idle Holder's Slot when Waiters are present and the Holder has
+sent no keyed beat for `idleYieldMs`. The yielded client learns via its next beat (`granted:
+false`) and re-queues. ADR 0003.
+_Avoid_: preemption, eviction
 
 ### Lease and beat
 
@@ -47,7 +53,8 @@ _Avoid_: lock, ticket
 
 **Beat**:
 A keyed lease refresh: the holder's report that it is using the slot. The daemon's only view of
-stream activity, and its reply is the authoritative grant state.
+stream activity, and its reply is the authoritative grant state. Keyed beats during streaming
+refresh `lastActivityAt`; between streams they stop, enabling idle-yield.
 _Avoid_: ping, signal
 
 **Heartbeat**:
@@ -89,7 +96,7 @@ _Avoid_: GC, reaper
 ### Roles and config
 
 **Parent**:
-An interactive pi session; queues with a bounded queue wait and a tier above children.
+An interactive pi session; queues with a warn-only queue wait and a tier above children.
 _Avoid_: interactive session, main session
 
 **Child**:
