@@ -82,27 +82,37 @@ describe("queueTimeoutMs visible warning", () => {
 	);
 
 	it("warns a queued parent past queueTimeoutMs and keeps it queued (no passthrough)", async () => {
-		const a = makePi();
-		const b = makePi();
-		const notices: [string, string][] = [];
-		extension(a as any);
-		extension(b as any);
-		const ctxA = start(a, "HOLDER", { notify: () => {}, setStatus: () => {} });
-		start(b, "TIMEOUT", { notify: (text: string, level: string) => notices.push([text, level]), setStatus: () => {} });
+		// The tier a session queues as comes from the env contract: pin parent so this test observes
+		// the parent queueTimeoutMs warning wherever the suite runs. A lane running these tests is
+		// itself a subagent child, and a child waits unbounded by design (no warning fires).
+		const savedRole = process.env.PI_QUEUE_ROLE;
+		process.env.PI_QUEUE_ROLE = "parent";
+		try {
+			const a = makePi();
+			const b = makePi();
+			const notices: [string, string][] = [];
+			extension(a as any);
+			extension(b as any);
+			const ctxA = start(a, "HOLDER", { notify: () => {}, setStatus: () => {} });
+			start(b, "TIMEOUT", { notify: (text: string, level: string) => notices.push([text, level]), setStatus: () => {} });
 
-		await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its whole run
+			await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its whole run
 
-		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // B queues behind A
-		const outcome = await Promise.race([eB.then((ev) => ev.type), sleep(2000).then(() => "blocked")]);
+			const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // B queues behind A
+			const outcome = await Promise.race([eB.then((ev) => ev.type), sleep(2000).then(() => "blocked")]);
 
-		assert.equal(outcome, "blocked", "B stays queued past queueTimeoutMs (warn-only, no passthrough)");
-		const warning = notices.find(([text, level]) => level === "warning" && text.includes("queueTimeoutMs"));
-		assert.ok(warning, "a visible warning is shown when the queue wait exceeds queueTimeoutMs");
+			assert.equal(outcome, "blocked", "B stays queued past queueTimeoutMs (warn-only, no passthrough)");
+			const warning = notices.find(([text, level]) => level === "warning" && text.includes("queueTimeoutMs"));
+			assert.ok(warning, "a visible warning is shown when the queue wait exceeds queueTimeoutMs");
 
-		// Release A: B is granted and streams.
-		a.handlers["session_shutdown"][0]({}, ctxA);
-		const granted = await Promise.race([eB.then((ev) => ev.type), sleep(3000).then(() => "blocked")]);
-		assert.equal(granted, "start", "B is granted and streams once the slot frees");
+			// Release A: B is granted and streams.
+			a.handlers["session_shutdown"][0]({}, ctxA);
+			const granted = await Promise.race([eB.then((ev) => ev.type), sleep(3000).then(() => "blocked")]);
+			assert.equal(granted, "start", "B is granted and streams once the slot frees");
+		} finally {
+			if (savedRole === undefined) delete process.env.PI_QUEUE_ROLE;
+			else process.env.PI_QUEUE_ROLE = savedRole;
+		}
 	});
 });
 
