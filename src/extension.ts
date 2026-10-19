@@ -418,11 +418,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			// A session reads as `id tier [group]`: the tier it holds or queues as, and its group label.
-			const named = (entry: StatusSession) => `${entry.sessionKey} ${entry.role}${entry.group ? ` ${entry.group}` : ""}`;
+			const label = (entry: StatusSession) => `${entry.sessionKey} ${entry.role}${entry.group ? ` ${entry.group}` : ""}`;
 			const lines = s.queues.map((q) => {
 				const depth = (role: Role) => q.waiting.filter((w) => w.role === role).length;
-				const waiters = q.waiting.map(named).join(", ");
-				return `${q.queueKey}: slot ${q.holders.map(named).join(", ") || "free"} (${q.holders.length}/${q.maxStreams === null ? "passthrough" : q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")}${waiters ? ` (${waiters})` : ""} · switches ${q.switches}`;
+				const waiters = q.waiting.map(label).join(", ");
+				return `${q.queueKey}: slot ${q.holders.map(label).join(", ") || "free"} (${q.holders.length}/${q.maxStreams === null ? "passthrough" : q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")}${waiters ? ` (${waiters})` : ""} · switches ${q.switches}`;
 			});
 			ctx.ui.notify(lines.length ? lines.join("\n") : "pi-llm-queue: no queues", "info");
 		},
