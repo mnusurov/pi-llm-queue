@@ -180,9 +180,11 @@ export class Scheduler {
 	}
 
 	// heartbeat (bare renew): keeps every lease of this connection alive. Refreshes TTL only, NOT
-	// lastActivityAt, so a bare heartbeat does not prevent an idle-yield (ADR 0003).
+	// lastActivityAt, so a bare heartbeat does not prevent an idle-yield (ADR 0003). Like every Scheduler
+	// entry it returns the decisions to emit; a heartbeat emits none (no log, no reply), so this is empty.
 	heartbeat(connId, now) {
 		for (const lease of this.connLeases.get(connId) ?? []) lease.expires = now + this.queueFor(lease.queueKey).ttlMs;
+		return [];
 	}
 
 	// release: a voluntary return. Removes the Lease and hands the Slot on (grantNext).

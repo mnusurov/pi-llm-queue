@@ -227,7 +227,8 @@ function handle(msg, conn) {
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
-			scheduler.heartbeat(conn.connId, now);
+			// Bare renew: heartbeat, keeps every lease of this connection alive; emits no decision.
+			emit(scheduler.heartbeat(conn.connId, now));
 			send(conn, { op: "ok" });
 			return;
 		}

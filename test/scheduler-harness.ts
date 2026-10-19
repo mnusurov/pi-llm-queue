@@ -85,8 +85,10 @@ export class SchedulerHarness {
 		return this.scheduler.beat(connId, sessionKey, queueKey, this.now);
 	}
 
-	heartbeat(connId: string): void {
-		this.scheduler.heartbeat(connId, this.now);
+	heartbeat(connId: string): Decision[] {
+		const decisions = this.scheduler.heartbeat(connId, this.now);
+		this.capture(connId, decisions);
+		return decisions;
 	}
 
 	release(connId: string, sessionKey: string, queueKey = QUEUE_KEY): Decision[] {
