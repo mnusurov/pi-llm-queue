@@ -101,7 +101,7 @@ function applyPolicy(queue, policy) {
 	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
 	queue.maxStreams = policy.enabled === false ? Infinity : pick("maxStreams", 1);
 	// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49), so the
-	// slot moves on voluntary release, abort, disconnect, or TTL expiry alone. "fifo" opts a
+	// slot moves on voluntary release, abort, disconnect, or a TTL lapse alone. "fifo" opts a
 	// queue out of parent/child tiering and aging (external multi-slot queues).
 	queue.ttlMs = pick("leaseTtlMs", 30000);
 	// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after
@@ -183,7 +183,7 @@ function release(queue, sessionKey, reason) {
 	grantNext(queue);
 }
 
-// Evict holders whose lease expired: a crashed session stops heartbeating and loses its slot.
+// Evict holders whose lease has lapsed: a crashed session stops heartbeating and loses its slot.
 // A live holder is never preempted (#49) — every switch re-prefills the KV cache, and a
 // child-to-child preemption benefits nobody. The sweep is unconditional so `/queue` never
 // reports a ghost holder, whether or not anyone is waiting.
@@ -257,7 +257,7 @@ function handle(msg, conn) {
 		}
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
 		// Keyed renew: an activity beat — the holder is using the slot, so its TTL refreshes. The
-		// reply is authoritative: granted:false tells the client the slot is gone (TTL expiry, a
+		// reply is authoritative: granted:false tells the client the slot is gone (a TTL lapse, a
 		// release, a disconnect) and it must re-queue before it streams.
 		case "renew": {
 			if (msg.sessionKey && msg.queueKey) {
@@ -389,7 +389,7 @@ process.on("SIGTERM", () => {
 });
 
 // Rebuild queues from the reloaded config, carrying holders and waiters with them: adding a
-// group at runtime must not leave the endpoint's old slot pool running beside the group's.
+// group at runtime must not leave the endpoint's old slot set running beside the group's.
 // shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
 function rebuildQueues() {
 	const rebuilt = new Map();

@@ -1,5 +1,5 @@
 // Fresh install: a missing llm-queue.json means an inert queue. The first session_start must
-// scaffold a starter config from models.json and make the queue live in that same session.
+// generate a Starter config from models.json and make the queue live in that same session.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";

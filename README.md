@@ -8,8 +8,8 @@ warmth on constrained local model servers.
 Local model servers (llama.cpp on a single GPU) thrash their KV cache when
 multiple pi sessions / subagents interleave requests: every session switch
 re-prefills the whole context. pi-llm-queue gives the model one session at a
-time (turn-based slot lease), with priority tiers, aging, and per-endpoint
-queues.
+time (turn-based slot lease), with tier ordering (parent > child), aging,
+and per-endpoint queues.
 
 ## Install (fresh machine)
 
@@ -207,7 +207,7 @@ children when it stops streaming; the parent re-queues after the batch completes
 Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
 provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and the
 session switch on release are implemented (#3); the session-switch quanta (#3) were removed by
-#49 — see ADR 0002. Priority tiers
+#49 — see ADR 0002. Tier ordering
 (parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
 `/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
 `enabled: false` passthrough, the config schema (all fields accepted; `queueTimeoutMs` / `failOpen` /

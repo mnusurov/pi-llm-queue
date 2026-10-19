@@ -392,7 +392,7 @@ describe("provider wrapper (queuedStream)", () => {
 		const raw = await connectClient(socketPath);
 		raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "RAW", role: "parent" }); // queued behind it
 
-		// The lease is gone (TTL expiry of a starved heartbeat, a disconnect release: the daemon
+		// The lease is gone (a TTL lapse of a starved heartbeat, a disconnect release: the daemon
 		// answers a beat ungranted). Here a release on its sessionKey takes the slot for RAW.
 		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "EVICTED" });
 		assert.deepEqual(await raw.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "RAW" }, "the freed slot goes to the waiter");

@@ -67,7 +67,7 @@ The slot is held per session across a whole run, and **a live holder is never pr
   on its next beat (`granted: false`) and re-queues.
 
 A keyed `renew` (activity beat) refreshes the TTL, and its reply is authoritative: `granted: false`
-means the slot is gone (released, disconnected, TTL-expired) and the client must re-queue before it
+means the slot is gone (released, disconnected, past its TTL) and the client must re-queue before it
 streams again — a run that lost its slot never streams unqueued. A bare `renew` (no keys)
 heartbeats every lease of the connection.
 
@@ -75,7 +75,7 @@ The daemon sweeps every `--sweep-ms` (default 1000 ms; the suites pass a short t
 test costs milliseconds). The sweep is two passes:
 
 - **TTL eviction, unconditional** — every lease whose TTL lapsed is evicted whether or not anyone
-  is waiting: an expired lease is a dead client, and `/queue` must never report it as a holder
+  is waiting: a lapsed lease is a dead client, and `/queue` must never report it as a holder
   (ADR 0002).
 - **idle yield, gated** (ADR 0003) — only when `idleYieldMs > 0`, a waiter is queued, and the
   lease is activity-flagged: a holder silent past `idleYieldMs` loses the slot to the next waiter.
@@ -85,7 +85,7 @@ closes, its TTL lapses (a dead client), or it is idle-yielded (ADR 0003, activit
 leases only) — the queue never takes the slot back from an *active* holder. That is the
 "hold for the whole run" contract; `queueTimeoutMs` remains the parent-side warning.
 
-shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its lease never expires and a
+shortcut: a stream longer than `leaseTtlMs` keeps heartbeating, so its lease never lapses and a
 waiter waits for the whole stream. That is the serialisation promise, not a bug — raise
 `httpIdleTimeoutMs` (recommended 900000) so the waiter's client stays patient.
 
@@ -256,7 +256,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | file                                   | suites                                                                                                                                                                     |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `test/config.test.ts`                  | config schema validation; config file loading                                                                                                                               |
-| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; priority tiers and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
+| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
 | `test/daemon-event-log.test.ts`        | daemon event log — the `logFile` seam: the JSON-lines sequence of a handover, every event's fields, a TTL reclaim as `evict` + `reason: "ttl"`, an idle yield as `release` + `reason: "idle"`, an unwritable path that leaves the daemon serving, no file when `logFile` is unset |
 | `test/lease-client.test.ts`            | lease client; daemon autostart                                                                                                                                              |
 | `test/extension.test.ts`               | provider resolution; queue key resolution; self-hosted endpoint detection; starter config generation; role resolution                                                       |

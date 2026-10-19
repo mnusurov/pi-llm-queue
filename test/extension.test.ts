@@ -45,7 +45,7 @@ describe("queue key resolution", () => {
 	it("splits one endpoint per provider with groups", () => {
 		const queues = { serial: { match: ["strata"] }, parallel: { match: ["llama"], maxStreams: 4 } };
 		assert.equal(resolveQueueKey(queues, strata), "serial");
-		assert.equal(resolveQueueKey(queues, llama), "parallel", "two providers on one server get two slot pools");
+		assert.equal(resolveQueueKey(queues, llama), "parallel", "two providers on one server get two slot sets");
 	});
 
 	it("merges every endpoint a group names into the group queue", () => {
@@ -60,7 +60,7 @@ describe("queue key resolution", () => {
 
 	it("keys a model by a group naming a provider that serves its endpoint", () => {
 		// The daemon's endpoint-level rule, now shared: a group naming strata owns every provider
-		// on strata's endpoint, so an extension session and a raw client land in one slot pool.
+		// on strata's endpoint, so an extension session and a raw client land in one slot set.
 		const providers = { strata: { baseUrl: "http://gpu.test/v1" }, extra: { baseUrl: "http://gpu.test/v1" } };
 		assert.equal(resolveQueueKey({ g1: { match: ["strata"] } }, { provider: "extra", baseUrl: "http://gpu.test/v1" }, providers), "g1");
 	});

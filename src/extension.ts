@@ -64,7 +64,7 @@ export function isLocalEndpoint(baseUrl?: string): boolean {
  * Starter config for a fresh install: one queue per endpoint baseUrl (deduplicated, sorted),
  * self-hosted enabled with the default single slot, cloud as passthrough, native-owned providers
  * excluded, and a `defaults` block carrying only the parent queue-wait cap. Null when there is
- * nothing to scaffold: no self-hosted, non-native endpoint.
+ * nothing to queue: no self-hosted, non-native endpoint.
  */
 export function buildStarterConfig(providers: Record<string, any>, isNativeOwned: (name: string) => boolean) {
 	const collected: Record<string, { enabled: boolean }> = {};
@@ -329,7 +329,7 @@ export default function (pi: ExtensionAPI) {
 				// Requests outside a run (compaction, classifier, nested calls) queue for themselves
 				// and release when done. A held request beats its lease: the run keeps the slot
 				// across tool executions. A beat answered ungranted means the daemon no longer grants
-				// the slot (TTL expiry, a release, a disconnect) — the run re-queues before it streams again.
+				// the slot (a TTL lapse, a release, a disconnect) — the run re-queues before it streams again.
 				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
 					// slot retained for the run
 				} else {
@@ -447,13 +447,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`pi-llm-queue: "${provider}" is owned by a native extension, left unqueued`, "info");
 				continue;
 			}
-			// Register with the api the wrapped models use; a model whose api differs
-			// bypasses the queue (composer matches streamSimple on api equality) (finding 6).
+			// Register with the api the wrapped models use; a model whose api differs streams
+			// unqueued (composer matches streamSimple on api equality) (finding 6).
 			const models = modelsJson[provider]?.models ?? [];
 			const api = modelsJson[provider]?.api ?? models[0]?.api ?? "openai-completions";
 			const offApi = [...new Set<string>(models.map((m: any) => m.api).filter(Boolean))].filter((a) => a !== api);
 			if (offApi.length)
-				ctx.ui.notify(`pi-llm-queue: "${provider}" models with api ${offApi.join(", ")} bypass the queue (queued for "${api}")`, "warning");
+				ctx.ui.notify(`pi-llm-queue: "${provider}" models with api ${offApi.join(", ")} stream unqueued (queued for "${api}")`, "warning");
 			pi.registerProvider(provider, { api, streamSimple: queuedStream });
 			wrapped.add(provider);
 		}

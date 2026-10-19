@@ -215,7 +215,7 @@ describe("lease lifecycle and no preemption", () => {
 	});
 
 	// No preemption (#49): a live holder is never switched away. The slot moves only on
-	// voluntary release, abort, disconnect, or TTL expiry of a dead client.
+	// voluntary release, abort, disconnect, or the TTL lapse of a dead client.
 	it("no preemption: a silent holder keeps the slot and the waiter is granted only on release", async () => {
 		const d = start();
 		const a = await open(d);
@@ -308,7 +308,7 @@ describe("lease lifecycle and no preemption", () => {
 	});
 });
 
-describe("priority tiers and aging", () => {
+describe("tier ordering (parent > child) and aging", () => {
 	const daemons: Daemon[] = [];
 	const clients: Client[] = [];
 	const open = async (d: Daemon) => {
@@ -690,7 +690,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		d.stop();
 	});
 
-	it("hot-reloads a new group without leaving the endpoint's old slot pool behind", async () => {
+	it("hot-reloads a new group without leaving the endpoint's old slot set behind", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
 		const a = await connectClient(d.socketPath);
 		const b = await connectClient(d.socketPath);
@@ -703,7 +703,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU], maxStreams: 1 } } }));
 		await sleep(600); // reload debounce + queue rebuild
 		release(a, GPU, "A");
-		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the migrated queue keeps holder and waiter in one slot pool");
+		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the migrated queue keeps holder and waiter in one slot set");
 
 		a.close();
 		b.close();
