@@ -3,6 +3,22 @@
 Pi extension + local daemon that serialises LLM access to protect KV-cache
 warmth on constrained local model servers.
 
+## Merge policy
+
+Squash only: merge commits and rebase merges are disabled on the remote. Merge
+with `gh pr merge --squash`; the remote head branch is auto-deleted (repo
+setting), so `--delete-branch` is not needed. Push straight to `main` is not a
+path to integration.
+
+After merging, clean up the local branch from `main`:
+
+    git checkout main && git pull --prune
+    git branch -D <branch>
+
+Squash rewrites history, so the merged branch is never an ancestor of `main`:
+`git branch -d` refuses, `-D` is the delete that works. Done when
+`git branch --list <branch>` and `git branch --list -r <branch>` are both empty.
+
 ## Agent skills
 
 ### Issue tracker
