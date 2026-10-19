@@ -1,6 +1,7 @@
-// queueTimeoutMs seam (#8): a parent whose queue wait exceeds queueTimeoutMs passes through
-// with a visible warning (no hard error). Own agent dir + config so queueTimeoutMs is set at
-// extension import; stub api provider, real daemon, no real endpoint.
+// queueTimeoutMs seam (#8, warn-only since ADR 0003 §6): a parent whose queue wait exceeds
+// queueTimeoutMs gets a visible warning and stays queued — passthrough is removed. Own agent dir
+// + config so queueTimeoutMs is set at extension import; stub api provider, real daemon, no real
+// endpoint.
 import assert from "node:assert/strict";
 import { describe, it, before, after } from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -14,7 +15,7 @@ const STUB_API = "stub-timeout-api";
 
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-timeout-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-// queueTimeoutMs 300 ms: a parent queued behind a long holder times out and passes through.
+// queueTimeoutMs 300 ms: a parent queued behind a long holder is warned past the cap, not released.
 writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, queueTimeoutMs: 300 }, queues: { stub: { maxStreams: 1 } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
