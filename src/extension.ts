@@ -86,6 +86,11 @@ function matchingProviders(key: string, providers: Record<string, any>): string[
 	return Object.keys(providers).filter((name) => providers[name]?.baseUrl === key);
 }
 
+/** A queue entry's members: its own key plus its `match` list — the names that address this queue. */
+function membersOf(key: string, entry?: QueueEntry): string[] {
+	return [key, ...(entry?.match ?? [])];
+}
+
 /** True when a queue key addresses this endpoint: it names the endpoint, a provider serving it, or a provider name on it. */
 function keyAddressesEndpoint(key: string, providers: Record<string, any>, baseUrl: string): boolean {
 	return matchingProviders(key, providers).some((name) => providers[name]?.baseUrl === baseUrl);
@@ -110,7 +115,7 @@ export function reconcileStarterKeys(
 		// An endpoint an entry already addresses — its own key, a provider-name key naming it, or a
 		// Group's match — is queued (or disabled on purpose); adding the baseUrl key would split it
 		// into a second queue and take the Slot away from the user's entry.
-		const covered = keys.some((key) => [key, ...(queues[key]?.match ?? [])].some((member) => keyAddressesEndpoint(member, providers, baseUrl)));
+		const covered = keys.some((key) => membersOf(key, queues[key]).some((member) => keyAddressesEndpoint(member, providers, baseUrl)));
 		if (!covered) added.push(baseUrl);
 	}
 	return added.sort();
@@ -142,7 +147,7 @@ export function resolveQueueProviders(
 	const names = new Set<string>();
 	for (const [key, entry] of Object.entries(queues)) {
 		if (entry?.enabled === false) continue;
-		for (const member of [key, ...(entry?.match ?? [])]) for (const provider of matchingProviders(member, providers)) names.add(provider);
+		for (const member of membersOf(key, entry)) for (const provider of matchingProviders(member, providers)) names.add(provider);
 	}
 	return [...names];
 }
@@ -436,7 +441,7 @@ export default function (pi: ExtensionAPI) {
 		// Queue keys naming no provider in models.json (directly, or through a group's match) (finding 7).
 		for (const [key, entry] of Object.entries(queues)) {
 			if (entry?.enabled === false) continue;
-			if (![key, ...(entry?.match ?? [])].some((k) => matchingProviders(k, modelsJson).length))
+			if (!membersOf(key, entry).some((k) => matchingProviders(k, modelsJson).length))
 				ctx.ui.notify(`pi-llm-queue: queue key "${key}" names no provider in models.json`, "warning");
 		}
 
