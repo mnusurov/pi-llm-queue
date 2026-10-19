@@ -250,7 +250,9 @@ read once at connect and are the fields that need a pi restart.
   per pi process, so the OS closing it is the "last pi is gone" signal, crash-safe by construction;
   there is no `bye`/`shutdown` op. `> 0` is an opt-in relaunch grace (a session restarting within
   it keeps the warm daemon, and a counted reconnect cancels the pending exit); set it high to keep
-  the daemon resident. A daemon that starts with no client arms the same timer with a 30 s floor, so
+  the daemon resident (the daemon clamps the delay to `setTimeout`'s 2^31-1 cap, ~24.8 days, so an
+  unclamped "a year" cannot become the 1 ms exit Node coerces it to). A daemon that starts with no
+  client arms the same timer with a 30 s floor, so
   a spawn whose client never arrives does not linger.
 - Recommended pi setting while queued requests queue up behind a long prefill:
   `httpIdleTimeoutMs: 900000`.
@@ -275,8 +277,11 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-starter-empty.test.ts` | (top-level test) creates no config when every endpoint is cloud or native-owned                                                                                             |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
-`waitForDaemon`, `sleep`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,
-`closeAllClients`) — without that cleanup `node --test` hangs. Assertions go through the JSON-line
+`waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,
+`closeAllClients`) — without that cleanup `node --test` hangs. `startDaemon` injects
+`daemonIdleExitMs: 1e9` into a config that omits it, so suites that reuse one daemon across
+connection gaps are not exited by the production default of 0 (#60); the lifetime and idle-exit
+suites set the field explicitly. Assertions go through the JSON-line
 protocol and the extension's public seams only, never daemon module internals. `make e2e`
 (`node scripts/e2e-two-sessions.mjs`) is the human-run tracer bullet: two real pi sessions against
 a stub endpoint, asserting zero request overlap.

@@ -31,7 +31,8 @@ That single command is the whole install:
 2. **Daemon autostart** — the extension spawns the daemon on demand: on the client's first socket
    op (an acquire, a beat, a status poll), not at session start, and again whenever the socket has
    to be re-established. Detached, `stdio` ignored (`~/.pi/agent/llm-queue.sock`, stale-socket
-   reclaim, exit the moment the last counted client leaves — a `status` poller is not counted, #60).
+   reclaim, exit the moment the last counted client leaves — a `status`-only connection (an
+   Observer) is not counted, #60).
    Nothing to run manually, no launch agent, no
    systemd unit — and no stderr to read afterwards, which is why `logFile` is the durable record.
 3. **Config file** — `~/.pi/agent/llm-queue.json` is created for you on the first launch, and an
@@ -124,7 +125,7 @@ to upgrade pi-llm-queue instead of failing silently.
 | `failOpen` | `true` | Daemon unreachable → pass through. `false` → hard-error. `defaults` only. |
 | `queueTimeoutMs` | unlimited | Parent queue-wait warning threshold → visible warning, stays queued. Child is always unlimited. `defaults` only. The Starter config ships `120000`. |
 | `blockingTools` | `["subagent","subagent_wait","bg_wait","ask_user","contact_supervisor","intercom"]` | Tools that park the run on another agent or the user: the run-scoped keyed beat pauses while one is in flight, so a parked holder yields the slot to the agent it waits on (ADR 0003). Add a custom waiting tool here. `defaults` only. |
-| `daemonIdleExitMs` | `0` | Daemon self-exit after the last **counted** client disconnects: `0` exits at once, so daemon lifetime = the live pi processes' lifetimes and a daemon code change needs no manual kill (the next pi op autostarts a fresh daemon). A connection is counted from its first state-touching op (`acquire`/`renew`/`role`/`cancel`); a `status`-only connection (an observer, a dashboard) is invisible to it. `> 0` is an opt-in relaunch grace; set it high to keep the daemon resident. `defaults` only. |
+| `daemonIdleExitMs` | `0` | Daemon self-exit after the last **counted** client disconnects: `0` exits at once, so daemon lifetime = the live pi processes' lifetimes and a daemon code change needs no manual kill (the next pi op autostarts a fresh daemon). A connection is counted from its first state-touching op (`acquire`/`renew`/`role`/`cancel`); a `status`-only connection (an Observer — a dashboard, a monitoring script) is invisible to it. `> 0` is an opt-in relaunch grace; set it high to keep the daemon resident (clamped to `setTimeout`'s 2^31-1 cap, ~24.8 days). `defaults` only. |
 | `logFile` | — (no file) | Daemon event log path: one JSON line per queue event — `grant`, `switch`, `queued`, `release` (`reason: "idle"` for an idle yield), `evict` (`reason: "ttl"` for a TTL reclaim) — each carrying `event`, `queueKey`, `sessionKey`, `role`, `ts` (+ `reason`). Best-effort: an unwritable path leaves the daemon serving. `defaults` only. |
 
 **`enabled: false` precedence.** A baseUrl (endpoint) key wins over a provider-name key naming the
@@ -224,7 +225,7 @@ session switch on release are implemented (#3); the session-switch quanta (#3) w
 `/queue` status (slot holder, per-tier queue depth, session-switch counts) and JSON status — is
 implemented. Fail-open hardening + idle-exit (#8) — `failOpen` (default true), the `queueTimeoutMs`
 parent queue-wait warning (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
-the daemon now exits with the last counted client and a `status` poller no longer keeps it alive (#60);
+the daemon now exits with the last counted client and an Observer polling `status` no longer keeps it alive (#60);
 packaging + docs (#9) — npm package, versioned config schema validation, install/config/env/dev docs —
 is implemented; e2e cache-warmth validation (#10) is human-run; the auto-starter (#37/#38) — a
 starter `llm-queue.json` generated from `models.json` on first launch — is implemented. Idle-yield

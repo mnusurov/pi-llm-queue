@@ -78,17 +78,19 @@ const queues = new Map();
 // fresh daemon. A `> 0` value is an opt-in relaunch grace (a session restarting keeps the warm
 // daemon); a huge value keeps the daemon resident. A `status`-only connection is never counted, so
 // an observer polling every 2 s cannot defeat the exit.
-let clientCount = 0;
+let countedClients = 0;
 let idleTimer = null;
 function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 	if (!isFinite(ms)) return;
 	clearTimeout(idleTimer);
+	// setTimeout coerces a delay past 2^31-1 (~24.8 days) to 1 ms, which would make "set it high to
+	// keep the daemon resident" exit at once — the exact inverse. Clamp to the largest real delay.
 	idleTimer = setTimeout(() => {
 		try {
 			unlinkSync(socketPath);
 		} catch {}
 		process.exit(0);
-	}, ms);
+	}, Math.min(ms, 2147483647));
 	idleTimer.unref();
 }
 
@@ -98,7 +100,7 @@ function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 function countClient(conn) {
 	if (conn.counted) return;
 	conn.counted = true;
-	clientCount++;
+	countedClients++;
 	if (idleTimer) {
 		clearTimeout(idleTimer);
 		idleTimer = null;
@@ -233,7 +235,7 @@ function handle(msg, conn) {
 	}
 	// Lifetime (#60): the ops that can change queue state make this connection a counted client.
 	// `status` (and `release`, which can only free what an acquire already reserved) changes nothing
-	// that a poller should be keeping alive, so observers stay invisible to the daemon's lifetime.
+	// an Observer should be keeping alive, so Observers stay invisible to the daemon's lifetime.
 	if (msg.op === "acquire" || msg.op === "renew" || msg.op === "role" || msg.op === "cancel") countClient(conn);
 	// Every keyed op is resolved through groups first: a group's members all address one queue.
 	// Replies always echo the key the client asked with — clients match replies on their own key.
@@ -370,7 +372,7 @@ function cleanup(conn) {
 	conn.cleaned = true;
 	for (const lease of [...(conn.leases ?? [])]) release(queueFor(lease.queueKey), lease.sessionKey);
 	for (const w of [...(conn.queued ?? [])]) remove(w.queue.waiting, w);
-	if (conn.counted && --clientCount <= 0) scheduleIdleExit();
+	if (conn.counted && --countedClients <= 0) scheduleIdleExit();
 }
 
 // Two sessions can autostart at once: the loser finds the socket taken and stands down.

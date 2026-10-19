@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, exited, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -816,12 +816,6 @@ describe("daemon idle-exit", () => {
 		stopAllDaemons();
 	});
 
-	const exited = (proc: import("node:child_process").ChildProcess, ms: number) =>
-		new Promise<boolean>((resolve) => {
-			proc.once("exit", () => resolve(true));
-			setTimeout(() => resolve(false), ms);
-		});
-
 	it("self-terminates after daemonIdleExitMs once the last client disconnects", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 300 }, queues: {} });
 		const c = await connectClient(d.socketPath);
@@ -858,12 +852,6 @@ describe("daemon lifetime: counted clients and status invisibility (#60)", () =>
 		stopAllDaemons();
 	});
 
-	const exited = (proc: import("node:child_process").ChildProcess, ms: number) =>
-		new Promise<boolean>((resolve) => {
-			proc.once("exit", () => resolve(true));
-			setTimeout(() => resolve(false), ms);
-		});
-
 	/** A counted client: its acquire is a state-touching op, so the daemon counts it as a client. */
 	const counted = async (socketPath: string, sessionKey: string) => {
 		const c = await connectClient(socketPath);
@@ -898,6 +886,22 @@ describe("daemon lifetime: counted clients and status invisibility (#60)", () =>
 		assert.ok(!(await exited(d.proc, 1000)), "the holder's open counted connection keeps the daemon alive");
 		holder.close();
 		assert.ok(await exited(d.proc, 2000), "the daemon exits with the last counted client");
+	});
+
+	it("counts a bare renew heartbeat, the extension's keeper of a live pi process", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 0 }, queues: {} });
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "renew" }); // the extension's connection-wide heartbeat: no lease, no queue state touched
+		assert.ok(!(await exited(d.proc, 1000)), "a bare renew counts the connection, so a live pi keeps the daemon");
+		c.close();
+		assert.ok(await exited(d.proc, 2000), "and the daemon exits when that pi is gone");
+	});
+
+	it("a resident value past setTimeout's 2^31-1 cap does not exit at once", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 31536000000 }, queues: {} });
+		const c = await counted(d.socketPath, "A");
+		c.close();
+		assert.ok(!(await exited(d.proc, 1000)), "Node coerces an unclamped delay past 2^31-1 to 1 ms: \"set it high\" must mean resident, not instant exit");
 	});
 
 	it("the documented default (no daemonIdleExitMs) exits at once and frees the socket", async () => {

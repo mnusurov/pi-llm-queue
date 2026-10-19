@@ -124,7 +124,8 @@ describe("config schema validation", () => {
 	});
 
 	// #60: the documented default is 0 (exit the moment the last counted client leaves), so 0 must
-	// be expressible; a JSON config cannot carry Infinity, so "never exit" is a large value.
+	// be expressible; a JSON config cannot carry Infinity, so "never exit" is a large value (the
+	// daemon clamps it to setTimeout's 2^31-1 cap — see the daemon-seam test).
 	it("accepts daemonIdleExitMs 0 (the #60 default) and a large resident value", () => {
 		assert.deepEqual(validateConfig({ defaults: { daemonIdleExitMs: 0 } }), []);
 		assert.deepEqual(validateConfig({ defaults: { daemonIdleExitMs: 31536000000 } }), []);

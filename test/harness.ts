@@ -57,6 +57,13 @@ export function startDaemon(config: Record<string, any> = { defaults: { maxStrea
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** True when the daemon process exits within ms, false if it is still alive after that. */
+export const exited = (proc: ChildProcess, ms: number) =>
+	new Promise<boolean>((resolve) => {
+		proc.once("exit", () => resolve(true));
+		setTimeout(() => resolve(false), ms);
+	});
+
 export interface Client {
 	send(msg: unknown): void;
 	/** Next message from the daemon, rejecting if none arrives within ms. */
