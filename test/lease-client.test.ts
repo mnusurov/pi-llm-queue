@@ -396,7 +396,7 @@ describe("daemon autostart", () => {
 
 	it("starts the daemon detached on demand", async () => {
 		const lease = new LeaseClient({ socketPath, daemonPath: DAEMON, configPath });
-		assert.equal((await lease.status()).op, "status");
+		assert.equal((await lease.status())?.op, "status");
 		lease.close();
 	});
 
@@ -406,7 +406,7 @@ describe("daemon autostart", () => {
 		spawnSync("pkill", ["-f", socketPath]);
 		await sleep(300);
 		const lease = new LeaseClient({ socketPath, daemonPath: DAEMON, configPath });
-		assert.equal((await lease.status()).op, "status");
+		assert.equal((await lease.status())?.op, "status");
 		lease.close();
 	});
 });
