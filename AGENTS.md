@@ -10,6 +10,14 @@ with `gh pr merge --squash`; the remote head branch is auto-deleted (repo
 setting), so `--delete-branch` is not needed. Push straight to `main` is not a
 path to integration.
 
+`gh pr merge` is silent on a pipe: done when
+`gh pr view <n> --json state -q .state` returns `MERGED`.
+
+Work committed on local `main` moves to a branch before it reaches the remote:
+
+    git switch -c <branch> && git push -u origin <branch>
+    git branch -f main origin/main
+
 After merging, clean up the local branch from `main`:
 
     git checkout main && git pull --prune
