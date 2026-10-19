@@ -102,7 +102,7 @@ function keyAddressesEndpoint(key: string, providers: Record<string, any>, baseU
  * tuned or `enabled: false`, is left alone, and a cloud endpoint is never added, so the file's own
  * choices always win and a deliberate passthrough stays a deliberate passthrough.
  */
-export function reconcileStarterKeys(
+function reconcileStarterKeys(
 	providers: Record<string, any>,
 	queues: Record<string, QueueEntry>,
 	isNativeOwned: (name: string) => boolean,
