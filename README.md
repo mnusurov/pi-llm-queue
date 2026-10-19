@@ -182,7 +182,7 @@ was granted with until it releases the Slot.
   (`agent_start` → `agent_settled`), lease with TTL, released on settle.
 - Leases are per session, keyed by `options.sessionId` (#53): a process running a Parent and its
   Children holds one Lease each, and those sessions queue against each other.
-- Priority: interactive parent > subagent child, with aging anti-starvation.
+- Tiers: parent (interactive) above child (subagent), with aging anti-starvation.
 - No preemption (ADR 0002): a live holder keeps the slot until it releases it, aborts,
   disconnects, its TTL lapses, or it is idle-yielded under contention (ADR 0003); a switch
   always re-prefills the KV cache.

@@ -18,7 +18,7 @@ JSON. Every message is one JSON object on a single line.
 queue that silently holds a slot. The reply is `{"op":"error","reason":"... requires queueKey"}`.
 
 `acquire` is the only request that may stay unanswered: while the queue's slots are taken the
-request sits in the priority waiting list and the grant arrives when a slot frees. A client that
+request sits in the tier-ordered waiting list and the grant arrives when a slot frees. A client that
 disconnects while queued is dropped from the queue (that is how Esc aborts feel immediate), and
 a disconnect that held a slot releases it. A client can also send `cancel` to drop its own
 queued request without closing the socket — this is how Esc cancels a request that is still
@@ -59,7 +59,7 @@ The slot is held per session across a whole run, and **a live holder is never pr
   `cancel` for a request that is still queued;
 - **disconnect** — the socket dies: the daemon releases every lease it held and drops every
   request it had queued (a killed session and a closed laptop look the same from here);
-- **TTL expiry** — the client stopped heartbeating, i.e. it died: a session killed mid-stream, a
+- **TTL lapse** — the client stopped heartbeating, i.e. it died: a session killed mid-stream, a
   process that vanished, a heartbeat starved by a tool that blocks the event loop;
 - **idle yield** (ADR 0003) — an activity-flagged holder sent no keyed beat for `idleYieldMs`
   and a waiter is queued: the daemon releases the slot and grants the next waiter. A lone holder
@@ -181,11 +181,11 @@ keeps the last good config.
   queue, not by the wrap set. Write the disable on the key that owns the endpoint: the endpoint
   key, or the group that names it.
 - **`match`** — an explicit resource group, overriding baseUrl keying:
-  - **merge**: members (baseUrls and/or provider names) share the group's slot pool. The
+  - **merge**: members (baseUrls and/or provider names) share the group's slot set. The
     extension keys a grouped model's requests by the group name; a raw socket client naming a
     member baseUrl is resolved to the first group whose `match` names it.
   - **split**: a group naming one provider of an endpoint shared by several providers gives
-    that provider its own slot pool (`match: ["strata"]` beside `match: ["llama"]` on one
+    that provider its own slot set (`match: ["strata"]` beside `match: ["llama"]` on one
     server). Splitting needs provider identity, so it works through the extension's key, not
     through a raw baseUrl.
   - **precedence**: a group naming the model's provider exactly owns it, ahead of a group naming
@@ -196,7 +196,7 @@ keeps the last good config.
 The daemon watches `llm-queue.json` (250 ms debounce, directory watch so atomic saves keep
 working), re-applies queue policy to live queues, and rebuilds them through the reloaded
 groups — holders and waiters move with their queue, so an endpoint never ends up with two
-slot pools. A widened `maxStreams` grants waiting sessions at once. The extension watches the
+slot sets. A widened `maxStreams` grants waiting sessions at once. The extension watches the
 same file and re-resolves its wrapped provider set (registering new providers, unregistering
 removed ones). A half-written file keeps the last good config. No daemon or pi restart is
 needed; `leaseTtlMs` on the client side (heartbeat period), `failOpen` and `queueTimeoutMs` are

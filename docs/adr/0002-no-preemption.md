@@ -12,8 +12,8 @@ unconditional TTL eviction.
 
 The daemon preempted a live holder mid-run whenever a waiter was queued, on three quanta:
 `idleQuantumMs` (120 s of no model request), `monopolyRequests` (12 requests) and `monopolyMs`
-(180 s of unbroken monopoly). Observed in a 2-worker parallel workflow (session 01a14ee4,
-2026-10-18): worker A ran solo, a 121 s tool pause evicted A on the idle quantum, then the
+(180 s of unbroken monopoly). Observed in a 2-child parallel workflow (session 01a14ee4,
+2026-10-18): child A ran solo, a 121 s tool pause evicted A on the idle quantum, then the
 12-request monopoly evicted B, and the slot ping-ponged between the two children 4–6 times in
 20 minutes. Every switch re-prefills the KV cache (~180K input tokens) — exactly the cost the
 queue exists to prevent.
@@ -27,7 +27,7 @@ throughput.
 Remove all three quanta. No forced preemption of a live holder under any role combination.
 
 - **Switch causes.** A slot changes hands only on voluntary release (`agent_settled` + the 3 s
-  grace), an abort, a disconnect, or the TTL expiry of a client that stopped heartbeating. ADR 0003
+  grace), an abort, a disconnect, or the TTL lapse of a client that stopped heartbeating. ADR 0003
   adds the fifth: a daemon-initiated idle-yield of an activity-flagged Holder with Waiters queued.
 - **Sweep is unconditional.** It evicts every lease whose TTL lapsed, whether or not anyone is
   waiting, so `/queue` never reports a ghost holder. ADR 0003 adds a second, gated pass to the same
