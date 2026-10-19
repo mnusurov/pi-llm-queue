@@ -16,3 +16,7 @@ Canonical five-role defaults. See `docs/agents/triage-labels.md`.
 ### Domain docs
 
 Single-context: `GLOSSARY.md` + `docs/adr/` at root. See `docs/agents/domain.md`.
+
+### LLM queue
+
+All LLM access goes through pi-llm-queue: one model slot, serialized. When delegating, run implementers one at a time and set child `timeoutMs` to include queue wait — a long queue wait is normal, not a hang.
