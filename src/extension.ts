@@ -12,7 +12,7 @@ import type {
 	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LeaseClient, type Role, type AcquireReason } from "./lease-client.ts";
+import { LeaseClient, type Role, type AcquireReason, type StatusSession } from "./lease-client.ts";
 import { loadValidConfig, readJson, groupKeyFor, queueEntryFor, SCHEMA_VERSION } from "./config.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
@@ -377,9 +377,12 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("pi-llm-queue: daemon unreachable", "info");
 				return;
 			}
-			const lines = s.queues.map((q: any) => {
-				const depth = (role: string) => q.waiting.filter((w: any) => w.role === role).length;
-				return `${q.queueKey}: slot ${q.holders.join(", ") || "free"} (${q.holders.length}/${q.maxStreams === null ? "passthrough" : q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")} · switches ${q.switches}`;
+			// A session reads as `id tier [group]`: the tier it holds or queues as, and its group label.
+			const named = (entry: StatusSession) => `${entry.sessionKey} ${entry.role}${entry.group ? ` ${entry.group}` : ""}`;
+			const lines = s.queues.map((q) => {
+				const depth = (role: Role) => q.waiting.filter((w) => w.role === role).length;
+				const waiters = q.waiting.map(named).join(", ");
+				return `${q.queueKey}: slot ${q.holders.map(named).join(", ") || "free"} (${q.holders.length}/${q.maxStreams === null ? "passthrough" : q.maxStreams}) · waiting parent ${depth("parent")}, child ${depth("child")}${waiters ? ` (${waiters})` : ""} · switches ${q.switches}`;
 			});
 			ctx.ui.notify(lines.length ? lines.join("\n") : "pi-llm-queue: no queues", "info");
 		},

@@ -104,10 +104,11 @@ function queueFor(key) {
 	return queues.get(queueKey);
 }
 
-// A lease is the holder's record: its TTL deadline. The same object lives in conn.leases, so a
-// client heartbeat refreshes it in place.
-function newLease(queue, sessionKey, conn, activity) {
-	return { queueKey: queue.queueKey, sessionKey, conn, expires: Date.now() + queue.ttlMs, activity: !!activity, lastActivityAt: Date.now() };
+// A lease is the holder's record: its TTL deadline, plus the tier it was acquired with and the
+// group label it came in with, so `status` can report a Holder by tier and label and not only by
+// session id. The same object lives in conn.leases, so a client heartbeat refreshes it in place.
+function newLease(queue, sessionKey, conn, activity, role, group) {
+	return { queueKey: queue.queueKey, sessionKey, conn, role, group, expires: Date.now() + queue.ttlMs, activity: !!activity, lastActivityAt: Date.now() };
 }
 
 function leaseOf(queue, sessionKey) {
@@ -135,7 +136,7 @@ function grantNext(queue) {
 		const waiter = pickNext(queue);
 		remove(queue.waiting, waiter);
 		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
-		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity);
+		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity, waiter.role, waiter.group);
 		queue.holders.push(lease);
 		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
 		remove(waiter.conn.queued, waiter);
@@ -197,7 +198,7 @@ function handle(msg, conn) {
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
-				const lease = newLease(queue, msg.sessionKey, conn, msg.activity);
+				const lease = newLease(queue, msg.sessionKey, conn, msg.activity, msg.role ?? "parent", msg.group);
 				queue.holders.push(lease);
 				conn.leases.push(lease);
 				// A direct grant counts toward the parent-grant streak too: a parent that never
@@ -263,7 +264,9 @@ function handle(msg, conn) {
 					queueKey: q.queueKey,
 					maxStreams: q.maxStreams,
 					switches: q.switches,
-					holders: q.holders.map((l) => l.sessionKey),
+					// Holders are reported like Waiters: a raw client reads tier and group from the
+					// reply, so it needs no extension-side parsing to build a dashboard.
+					holders: q.holders.map((l) => ({ sessionKey: l.sessionKey, role: l.role, group: l.group })),
 					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role, group: w.group })),
 				})),
 			});
