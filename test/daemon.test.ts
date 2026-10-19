@@ -40,9 +40,10 @@ describe("daemon socket protocol", () => {
 
 });
 
-// Lease lifecycle: TTL reclaim, heartbeat, and no preemption. Asserted through
-// the socket seam only. Daemons/clients are registered for cleanup so a failing assert
-// cannot leave them alive and hang the runner.
+// Lease lifecycle: TTL reclaim, heartbeat, and no preemption. The scheduling families moved to
+// memory (test/scheduler.test.ts); this file keeps the socket smokes that pin the wire path (the
+// daemon process, the sweep timer, the config schema rejection). Daemons/clients are registered for
+// cleanup so a failing assert cannot leave them alive and hang the runner.
 describe("lease lifecycle and no preemption", () => {
 	const daemons: Daemon[] = [];
 	const clients: Client[] = [];
@@ -182,6 +183,26 @@ describe("tier ordering (parent > child) and aging", () => {
 
 		release(h, "H");
 		assert.deepEqual(await child.next(3000), granted("C"), "aged child jumps ahead of the parent");
+	});
+
+	it("re-tiers a queued waiter over the socket (the role op)", async () => {
+		// The role op's wire smoke (its in-memory counterpart is the promote test in scheduler.test.ts):
+		// the op is accepted over the socket and re-tiers a live queued waiter in place, no reply.
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		daemons.push(d);
+		const h = await open(d);
+		const child = await open(d);
+		const parent = await open(d);
+
+		acquire(h, "H", "parent");
+		assert.deepEqual(await h.next(3000), granted("H"));
+		acquire(child, "C", "child");
+		acquire(parent, "P", "parent");
+		await assert.rejects(child.next(200), /no message from daemon within/, "as a child, C queues behind P");
+
+		child.send({ op: "role", sessionKey: "C", role: "parent" }); // /queue promote: re-tier the queued waiter, no reply
+		release(h, "H");
+		assert.deepEqual(await child.next(3000), granted("C"), "promoted, C leads the parent tier (it enqueued first)");
 	});
 
 });

@@ -183,8 +183,14 @@ describe("idle yield (in memory)", () => {
 		const reacquire = h.acquire(a, "A", { role: "parent", activity: true });
 		assert.equal(reacquire.granted, false, "the yielded holder re-queues behind the new holder");
 
-		h.release(b, "B");
-		assert.deepEqual(h.grantedSessions(a), ["A", "A"], "the re-queued holder is granted on release");
+		// Assert the re-queue Grant specifically: the release's decision list carries exactly the
+		// handover grant to A, not A's earlier (pre-yield) grant from the cumulative capture.
+		const handover = h.release(b, "B");
+		assert.deepEqual(
+			handover.filter((d) => d.type === "grant").map((d) => d.sessionKey),
+			["A"],
+			"the re-queued holder is granted on release",
+		);
 	});
 
 	it("idle-yield counts as a switch in status", () => {

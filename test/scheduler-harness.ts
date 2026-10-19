@@ -10,6 +10,9 @@ import { Scheduler } from "../src/scheduler.js";
 
 export const QUEUE_KEY = "http://model.test/v1";
 export const QUEUE_KEY2 = "http://model.test/v2";
+// The pseudo-connection a sweep's connId-less decisions (a TTL evict, an idle release) route to, so
+// capture() has one routing rule for every entry (the sweep has no triggering actor connection).
+const SYSTEM = "__system__";
 
 export interface Policy {
 	maxStreams?: number;
@@ -49,8 +52,6 @@ export class SchedulerHarness {
 	// connId -> decisions routed to that connection (grants/queued carry the connId; release/evict/
 	// switch carry none and are routed to the actor that triggered the entry, or to SYSTEM on a sweep).
 	private byConn = new Map<string, Decision[]>();
-	// Decisions a sweep produced that carry no connId (a TTL evict, an idle release).
-	private system: Decision[] = [];
 
 	constructor(policy: Policy | ((queueKey: string) => Policy) = {}) {
 		const resolve = typeof policy === "function" ? policy : () => policy;
@@ -114,14 +115,11 @@ export class SchedulerHarness {
 	}
 
 	// The sweep, run at an explicit instant. Returns every decision it produced; grants/queued are
-	// routed to their connId, evict/release (no connId) land in the system bucket.
+	// routed to their connId, evict/release (no connId) land in the SYSTEM bucket via capture.
 	sweepAt(now = this.now): Decision[] {
 		this.now = now;
 		const decisions = this.scheduler.sweepAt(now);
-		for (const d of decisions) {
-			if (d.connId) this.push(d.connId, d);
-			else this.system.push(d);
-		}
+		this.capture(SYSTEM, decisions);
 		return decisions;
 	}
 
@@ -147,7 +145,7 @@ export class SchedulerHarness {
 		return (this.snapshot().find((q) => q.queueKey === queueKey)?.holders ?? []).map((h: { sessionKey: string }) => h.sessionKey);
 	}
 	evicts(): Decision[] {
-		return this.system.filter((d) => d.type === "evict");
+		return this.decisionsFor(SYSTEM).filter((d) => d.type === "evict");
 	}
 
 	private capture(actor: string, decisions: Decision[]): void {
