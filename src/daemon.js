@@ -47,7 +47,9 @@ function send(conn, msg) {
 // finished run can be read back from one file — the extension spawns the daemon detached and its
 // stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
 // move it. The queue key logged is the queue that owns the slot: a group's name when the client
-// addressed it by a member key.
+// addressed it by a member key. Callers pass the role off the Lease (or the Waiter, while it is
+// still queued), never off the acquire message: `status` reports the same field, so a reader can
+// never see the log and the reply disagree about the tier a session holds.
 function logEvent(event, queue, sessionKey, role, reason) {
 	const path = defaults.logFile;
 	if (!path) return;
@@ -156,8 +158,8 @@ function grantNext(queue) {
 		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity, waiter.role, waiter.group);
 		queue.holders.push(lease);
 		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
-		logEvent("grant", queue, waiter.sessionKey, waiter.role);
-		logEvent("switch", queue, waiter.sessionKey, waiter.role);
+		logEvent("grant", queue, lease.sessionKey, lease.role);
+		logEvent("switch", queue, lease.sessionKey, lease.role);
 		remove(waiter.conn.queued, waiter);
 		waiter.conn.leases.push(lease);
 		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
@@ -226,14 +228,14 @@ function handle(msg, conn) {
 				// A direct grant counts toward the parent-grant streak too: a parent that never
 				// queues must not starve a queued child past agingAfterSlots.
 				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
-				logEvent("grant", queue, msg.sessionKey, msg.role ?? "parent");
+				logEvent("grant", queue, lease.sessionKey, lease.role);
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
 			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
-			logEvent("queued", queue, msg.sessionKey, msg.role ?? "parent");
+			logEvent("queued", queue, waiter.sessionKey, waiter.role);
 			return;
 		}
 		case "release":
