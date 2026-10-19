@@ -4,7 +4,9 @@ Date: 2026-10-18
 
 ## Status
 
-Accepted (implements #49, supersedes the switch quanta of #3).
+Accepted (implements #49, supersedes the switch quanta of #3). Refined by ADR 0003 (#51): an
+idle-yield adds a fifth Switch cause, and the Sweep gains a gated idle-yield pass beside its
+unconditional TTL eviction.
 
 ## Context
 
@@ -25,9 +27,12 @@ throughput.
 Remove all three quanta. No forced preemption of a live holder under any role combination.
 
 - **Switch causes.** A slot changes hands only on voluntary release (`agent_settled` + the 3 s
-  grace), an abort, a disconnect, or the TTL expiry of a client that stopped heartbeating.
-- **Sweep is TTL-only and unconditional.** It evicts every lease whose TTL lapsed, whether or not
-  anyone is waiting, so `/queue` never reports a ghost holder.
+  grace), an abort, a disconnect, or the TTL expiry of a client that stopped heartbeating. ADR 0003
+  adds the fifth: a daemon-initiated idle-yield of an activity-flagged Holder with Waiters queued.
+- **Sweep is unconditional.** It evicts every lease whose TTL lapsed, whether or not anyone is
+  waiting, so `/queue` never reports a ghost holder. ADR 0003 adds a second, gated pass to the same
+  sweep (idle-yield: `idleYieldMs > 0`, waiters present, activity-flagged leases only); the TTL
+  eviction stays unconditional.
 - **No config surface.** `idleQuantumMs`, `monopolyRequests` and `monopolyMs` are deleted from the
   schema. Pre-release software: no back-compat, no deprecation warning. A config carrying them
   fails validation and the daemon serves defaults, so preemption cannot be re-enabled.
@@ -35,9 +40,10 @@ Remove all three quanta. No forced preemption of a live holder under any role co
   stream ended. With no quanta, the daemon has nothing to gate on: the beat is a TTL refresh and
   its reply is the grant state. `inFlight` and the request counter go with it.
 - **Accepted costs.** A parent may queue indefinitely behind a child (that is the tier contract;
-  `queueTimeoutMs` stays the opt-in parent escape hatch). A live stuck child holds the slot
-  forever — the "hold for the whole run" contract. Escape hatches: stop the child session, close
-  its socket, or let its TTL lapse (a dead client).
+  `queueTimeoutMs` is a warn-only signal, not an escape — a parent past the cap stays queued,
+  ADR 0003). A live stuck child holds the slot forever — the "hold for the whole run" contract.
+  Escape hatches: stop the child session, close its socket, let its TTL lapse (a dead client), or —
+  once it goes idle with someone waiting — let the idle-yield take the slot (ADR 0003).
 - **Unchanged.** Aging, the settle grace, TTL, fail-open, and the `switches` counter.
 
 ## Consequences
