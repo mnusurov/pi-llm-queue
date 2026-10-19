@@ -106,7 +106,7 @@ because only `status` reports group keys. The position it shows is enqueue order
 
 ```json
 {
-  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 60000, "logFile": "/home/marat/.pi/agent/llm-queue.log" },
+  "defaults": { "maxStreams": 1, "policy": "priority-aging", "leaseTtlMs": 30000, "agingAfterSlots": 3, "agingAfterMs": 60000, "failOpen": true, "daemonIdleExitMs": 0, "logFile": "/home/marat/.pi/agent/llm-queue.log" },
   "queues": {
     "http://192.168.1.100:8001/v1": { "maxStreams": 1 },
     "zen": { "maxStreams": 3, "policy": "fifo" },
@@ -130,7 +130,8 @@ Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAft
 `agingAfterMs`, `idleYieldMs` (all also valid in
 `defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
 `failOpen` (default `true`) and `queueTimeoutMs`
-are client-side (`defaults` only); `daemonIdleExitMs` (default `60000`) and `logFile` (no file
+are client-side (`defaults` only); `daemonIdleExitMs` (default `0`, exit at once — see
+Idle-exit) and `logFile` (no file
 until you set a path) are daemon-side (`defaults` only). An optional top-level `schemaVersion` (current: 1) must be a positive
 integer; a newer version is rejected with an "upgrade pi-llm-queue" error. Validation
 (`src/config.js`) reports every violation as a path-named error (`queues.zen.maxStreams must
@@ -239,11 +240,20 @@ read once at connect and are the fields that need a pi restart.
   self-heals; passing through behind a live streaming child would re-create the stampede. A
   child's wait is always unlimited — a subagent never passes through unqueued, which would
   defeat serialisation.
-- Idle-exit: the daemon self-terminates `daemonIdleExitMs` (default 60 s) after the last client
-  disconnects, unlinking its socket, so no orphan process lingers. A client that reconnects
-  within the grace cancels the exit, so a quick relaunch keeps the warm daemon. A daemon that
-  starts with no client arms the same timer, so a spawn whose client never arrives does not linger.
-  Set `daemonIdleExitMs` high to keep the daemon resident.
+- Idle-exit (#60): the daemon self-terminates `daemonIdleExitMs` (default `0` = at once) after the
+  last **counted** client disconnects, unlinking its socket, so daemon lifetime is the union of the
+  live pi processes' lifetimes: every pi restart picks up new daemon code with no manual kill, and
+  the next pi socket op autostarts a fresh daemon. A connection is counted from its first
+  state-touching op (`acquire`, `renew`, `role`, `cancel`) and stops being one when it closes. A
+  `status`-only connection — the queue observer, a dashboard, a monitoring script — changes no
+  queue state, so it never keeps the daemon alive. The extension holds one persistent connection
+  per pi process, so the OS closing it is the "last pi is gone" signal, crash-safe by construction;
+  there is no `bye`/`shutdown` op. `> 0` is an opt-in relaunch grace (a session restarting within
+  it keeps the warm daemon, and a counted reconnect cancels the pending exit); set it high to keep
+  the daemon resident (the daemon clamps the delay to `setTimeout`'s 2^31-1 cap, ~24.8 days, so an
+  unclamped "a year" cannot become the 1 ms exit Node coerces it to). A daemon that starts with no
+  client arms the same timer with a 30 s floor, so
+  a spawn whose client never arrives does not linger.
 - Recommended pi setting while queued requests queue up behind a long prefill:
   `httpIdleTimeoutMs: 900000`.
 
@@ -256,7 +266,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | file                                   | suites                                                                                                                                                                     |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `test/config.test.ts`                  | config schema validation; config file loading                                                                                                                               |
-| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
+| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; daemon lifetime: counted clients and status invisibility (#60); config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
 | `test/daemon-event-log.test.ts`        | daemon event log — the `logFile` seam: the JSON-lines sequence of a handover, every event's fields, a TTL reclaim as `evict` + `reason: "ttl"`, an idle yield as `release` + `reason: "idle"`, an unwritable path that leaves the daemon serving, the path followed across a hot-reload (on, moved, off), no file when `logFile` is unset |
 | `test/lease-client.test.ts`            | lease client; daemon autostart                                                                                                                                              |
 | `test/extension.test.ts`               | provider resolution; queue key resolution; self-hosted endpoint detection; starter config generation; role resolution                                                       |
@@ -267,8 +277,11 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-starter-empty.test.ts` | (top-level test) creates no config when every endpoint is cloud or native-owned                                                                                             |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
-`waitForDaemon`, `sleep`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,
-`closeAllClients`) — without that cleanup `node --test` hangs. Assertions go through the JSON-line
+`waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,
+`closeAllClients`) — without that cleanup `node --test` hangs. `startDaemon` injects
+`daemonIdleExitMs: 1e9` into a config that omits it, so suites that reuse one daemon across
+connection gaps are not exited by the production default of 0 (#60); the lifetime and idle-exit
+suites set the field explicitly. Assertions go through the JSON-line
 protocol and the extension's public seams only, never daemon module internals. `make e2e`
 (`node scripts/e2e-two-sessions.mjs`) is the human-run tracer bullet: two real pi sessions against
 a stub endpoint, asserting zero request overlap.

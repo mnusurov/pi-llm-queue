@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, exited, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -816,15 +816,11 @@ describe("daemon idle-exit", () => {
 		stopAllDaemons();
 	});
 
-	const exited = (proc: import("node:child_process").ChildProcess, ms: number) =>
-		new Promise<boolean>((resolve) => {
-			proc.once("exit", () => resolve(true));
-			setTimeout(() => resolve(false), ms);
-		});
-
 	it("self-terminates after daemonIdleExitMs once the last client disconnects", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 300 }, queues: {} });
 		const c = await connectClient(d.socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" }); // a counted client (#60)
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
 		c.close(); // last client leaves: the idle timer arms
 		assert.ok(await exited(d.proc, 4000), "the daemon exits after daemonIdleExitMs with no clients");
 	});
@@ -832,12 +828,98 @@ describe("daemon idle-exit", () => {
 	it("survives a quick relaunch within the idle grace", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 900 }, queues: {} });
 		const c1 = await connectClient(d.socketPath);
+		c1.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.deepEqual(await c1.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
 		c1.close();
 		await sleep(400); // within the grace window
-		const c2 = await connectClient(d.socketPath); // relaunch cancels the pending exit
+		const c2 = await connectClient(d.socketPath);
+		c2.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" }); // a counted relaunch cancels the pending exit
+		assert.deepEqual(await c2.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		await sleep(600); // past the 900 ms grace the first close armed
 		c2.send({ op: "status" });
 		assert.equal((await c2.next(3000)).op, "status", "the daemon survived the idle grace");
 		c2.close();
+	});
+});
+
+// Daemon lifetime (#60): a connection becomes a counted client at its first state-touching op
+// (acquire, renew, role, cancel). A `status` poll — the queue observer, a dashboard — changes no
+// queue state, so it must not keep the daemon alive. Default daemonIdleExitMs 0: the daemon exits
+// the moment the last counted client closes, so every pi restart picks up new daemon code.
+describe("daemon lifetime: counted clients and status invisibility (#60)", () => {
+	after(() => {
+		closeAllClients();
+		stopAllDaemons();
+	});
+
+	/** A counted client: its acquire is a state-touching op, so the daemon counts it as a client. */
+	const counted = async (socketPath: string, sessionKey: string) => {
+		const c = await connectClient(socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey });
+		return c;
+	};
+
+	it("exits with the last counted client while a status-only observer stays open", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 0 }, queues: {} });
+		const observer = await connectClient(d.socketPath);
+		observer.send({ op: "status" });
+		assert.equal((await observer.next(3000)).op, "status", "the observer polls status every 2 s, as the queue observer does");
+
+		const lease = await counted(d.socketPath, "A");
+		lease.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await lease.next(3000), { op: "ok" });
+		lease.close(); // the last counted client is gone
+
+		assert.ok(await exited(d.proc, 2000), "a status-only connection must not keep the daemon alive");
+	});
+
+	it("stays alive while a counted client stays open, and exits when it closes", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 0 }, queues: {} });
+		const holder = await counted(d.socketPath, "H");
+		const waiter = await connectClient(d.socketPath);
+		waiter.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "W", role: "parent" });
+		await assert.rejects(waiter.next(200), /no message from daemon within/, "W waits behind the holder");
+		waiter.send({ op: "cancel", queueKey: QUEUE_KEY, sessionKey: "W" });
+		waiter.close(); // a counted client leaves, but not the last one
+
+		assert.ok(!(await exited(d.proc, 1000)), "the holder's open counted connection keeps the daemon alive");
+		holder.close();
+		assert.ok(await exited(d.proc, 2000), "the daemon exits with the last counted client");
+	});
+
+	it("counts a bare renew heartbeat, the extension's keeper of a live pi process", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 0 }, queues: {} });
+		const c = await connectClient(d.socketPath);
+		c.send({ op: "renew" }); // the extension's connection-wide heartbeat: no lease, no queue state touched
+		assert.ok(!(await exited(d.proc, 1000)), "a bare renew counts the connection, so a live pi keeps the daemon");
+		c.close();
+		assert.ok(await exited(d.proc, 2000), "and the daemon exits when that pi is gone");
+	});
+
+	it("a resident value past setTimeout's 2^31-1 cap does not exit at once", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 31536000000 }, queues: {} });
+		const c = await counted(d.socketPath, "A");
+		c.close();
+		assert.ok(!(await exited(d.proc, 1000)), "Node coerces an unclamped delay past 2^31-1 to 1 ms: \"set it high\" must mean resident, not instant exit");
+	});
+
+	it("the documented default (no daemonIdleExitMs) exits at once and frees the socket", async () => {
+		// Spawned directly, not through the harness: the harness opts the suite out of the default.
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-60-"));
+		const socketPath = join(dir, "queue.sock");
+		const configPath = join(dir, "config.json");
+		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
+		const proc = spawn(process.execPath, [DAEMON, "--socket", socketPath, "--config", configPath], { stdio: "ignore" });
+		proc.unref();
+		const c = await connectClient(socketPath);
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		c.close();
+
+		assert.ok(await exited(proc, 2000), "the default is exit at once, not a 60 s grace");
+		assert.equal(existsSync(socketPath), false, "the exit unlinks the socket, so the next op autostarts a fresh daemon");
+		proc.kill();
 	});
 });
 

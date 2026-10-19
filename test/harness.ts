@@ -31,11 +31,15 @@ export function closeAllClients(): void {
 	sockets.length = 0;
 }
 
-export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown, modelsJsonPath?: string, sweepMs?: number): Daemon {
+export function startDaemon(config: Record<string, any> = { defaults: { maxStreams: 1 }, queues: {} }, modelsJson?: unknown, modelsJsonPath?: string, sweepMs?: number): Daemon {
 	const dir = mkdtempSync(join(tmpdir(), "llm-queue-"));
 	const socketPath = join(dir, "queue.sock");
 	const configPath = join(dir, "config.json");
-	writeFileSync(configPath, JSON.stringify(config));
+	// The production default (0, #60) exits the daemon the moment its last counted client closes;
+	// suites that reuse a daemon across connection gaps opt out here. Idle-exit/lifetime tests set
+	// the field explicitly. 1e9 ms ≈ 11 days, and JSON cannot carry Infinity.
+	const merged = { ...config, defaults: { daemonIdleExitMs: 1e9, ...(config.defaults ?? {}) } };
+	writeFileSync(configPath, JSON.stringify(merged));
 	const args = [DAEMON, "--socket", socketPath, "--config", configPath, ...(sweepMs ? ["--sweep-ms", String(sweepMs)] : [])];
 	if (modelsJsonPath) {
 		// A catalog path the daemon must survive not having (models.json is optional for pi).
@@ -52,6 +56,13 @@ export function startDaemon(config: unknown = { defaults: { maxStreams: 1 }, que
 }
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** True when the daemon process exits within ms, false if it is still alive after that. */
+export const exited = (proc: ChildProcess, ms: number) =>
+	new Promise<boolean>((resolve) => {
+		proc.once("exit", () => resolve(true));
+		setTimeout(() => resolve(false), ms);
+	});
 
 export interface Client {
 	send(msg: unknown): void;

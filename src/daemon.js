@@ -72,22 +72,39 @@ function logEvent(event, queue, sessionKey, role, reason) {
 
 const queues = new Map();
 
-// Idle-exit: the daemon self-terminates `daemonIdleExitMs` after the last client disconnects,
-// so no orphan lingers. A client that reconnects within the grace cancels the exit, so quick
-// relaunches (a session restarting) keep the warm daemon. `Infinity` disables idle-exit.
-let clientCount = 0;
+// Idle-exit (#60): the daemon self-terminates `daemonIdleExitMs` after the last counted client
+// disconnects. The default is 0 — exit at once — so daemon lifetime is the union of the live pi
+// processes' lifetimes and a code change needs no manual kill: the next pi socket op autostarts a
+// fresh daemon. A `> 0` value is an opt-in relaunch grace (a session restarting keeps the warm
+// daemon); a huge value keeps the daemon resident. A `status`-only connection is never counted, so
+// an observer polling every 2 s cannot defeat the exit.
+let countedClients = 0;
 let idleTimer = null;
-function scheduleIdleExit() {
-	const ms = defaults.daemonIdleExitMs ?? 60000;
+function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 	if (!isFinite(ms)) return;
 	clearTimeout(idleTimer);
+	// setTimeout coerces a delay past 2^31-1 (~24.8 days) to 1 ms, which would make "set it high to
+	// keep the daemon resident" exit at once — the exact inverse. Clamp to the largest real delay.
 	idleTimer = setTimeout(() => {
 		try {
 			unlinkSync(socketPath);
 		} catch {}
 		process.exit(0);
-	}, ms);
+	}, Math.min(ms, 2147483647));
 	idleTimer.unref();
+}
+
+// A connection joins the client count at its first state-touching op and leaves it on close. The
+// extension holds one persistent connection per pi process, so the OS closes it on pi exit and on
+// pi crash alike: socket close is the "last pi is gone" signal, crash-safe by construction.
+function countClient(conn) {
+	if (conn.counted) return;
+	conn.counted = true;
+	countedClients++;
+	if (idleTimer) {
+		clearTimeout(idleTimer);
+		idleTimer = null;
+	}
 }
 
 // Queue keys are endpoint baseUrls. A provider-name key applies to that provider's
@@ -216,6 +233,10 @@ function handle(msg, conn) {
 		send(conn, { op: "error", reason: `${msg.op} requires queueKey` });
 		return;
 	}
+	// Lifetime (#60): the ops that can change queue state make this connection a counted client.
+	// `status` (and `release`, which can only free what an acquire already reserved) changes nothing
+	// an Observer should be keeping alive, so Observers stay invisible to the daemon's lifetime.
+	if (msg.op === "acquire" || msg.op === "renew" || msg.op === "role" || msg.op === "cancel") countClient(conn);
 	// Every keyed op is resolved through groups first: a group's members all address one queue.
 	// Replies always echo the key the client asked with — clients match replies on their own key.
 	const requestedKey = msg.queueKey;
@@ -316,11 +337,6 @@ function handle(msg, conn) {
 const server = createServer((conn) => {
 	conn.leases = [];
 	conn.queued = [];
-	clientCount++;
-	if (idleTimer) {
-		clearTimeout(idleTimer);
-		idleTimer = null;
-	}
 	let buffer = "";
 	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the key.
 	const decoder = new TextDecoder("utf8");
@@ -356,7 +372,7 @@ function cleanup(conn) {
 	conn.cleaned = true;
 	for (const lease of [...(conn.leases ?? [])]) release(queueFor(lease.queueKey), lease.sessionKey);
 	for (const w of [...(conn.queued ?? [])]) remove(w.queue.waiting, w);
-	if (--clientCount <= 0) scheduleIdleExit();
+	if (conn.counted && --countedClients <= 0) scheduleIdleExit();
 }
 
 // Two sessions can autostart at once: the loser finds the socket taken and stands down.
@@ -455,5 +471,7 @@ if (configPath) {
 
 start();
 // Arm idle-exit at startup too: a daemon spawned by ensureDaemon whose client never reaches it
-// (connect fails, fail-open) must not hold the socket forever with zero clients.
-scheduleIdleExit();
+// (connect fails, fail-open) must not hold the socket forever with zero clients. The client
+// retries its connect for ~3 s, so the startup arm gets a floor well above that; the first
+// counted op clears it.
+scheduleIdleExit(Math.max(defaults.daemonIdleExitMs ?? 0, 30000));

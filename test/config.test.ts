@@ -123,6 +123,14 @@ describe("config schema validation", () => {
 		assert.deepEqual(validateConfig({ defaults: { logFile: "" } }), ['defaults.logFile must be a non-empty string path (got "")']);
 	});
 
+	// #60: the documented default is 0 (exit the moment the last counted client leaves), so 0 must
+	// be expressible; a JSON config cannot carry Infinity, so "never exit" is a large value (the
+	// daemon clamps it to setTimeout's 2^31-1 cap — see the daemon-seam test).
+	it("accepts daemonIdleExitMs 0 (the #60 default) and a large resident value", () => {
+		assert.deepEqual(validateConfig({ defaults: { daemonIdleExitMs: 0 } }), []);
+		assert.deepEqual(validateConfig({ defaults: { daemonIdleExitMs: 31536000000 } }), []);
+	});
+
 	it("flags a non-object defaults and queue entry", () => {
 		assert.deepEqual(validateConfig({ defaults: [] }), ["defaults must be an object"]);
 		assert.deepEqual(validateConfig({ queues: { zen: [] } }), ["queues.zen must be an object"]);
