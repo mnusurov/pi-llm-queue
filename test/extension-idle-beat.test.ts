@@ -13,20 +13,22 @@ import { QUEUE_KEY, closeAllClients, connectClient, sleep, stopAllDaemons } from
 import { LeaseClient } from "../src/lease-client.ts";
 
 const STUB_API = "stub-idle-api";
+const QUEUE2 = "http://model2.test/v1";
 
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-idle-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 // idleYieldMs 1500 + sweep 200 ms: a beat gap shows up in ~1.5-2.5 s. leaseTtlMs 3000 puts the
 // client beat period at 1000 ms, so a run beats 1-2× per idle window.
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 3000 }, queues: { stub: { maxStreams: 1 } } }));
-writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 3000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 } } }));
+writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] }, stub2: { baseUrl: QUEUE2, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
 
 const { default: extension } = await import("../src/extension.ts");
 
 const model = { api: STUB_API, baseUrl: QUEUE_KEY, provider: "stub", id: "m" } as any;
+const model2 = { api: STUB_API, baseUrl: QUEUE2, provider: "stub2", id: "m" } as any;
 
 function makePi() {
 	const handlers: Record<string, ((e: any, ctx: any) => void)[]> = {};
@@ -60,12 +62,12 @@ const start = (pi: ReturnType<typeof makePi>, sessionId: string) => {
 const firstEvent = (stream: AsyncIterable<any>) => (async () => { for await (const e of stream) return e; })();
 const race = async (p: Promise<unknown>, ms: number) => Promise.race([p.then(() => "done"), sleep(ms).then(() => "blocked")]);
 
-const queueStatus = async () => {
+const queueStatus = async (queueKey = QUEUE_KEY) => {
 	const raw = await connectClient(socketPath);
 	raw.send({ op: "status" });
 	const s = await raw.next(2000);
 	raw.close();
-	return s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
+	return s.queues.find((q: any) => q.queueKey === queueKey);
 };
 
 // Stub api: yields one event and ends. The blocking under test is the lease, not this.
@@ -149,6 +151,41 @@ registerApiProvider(
 		assert.equal(await race(eA, 3000), "done", "the yielded run re-queues and proceeds when the slot frees");
 
 		a.handlers["session_shutdown"][0]({}, ctxA);
+		b.handlers["session_shutdown"][0]({}, ctxB);
+	});
+
+	it("a stream on a second queue does not destroy the run's beat on the first", async () => {
+		// The beat is per held lease: a sessionless request (compaction, classifier) that acquires
+		// a second queue must not replace the run's beat, and its release must not stop it.
+		const a = makePi();
+		const b = makePi();
+		extension(a as any);
+		extension(b as any);
+		const ctxA = start(a, "MQ-A");
+		const ctxB = start(b, "MQ-B");
+		await a.handlers["agent_start"][0]({}, ctxA); // run holds queue 1 → beat starts
+
+		const raw = await connectClient(socketPath);
+		raw.send({ op: "acquire", queueKey: QUEUE2, sessionKey: "RAW-Q2", role: "parent" });
+		assert.equal((await raw.next(3000)).op, "granted", "a raw client holds queue 2");
+
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // queues behind the run on queue 1
+		const eA2 = firstEvent(a.registered["stub2"].streamSimple(model2, {} as any, { sessionId: "MQ-A" } as any)); // queues behind RAW on queue 2
+		await sleep(300);
+		raw.send({ op: "release", queueKey: QUEUE2, sessionKey: "RAW-Q2" }); // the run's queue-2 request lands
+		assert.equal(await race(eA2, 3000), "done", "the queue-2 request streams and releases its own lease");
+		raw.close();
+
+		// 3× idleYieldMs after the queue-2 lease is gone: the run's queue-1 beat must have survived.
+		for (let i = 0; i < 3; i++) {
+			await sleep(1500);
+			const q = await queueStatus();
+			assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["MQ-A"], `the run keeps the queue-1 Slot at ${1500 * (i + 1)} ms`);
+		}
+		assert.equal(await race(eB, 400), "blocked", "the queue-1 waiter stays behind the live run");
+
+		a.handlers["session_shutdown"][0]({}, ctxA);
+		assert.equal(await race(eB, 3000), "done", "B proceeds once A releases");
 		b.handlers["session_shutdown"][0]({}, ctxB);
 	});
 

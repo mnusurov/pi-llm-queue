@@ -213,28 +213,35 @@ export default function (pi: ExtensionAPI) {
 		// True between agent_start and agent_settled: a run owns the slot, so a stream that ends must
 		// not re-arm the grace release the run will re-arm at settle instead.
 		runActive = false;
-		// Run-scoped keyed beat: one per held lease, started at the grant, stopped at release. The
-		// daemon's activity clock advances for the whole live run — streaming and compute tools alike —
-		// and pauses only while a blocking tool is in flight, so idle-yield fires for a Holder parked
-		// on another agent, never for one busy in a tool (#57).
-		private beatTimer: ReturnType<typeof setInterval> | null = null;
+		// Run-scoped keyed beats: one per held lease (keyed by queueKey), started at the grant, stopped
+		// at that lease's release. The daemon's activity clock advances for the whole live run —
+		// streaming and compute tools alike — and pauses only while a blocking tool is in flight, so
+		// idle-yield fires for a Holder parked on another agent, never for one busy in a tool (#57).
+		private readonly beatTimers = new Map<string, ReturnType<typeof setInterval>>();
 		readonly blockingCalls = new Set<string>();
 
 		startBeat(queueKey: string) {
-			this.stopBeat();
-			this.beatTimer = setInterval(() => {
+			this.stopBeat(queueKey);
+			const timer = setInterval(() => {
 				if (this.blockingCalls.size) return; // parked on an agent/user: silence lets idle-yield fire
 				lease.beat(queueKey, this.sessionKey).then((granted) => {
-					if (!granted) this.stopBeat(); // the Slot is gone: the next stream re-queues
+					if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
 				}, () => {});
 			}, heartbeatMs);
-			this.beatTimer.unref();
+			timer.unref();
+			this.beatTimers.set(queueKey, timer);
 		}
 
-		stopBeat() {
-			if (this.beatTimer) {
-				clearInterval(this.beatTimer);
-				this.beatTimer = null;
+		stopBeat(queueKey?: string) {
+			if (queueKey === undefined) {
+				for (const timer of this.beatTimers.values()) clearInterval(timer);
+				this.beatTimers.clear();
+			} else {
+				const timer = this.beatTimers.get(queueKey);
+				if (timer) {
+					clearInterval(timer);
+					this.beatTimers.delete(queueKey);
+				}
 			}
 		}
 		// The run's acquire started at agent_start, still awaiting the grant. pi does not await the
@@ -304,10 +311,12 @@ export default function (pi: ExtensionAPI) {
 
 		release() {
 			this.cancelPendingRelease();
-			this.stopBeat();
+			if (this.heldQueueKey) {
+				this.stopBeat(this.heldQueueKey);
+				lease.release(this.heldQueueKey, this.sessionKey);
+				this.heldQueueKey = null;
+			}
 			this.blockingCalls.clear(); // a lost tool_execution_end must not silence the beat of later runs
-			if (this.heldQueueKey) lease.release(this.heldQueueKey, this.sessionKey);
-			this.heldQueueKey = null;
 		}
 	}
 
@@ -413,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 			} finally {
 				// A run claimed the slot meanwhile (agent_start set heldQueueKey): leave the lease to it.
 				if (selfQueued && state.heldQueueKey !== queueKey) {
-					state.stopBeat(); // stop at release: the beat must not outlive the lease it beats
+					state.stopBeat(queueKey); // stop at release: the beat must not outlive the lease it beats
 					lease.release(queueKey, sessionKey);
 				}
 				// No run is coming to re-arm: this lone request resumed the session, so restart the grace.
