@@ -81,6 +81,12 @@ truth; the price is that the generator writes one more block and reconcile must 
   completely unwrapped — no serialisation, no KV-cache protection, nothing in `/queue`.
 - A Parent's queue wait is bounded by a visible warning at 120 s: a stuck queue surfaces as a
   notify instead of a silent wait behind a long Child generation. Children keep an unbounded wait.
+  The cap is a client-side field read once, when the extension loads its config, and it needs a pi
+  restart to take effect (the protocol doc lists `queueTimeoutMs` with the fields that need one).
+  So the session that CREATES the Starter config is not bounded by the 120 s it just wrote — it
+  loaded no config file, so its own wait is unbounded — and the warning bounds waits from the next
+  pi process onward. A reconcile that adds a Queue key is read by the running session; the cap in
+  the file is not.
 - "Disable" is a config edit (`enabled: false`), not a key deletion; the README documents this.
 - Every file change the extension makes is notified, naming the endpoints it added.
 - Detection is host-based: a self-hosted server reached by a public IP or a non-local hostname is

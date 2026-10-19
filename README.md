@@ -61,8 +61,9 @@ rejection is already reported at session start).
 - **Generated file shape**: `schemaVersion: 1`, one endpoint-keyed `queues` entry per baseUrl
   (deduplicated, sorted), and a `defaults` block containing only the Parent queue-wait cap
   `queueTimeoutMs: 120000` — a Parent's queue wait warns visibly at 120 s and stays queued; Children
-  keep an unbounded wait. Nothing else in `defaults`: every other field stays absent so the schema's
-  own defaults apply (ADR 0001, as amended by #46).
+  keep an unbounded wait. The client reads `queueTimeoutMs` once at startup, so the cap binds from
+  the next pi restart, not for the session that wrote the file. Nothing else in `defaults`: every
+  other field stays absent so the schema's own defaults apply (ADR 0001, as amended by #46).
 
 It is created only when there is at least one self-hosted, non-native endpoint. To disable the queue
 permanently, set every key to `enabled: false` — the stable disable path. Deleting the file is not a
