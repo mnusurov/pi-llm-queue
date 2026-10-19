@@ -4,6 +4,7 @@
   "description": "Pi extension + local daemon that serialises LLM access to protect KV-cache warmth",
   "type": "module",
   "license": "MIT",
+  "author": "Marat Nusurov <mnusurov@gmail.com>",
   "keywords": [
     "pi-package",
     "pi",
