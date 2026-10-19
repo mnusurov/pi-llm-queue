@@ -2,7 +2,7 @@
 // pi-llm-queue daemon: serialises model access per endpoint over a unix socket.
 // Protocol: newline-delimited JSON. See docs/daemon-protocol.md.
 import { createConnection, createServer } from "node:net";
-import { existsSync, readFileSync, unlinkSync, watch } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadValidConfig, groupKeyFor, queueEntryFor } from "./config.js";
 
@@ -41,6 +41,23 @@ if (modelsJsonPath && existsSync(modelsJsonPath)) {
 
 function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
+}
+
+// Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
+// finished run can be read back from one file — the extension spawns the daemon detached and its
+// stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
+// move it. The queue key logged is the queue that owns the slot: a group's name when the client
+// addressed it by a member key.
+function logEvent(event, queue, sessionKey, role, reason) {
+	const path = defaults.logFile;
+	if (!path) return;
+	const line = { event, queueKey: queue.queueKey, sessionKey, role, ts: new Date().toISOString() };
+	if (reason) line.reason = reason;
+	// Best effort, swallowed: a bad path, a full disk or a log rotation race must never take the
+	// daemon down (it is spawned detached, so a crash is silent) nor reject the request that logged.
+	try {
+		appendFileSync(path, `${JSON.stringify(line)}\n`, "utf8");
+	} catch {}
 }
 
 const queues = new Map();
@@ -139,6 +156,8 @@ function grantNext(queue) {
 		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity, waiter.role, waiter.group);
 		queue.holders.push(lease);
 		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
+		logEvent("grant", queue, waiter.sessionKey, waiter.role);
+		logEvent("switch", queue, waiter.sessionKey, waiter.role);
 		remove(waiter.conn.queued, waiter);
 		waiter.conn.leases.push(lease);
 		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
@@ -155,6 +174,9 @@ function release(queue, sessionKey, reason) {
 	if (lease) {
 		remove(queue.holders, lease);
 		remove(lease.conn.leases, lease);
+		// The log names the cause: a TTL reclaim is an evict — the only eviction reason after ADR
+		// 0002 — a yield is a release with reason "idle", a voluntary return a bare release.
+		logEvent(reason === "ttl" ? "evict" : "release", queue, sessionKey, lease.role, reason);
 	}
 	grantNext(queue);
 }
@@ -166,7 +188,7 @@ function release(queue, sessionKey, reason) {
 function sweep() {
 	const now = Date.now();
 	for (const queue of queues.values()) {
-		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey);
+		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey, "ttl");
 		// Idle-yield: an activity-flagged holder silent past idleYieldMs with waiters present yields
 		// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
 		if (queue.idleYieldMs > 0 && queue.waiting.length > 0) {
@@ -204,12 +226,14 @@ function handle(msg, conn) {
 				// A direct grant counts toward the parent-grant streak too: a parent that never
 				// queues must not starve a queued child past agingAfterSlots.
 				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
+				logEvent("grant", queue, msg.sessionKey, msg.role ?? "parent");
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
 			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
+			logEvent("queued", queue, msg.sessionKey, msg.role ?? "parent");
 			return;
 		}
 		case "release":

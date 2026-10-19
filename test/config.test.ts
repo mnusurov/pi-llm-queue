@@ -19,6 +19,7 @@ describe("config schema validation", () => {
 					failOpen: true,
 					queueTimeoutMs: 120000,
 					daemonIdleExitMs: 60000,
+					logFile: "/tmp/queue-events.jsonl",
 				},
 				queues: {
 					"http://gpu.test/v1": { maxStreams: 1, idleYieldMs: 30000 },
@@ -85,20 +86,28 @@ describe("config schema validation", () => {
 	// the daemon serves defaults, so no preemption can be re-enabled from config.
 	it("rejects the removed session-switch quanta as unknown fields", () => {
 		assert.deepEqual(validateConfig({ defaults: { idleQuantumMs: 120000, monopolyRequests: 12, monopolyMs: 180000 } }), [
-			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
-			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
-			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs)",
+			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
+			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
+			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
 		]);
 		assert.match(validateConfig({ queues: { zen: { idleQuantumMs: 1 } } })[0], /^queues\.zen\.idleQuantumMs is an unknown field/);
 	});
 
 	it("flags defaults-only fields set per queue", () => {
-		const errors = validateConfig({ queues: { zen: { failOpen: false, queueTimeoutMs: 5, daemonIdleExitMs: 1 } } });
+		const errors = validateConfig({ queues: { zen: { failOpen: false, queueTimeoutMs: 5, daemonIdleExitMs: 1, logFile: "/tmp/queue.jsonl" } } });
 		assert.deepEqual(errors, [
 			"queues.zen.failOpen is only valid in defaults (the whole config is rejected and defaults are used)",
 			"queues.zen.queueTimeoutMs is only valid in defaults (the whole config is rejected and defaults are used)",
 			"queues.zen.daemonIdleExitMs is only valid in defaults (the whole config is rejected and defaults are used)",
+			"queues.zen.logFile is only valid in defaults (the whole config is rejected and defaults are used)",
 		]);
+	});
+
+	// #47: the event log is a daemon-wide path, so it is defaults-only and must name a real file.
+	it("rejects a logFile that is not a path, accepts a string path", () => {
+		assert.deepEqual(validateConfig({ defaults: { logFile: "/tmp/queue-events.jsonl" } }), []);
+		assert.deepEqual(validateConfig({ defaults: { logFile: 42 } }), ['defaults.logFile must be a non-empty string path (got 42)']);
+		assert.deepEqual(validateConfig({ defaults: { logFile: "" } }), ['defaults.logFile must be a non-empty string path (got "")']);
 	});
 
 	it("flags a non-object defaults and queue entry", () => {
