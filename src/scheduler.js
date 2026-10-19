@@ -162,9 +162,12 @@ export class Scheduler {
 		return { granted: false, refreshed: false, decisions };
 	}
 
-	// beat (keyed renew): the authoritative `granted` answer. A live lease in queue.holders that is
+	// beat (keyed renew): the authoritative `granted` answer, and a query returning
+	// { granted, refreshed, decisions } (spec #65 / ticket #68). A live lease in queue.holders that is
 	// also this connection's lease for this session refreshes TTL and lastActivityAt (a keyed beat
-	// prevents idle-yield). granted:false tells the client the Slot is gone and it must re-queue.
+	// prevents idle-yield), so `refreshed` is true exactly when a live lease's TTL was refreshed here.
+	// granted:false tells the client the Slot is gone and it must re-queue. A beat is a pure query: it
+	// emits no decision (no log line, no reply beyond the granted answer), so `decisions` is always empty.
 	beat(connId, sessionKey, queueKey, now) {
 		const queue = this.queueFor(queueKey);
 		const lease = (this.connLeases.get(connId) ?? []).find((l) => l.sessionKey === sessionKey && l.queueKey === queue.queueKey);
@@ -173,7 +176,7 @@ export class Scheduler {
 			lease.expires = now + queue.ttlMs;
 			lease.lastActivityAt = now;
 		}
-		return { granted };
+		return { granted, refreshed: granted, decisions: [] };
 	}
 
 	// heartbeat (bare renew): keeps every lease of this connection alive. Refreshes TTL only, NOT

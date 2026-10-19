@@ -34,9 +34,12 @@ describe("lease / TTL (in memory)", () => {
 
 		h.acquire(a, "A", { role: "parent" });
 		assert.equal(h.beat(a, "A").granted, true, "a beat on a held slot is granted");
+		assert.equal(h.beat(a, "A").refreshed, true, "a beat on a live lease refreshes its TTL (ticket #68)");
+		assert.deepEqual(h.beat(a, "A").decisions, [], "a beat is a query: it emits no decision");
 
 		h.release(a, "A");
 		assert.equal(h.beat(a, "A").granted, false, "a beat on a lost slot tells the client to re-queue");
+		assert.equal(h.beat(a, "A").refreshed, false, "a beat on a phantom holder refreshes nothing");
 	});
 
 	it("releases every lease of a client that disconnects (no phantom holder)", () => {
