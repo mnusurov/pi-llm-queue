@@ -14,7 +14,9 @@ const STUB_API = "stub-queue-api";
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-ext-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
+// daemonIdleExitMs 1e9: the suite reuses one daemon fixture; session_shutdown says bye (#63) and
+// the production default 0 would kill the fixture between tests.
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
@@ -478,7 +480,7 @@ describe("config hot-reload (provider set)", () => {
 		start(a, "RELOAD");
 		assert.ok(a.registered["stub"], "wrapped before the edit");
 
-		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1 }, queues: { stub: { enabled: false }, "free-api": { enabled: false } } }));
+		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { enabled: false }, "free-api": { enabled: false } } }));
 		await sleep(600); // reload debounce
 		assert.equal(a.registered["stub"], undefined, "a disabled provider is unregistered: passthrough, no pi restart");
 	});

@@ -897,6 +897,16 @@ describe("daemon lifetime: counted clients and status invisibility (#60)", () =>
 		assert.ok(await exited(d.proc, 2000), "and the daemon exits when that pi is gone");
 	});
 
+	it("bye from the last counted client exits the daemon while its socket stays open", async () => {
+		// pi's session_shutdown says "I am leaving" before the process dies: the daemon must arm
+		// the idle-exit at the word, not wait for the OS to close the socket — a lingering pi
+		// process must not keep stale code resident past the last session's shutdown.
+		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 0 }, queues: {} });
+		const c = await counted(d.socketPath, "A");
+		c.send({ op: "bye" }); // the socket stays open: the departure is announced, not enforced
+		assert.ok(await exited(d.proc, 2000), "bye arms the idle-exit with the connection still open");
+	});
+
 	it("a resident value past setTimeout's 2^31-1 cap does not exit at once", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 31536000000 }, queues: {} });
 		const c = await counted(d.socketPath, "A");

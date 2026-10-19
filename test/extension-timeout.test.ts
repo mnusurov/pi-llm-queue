@@ -16,7 +16,9 @@ const STUB_API = "stub-timeout-api";
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-timeout-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 // queueTimeoutMs 300 ms: a parent queued behind a long holder is warned past the cap, not released.
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, queueTimeoutMs: 300 }, queues: { stub: { maxStreams: 1 } } }));
+// daemonIdleExitMs 1e9: the suite reuses one daemon fixture; session_shutdown says bye (#63) and
+// the production default 0 would kill the fixture between tests.
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, queueTimeoutMs: 300, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);

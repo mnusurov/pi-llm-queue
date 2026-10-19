@@ -19,8 +19,11 @@ const QUEUE2 = "http://model2.test/v1";
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-idle-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 // idleYieldMs 1500 + sweep 200 ms: a beat gap shows up in ~1.5-2.5 s. leaseTtlMs 3000 puts the
-// client beat period at 1000 ms, so a run beats 1-2× per idle window.
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 3000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 } } }));
+// client beat period at 1000 ms, so a run beats 1-2× per idle window. daemonIdleExitMs 1e9: this
+// suite reuses one daemon across tests, and each test's session_shutdown now says bye (#63) —
+// with the production default 0 the last bye would kill the fixture between tests and the
+// autostarted replacement would lose the queue state the next test asserts on.
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 3000, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] }, stub2: { baseUrl: QUEUE2, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);

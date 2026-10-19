@@ -13,6 +13,7 @@ JSON. Every message is one JSON object on a single line.
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`); a Holder keeps the tier it was granted with |
 | `renew`   | — (heartbeat) or `queueKey`*, `sessionKey` (activity beat) | `{"op":"ok"}` (heartbeat) / `{"op":"ok","queueKey","sessionKey","granted"}` (beat) |
 | `status`  | —                                            | `{"op":"status","queues":[{queueKey,maxStreams,switches,holders,waiting}]}` — `holders` and `waiting` are each `[{sessionKey,role,group}…]` |
+| `bye`     | — (shutdown intent)                          | — (no reply) — treat this connection as disconnected now: release its leases, drop its queued requests, decrement the client count; the client then closes the socket (#63) |
 
 \* `acquire`, `release` and `cancel` require `queueKey`: a keyless one would create an unnamed
 queue that silently holds a slot. The reply is `{"op":"error","reason":"... requires queueKey"}`.
@@ -247,8 +248,10 @@ read once at connect and are the fields that need a pi restart.
   state-touching op (`acquire`, `renew`, `role`, `cancel`) and stops being one when it closes. A
   `status`-only connection — the queue observer, a dashboard, a monitoring script — changes no
   queue state, so it never keeps the daemon alive. The extension holds one persistent connection
-  per pi process, so the OS closing it is the "last pi is gone" signal, crash-safe by construction;
-  there is no `bye`/`shutdown` op. `> 0` is an opt-in relaunch grace (a session restarting within
+  per pi process, so the OS closing it is the "last pi is gone" signal, crash-safe by construction.
+  A graceful pi does not wait for its process to die: `session_shutdown` sends `bye` (#63), which
+  runs the same cleanup a close would, so the idle-exit arms at the word and a pi that lingers
+  after its last session cannot keep stale daemon code resident for the next pi to connect to. `> 0` is an opt-in relaunch grace (a session restarting within
   it keeps the warm daemon, and a counted reconnect cancels the pending exit); set it high to keep
   the daemon resident (the daemon clamps the delay to `setTimeout`'s 2^31-1 cap, ~24.8 days, so an
   unclamped "a year" cannot become the 1 ms exit Node coerces it to). A daemon that starts with no
@@ -275,6 +278,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-config-watch.test.ts`  | config created after startup                                                                                                                                                |
 | `test/extension-starter.test.ts`       | starter config on first launch; reconcile of an existing config on session start, the tuned entry's exact text, and the reconciled key as a live queue at the daemon socket                                  |
 | `test/extension-starter-empty.test.ts` | (top-level test) creates no config when every endpoint is cloud or native-owned                                                                                             |
+| `test/extension-bye.test.ts`           | `bye` on `session_shutdown`: the daemon exits with the last session's shutdown while the client process is still alive (#63)                                                 |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
 `waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,
