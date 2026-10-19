@@ -151,7 +151,9 @@ function emit(decisions) {
 			case "grant": {
 				logEvent("grant", d.queueKey, d.sessionKey, d.role);
 				const conn = connById.get(d.connId);
-				if (conn) send(conn, { op: "granted", queueKey: conn.requestedKeys.get(d.sessionKey) ?? d.queueKey, sessionKey: d.sessionKey });
+				// Echo the key the request asked with (the per-request `requestedKey` the Scheduler
+				// carries on the decision), falling back to the resolved queue key for a direct grant.
+				if (conn) send(conn, { op: "granted", queueKey: d.requestedKey ?? d.queueKey, sessionKey: d.sessionKey });
 				break;
 			}
 			case "switch":
@@ -189,14 +191,12 @@ function handle(msg, conn) {
 	if (msg.queueKey) msg.queueKey = groupFor(msg.queueKey);
 	switch (msg.op) {
 		case "acquire": {
-			// Remember the key this session asked with, so a later queued grant echoes it.
-			conn.requestedKeys.set(msg.sessionKey, requestedKey);
-			const result = scheduler.acquire(conn.connId, msg.sessionKey, msg.role, msg.group, msg.activity, msg.queueKey, now);
+			const result = scheduler.acquire(conn.connId, msg.sessionKey, msg.role, msg.group, msg.activity, msg.queueKey, requestedKey, now);
 			emit(result.decisions);
-			// A re-acquire of a held slot is a TTL refresh with a `granted` reply and no Grant decision
-			// (the Grace window logs one grant and no switch); the direct-grant path's reply rides on
-			// its own `grant` decision, so only send here when no grant decision carried it.
-			if (result.granted && !result.decisions.some((d) => d.type === "grant")) {
+			// A re-acquire of a held slot is a TTL refresh: `granted` with no Grant decision (the Grace
+			// window logs one grant and no switch). The direct-grant path's reply rides on its own
+			// `grant` decision, so reply here only for a refresh, keyed by the current op's requestedKey.
+			if (result.refreshed) {
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 			}
 			return;
@@ -245,7 +245,6 @@ function handle(msg, conn) {
 
 const server = createServer((conn) => {
 	conn.connId = ++connSeq;
-	conn.requestedKeys = new Map();
 	connById.set(conn.connId, conn);
 	let buffer = "";
 	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the key.

@@ -117,7 +117,10 @@ export class Scheduler {
 		// A direct grant counts toward the parent-grant streak too: a parent that never queues must
 		// not starve a queued child past agingAfterSlots.
 		queue.parentGrantStreak = lease.role === "parent" ? queue.parentGrantStreak + 1 : 0;
-		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, role: lease.role });
+		// The grant carries the requester's `requestedKey` (the key it asked with, opaque to the
+		// Scheduler) so the adapter echoes it per-request: a session queued on two group members gets
+		// each grant keyed by the key that request used, never the other's (protocol:228-232).
+		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, role: lease.role, requestedKey: requester.requestedKey });
 		if (fromWaiting) {
 			// Handing the Slot to a new session is the Switch that re-prefills the KV cache.
 			queue.switches++;
@@ -139,24 +142,24 @@ export class Scheduler {
 	// acquire: re-acquiring a held Slot is a TTL refresh (Grace window: a Parent woken by its Child
 	// keeps the Slot, so the handback costs no Switch and logs nothing). A free Slot is a direct Grant.
 	// Otherwise the request parks as a Waiter. Returns { granted, decisions }.
-	acquire(connId, sessionKey, tier, group, activity, queueKey, now) {
+	acquire(connId, sessionKey, tier, group, activity, queueKey, requestedKey, now) {
 		const queue = this.queueFor(queueKey);
 		const role = tier ?? "parent";
 		const held = this.leaseOf(queue, sessionKey);
 		if (held) {
 			held.expires = now + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
-			return { granted: true, decisions: [] };
+			return { granted: true, refreshed: true, decisions: [] };
 		}
 		const decisions = [];
 		if (queue.holders.length < queue.maxStreams) {
-			this.grantLease(queue, { sessionKey, connId, activity, role, group }, now, false, decisions);
-			return { granted: true, decisions };
+			this.grantLease(queue, { sessionKey, connId, activity, role, group, requestedKey }, now, false, decisions);
+			return { granted: true, refreshed: false, decisions };
 		}
-		const waiter = { sessionKey, role, group, connId, queueKey, enqueuedAt: now, activity: !!activity };
+		const waiter = { sessionKey, role, group, connId, queueKey, requestedKey, enqueuedAt: now, activity: !!activity };
 		queue.waiting.push(waiter);
 		this.pushQueued(connId, waiter);
 		decisions.push({ type: "queued", connId, queueKey: queue.queueKey, sessionKey, role });
-		return { granted: false, decisions };
+		return { granted: false, refreshed: false, decisions };
 	}
 
 	// beat (keyed renew): the authoritative `granted` answer. A live lease in queue.holders that is

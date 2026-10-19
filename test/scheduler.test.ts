@@ -394,6 +394,42 @@ describe("no preemption (in memory)", () => {
 	});
 });
 
+// The `requestedKey` echo (spec #65 finding 1): a session queued on two group members must get each
+// grant keyed by the key that request asked with, never the other's. The Scheduler carries the
+// requestedKey on the Waiter and returns it on the grant decision; the adapter echoes it. This is a
+// Scheduler property (the per-request echo rides on the decision), so it is asserted in memory.
+describe("requestedKey echo (in memory)", () => {
+	const GROUP = "gpu";
+	const MEMBER_A = "http://gpu.test/v1";
+	const MEMBER_B = "http://zen.test/v1";
+
+	it("carries the key each queued request asked with on its own grant decision", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const dual = h.connect();
+
+		h.acquire(holder, "H", { role: "parent", queueKey: GROUP });
+		// One session, two group-member keys, both queued on the group's single slot.
+		h.acquire(dual, "S", { role: "parent", queueKey: GROUP, requestedKey: MEMBER_A });
+		h.acquire(dual, "S", { role: "parent", queueKey: GROUP, requestedKey: MEMBER_B });
+		assert.deepEqual(h.grantsFor(dual), [], "both member requests park as Waiters behind the holder");
+
+		h.release(holder, "H", GROUP); // FIFO: the first waiter (asked with MEMBER_A) is granted
+		assert.deepEqual(
+			h.grantsFor(dual).map((g) => g.requestedKey),
+			[MEMBER_A],
+			"the first grant echoes the key that request asked with, not the other member's",
+		);
+
+		h.release(dual, "S", GROUP); // frees the slot, grants the second waiter (asked with MEMBER_B)
+		assert.deepEqual(
+			h.grantsFor(dual).map((g) => g.requestedKey),
+			[MEMBER_A, MEMBER_B],
+			"the second grant echoes its own key, proving the echo is per-request not per-session",
+		);
+	});
+});
+
 // The status view (tier, group label, per-tier depth, switch counter), migrated off the socket seam.
 // The Scheduler's snapshot is the source `status` reports; the socket suite keeps the handover-switch
 // smoke. The adapter's serialisation of this shape is its own contract, tested on the wire.

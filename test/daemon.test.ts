@@ -337,6 +337,31 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		d.stop();
 	});
 
+	it("echoes each queued request's own key when one session queues on two group members", async () => {
+		// Finding 1 (P1): a session acquiring two member keys of one group overwrote a per-session
+		// echo, so a queued grant echoed the other key and the client (lease-client matches on its own
+		// queueKey) never resolved. The echo is per-request: each grant names the key that request used.
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU, ZEN], maxStreams: 1 } } }, modelsJson);
+		const holder = await connectClient(d.socketPath);
+		const dual = await connectClient(d.socketPath);
+
+		holder.send({ op: "acquire", queueKey: GPU, sessionKey: "H", role: "parent" });
+		assert.deepEqual(await holder.next(3000), granted(GPU, "H"));
+
+		dual.send({ op: "acquire", queueKey: GPU, sessionKey: "S", role: "parent" });
+		dual.send({ op: "acquire", queueKey: ZEN, sessionKey: "S", role: "parent" });
+		await assert.rejects(dual.next(200), /no message from daemon within/, "both member requests queue on the group's single slot");
+
+		holder.send({ op: "release", queueKey: GPU, sessionKey: "H" });
+		assert.deepEqual(await dual.next(3000), granted(GPU, "S"), "the first grant echoes the key that request asked with");
+		dual.send({ op: "release", queueKey: GPU, sessionKey: "S" });
+		assert.deepEqual(await dual.next(3000), granted(ZEN, "S"), "the second grant echoes its own key, not the first's");
+
+		holder.close();
+		dual.close();
+		d.stop();
+	});
+
 	it("resolves provider names in a group's match list to their endpoints", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { merged: { match: ["strata", "zen"], maxStreams: 1 } } }, modelsJson);
 		const a = await connectClient(d.socketPath);

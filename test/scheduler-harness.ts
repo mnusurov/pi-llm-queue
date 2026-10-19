@@ -26,6 +26,7 @@ export interface Decision {
 	queueKey: string;
 	sessionKey: string;
 	role: string;
+	requestedKey?: string;
 	reason?: string;
 }
 
@@ -72,9 +73,10 @@ export class SchedulerHarness {
 		this.now += ms;
 	}
 
-	acquire(connId: string, sessionKey: string, opts: { role?: string; group?: string; activity?: boolean; queueKey?: string } = {}) {
+	acquire(connId: string, sessionKey: string, opts: { role?: string; group?: string; activity?: boolean; queueKey?: string; requestedKey?: string } = {}) {
 		const queueKey = opts.queueKey ?? QUEUE_KEY;
-		const result = this.scheduler.acquire(connId, sessionKey, opts.role, opts.group, opts.activity, queueKey, this.now);
+		const requestedKey = opts.requestedKey ?? queueKey;
+		const result = this.scheduler.acquire(connId, sessionKey, opts.role, opts.group, opts.activity, queueKey, requestedKey, this.now);
 		this.capture(connId, result.decisions);
 		return result;
 	}
