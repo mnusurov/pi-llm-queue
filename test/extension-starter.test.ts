@@ -146,6 +146,29 @@ describe("reconcile of an existing config on session start", () => {
 		assert.deepEqual(Object.keys(pi.registered).sort(), ["extra", "strata", "tuned"], "the added endpoint is wrapped; the disabled one is not");
 	});
 
+	// #46 box 4: "byte-for-byte unchanged for those keys". The reconcile write is
+	// JSON.stringify(data, null, 2), so what survives is the entry's exact serialized text; the
+	// file's layout is the generator's. Pinned so the ADR cannot over-claim the file's bytes.
+	it("keeps the tuned entry's exact serialized text, in the generator's 2-space layout", () => {
+		const tuned = { maxStreams: 4, policy: "fifo", leaseTtlMs: 5000, idleYieldMs: 0, match: ["tuned"] };
+		const { written } = sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [LOCAL_URL_3]: tuned } }), {
+			...BASE_PROVIDERS,
+			tuned: { baseUrl: LOCAL_URL_3, api: STUB_API },
+		});
+
+		// The entry as the file spells it: key, then the value's own lines at the file's indent.
+		const entryText = JSON.stringify(tuned, null, 2)
+			.split("\n")
+			.map((line, at) => (at ? `    ${line}` : line))
+			.join("\n");
+		assert.ok(written.includes(`"${LOCAL_URL_3}": ${entryText}`), `the tuned entry's text survives the write verbatim: ${written}`);
+		assert.equal(
+			written,
+			`${JSON.stringify({ schemaVersion: 1, queues: { [LOCAL_URL_3]: tuned, [LOCAL_URL]: { enabled: true } } }, null, 2)}\n`,
+			"a compact user file is reflowed to the generator's 2-space shape: the entry's bytes survive, the file's layout is the generator's",
+		);
+	});
+
 	it("adds nothing when a Group's match already addresses the endpoint", () => {
 		const existing = { schemaVersion: 1, queues: { local: { match: ["extra"], maxStreams: 3 } } };
 		const { written, added } = sessionAgainst(JSON.stringify(existing));

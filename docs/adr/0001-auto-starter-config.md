@@ -42,6 +42,14 @@ from the user's own `~/.pi/agent/models.json`:
   own key, a provider-name key naming it, or a Group's `match`) counts as addressed, so reconcile
   never splits a queue in two. A config the schema rejects is left alone: its rejection is already
   reported at session start, and writing into it would bury that report.
+- **"Byte-for-byte unchanged for those keys" is the entry's text, not the file's layout.** The
+  reconcile write re-serializes the whole file as `JSON.stringify(data, null, 2)`, so a tuned entry
+  survives with its exact serialized text — key, fields, field order, values — while the file's own
+  layout is the generator's 2-space shape: a compact or 4-space user file is reflowed by the write
+  that adds a key. A file reconcile does not write (nothing missing, or a rejected config) keeps
+  every byte. Preserving a user's own indentation would need a text edit of the file rather than a
+  parse-and-reserialize, and the write is guarded on the parsed content it is based on; the entry's
+  text is what the guarantee covers, and a test pins it.
 - **Shape.** `schemaVersion: 1`, one endpoint-keyed `queues` entry per baseUrl (deduplicated,
   sorted), and a `defaults` block containing only the parent queue-wait cap `queueTimeoutMs` (120 s).
   Nothing else in `defaults`: every other field stays absent so the schema's own defaults apply, and
