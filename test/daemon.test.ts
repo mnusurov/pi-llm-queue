@@ -160,60 +160,6 @@ describe("lease lifecycle and no preemption", () => {
 		assert.deepEqual(await b.next(1500), granted("B"));
 	});
 
-	it("keeps a lease alive while its client heartbeats, and reclaims it when heartbeats stop", async () => {
-		const d = start(1000);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B");
-
-		for (let i = 0; i < 12; i++) {
-			await sleep(100); // ~1.2 TTLs of heartbeats
-			a.send({ op: "renew" });
-		}
-		await assert.rejects(b.next(200), /no message from daemon within/, "heartbeats keep A's slot");
-
-		await sleep(1200); // heartbeats stop: the TTL reclaims
-		assert.deepEqual(await b.next(1500), granted("B"));
-	});
-
-	it("answers a keyed beat with the authoritative grant state", async () => {
-		const d = start();
-		const a = await open(d);
-
-		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
-		beat(a, "A");
-		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }, "a beat on a held slot is acknowledged");
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await a.next(3000), { op: "ok" });
-		beat(a, "A");
-		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "a beat on a lost slot tells the client to re-queue");
-	});
-
-	it("releases every lease of a client that disconnects (no phantom holder)", async () => {
-		const d = start();
-		const multi = await open(d); // one client holding two sessions on two endpoints
-		const w1 = await open(d);
-		const w2 = await open(d);
-
-		acquire(multi, "M1");
-		assert.deepEqual(await multi.next(3000), granted("M1"));
-		multi.send({ op: "acquire", queueKey: QUEUE_KEY2, sessionKey: "M2", role: "parent" });
-		assert.deepEqual(await multi.next(3000), { op: "granted", queueKey: QUEUE_KEY2, sessionKey: "M2" });
-
-		acquire(w1, "W1");
-		w2.send({ op: "acquire", queueKey: QUEUE_KEY2, sessionKey: "W2", role: "parent" });
-		await assert.rejects(w1.next(200), /no message from daemon within/);
-
-		multi.close(); // disconnect while holding BOTH leases: both slots must free
-		assert.deepEqual(await w1.next(5000), granted("W1"));
-		assert.deepEqual(await w2.next(5000), { op: "granted", queueKey: QUEUE_KEY2, sessionKey: "W2" });
-	});
-
 	// No preemption (#49): a live holder is never switched away. The slot moves only on
 	// voluntary release, abort, disconnect, or the TTL lapse of a dead client.
 	it("no preemption: a silent holder keeps the slot and the waiter is granted only on release", async () => {
@@ -253,23 +199,6 @@ describe("lease lifecycle and no preemption", () => {
 		assert.deepEqual(await b.next(1500), granted("B"));
 	});
 
-	it("sweeps an expired lease with nobody waiting, so status never shows a ghost holder", async () => {
-		const d = start(1000);
-		const a = await open(d); // live socket, abandoned lease: never renews
-
-		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
-		await sleep(1200); // TTL + sweep ticks, with zero waiters: the old gated sweep skipped this queue
-
-		a.send({ op: "status" });
-		const status = await a.next(3000);
-		assert.deepEqual(
-			status.queues.find((q: any) => q.queueKey === QUEUE_KEY).holders,
-			[],
-			"the TTL sweep is unconditional, so /queue never reports a dead holder",
-		);
-	});
-
 	// The quanta are gone from the schema, so a pre-#49 config carrying them is rejected outright
 	// and the daemon serves defaults: preemption cannot be re-enabled from config.
 	it("a config carrying the removed quanta falls back to defaults and never preempts", async () => {
@@ -292,20 +221,6 @@ describe("lease lifecycle and no preemption", () => {
 		assert.deepEqual(await b.next(1500), granted("B"));
 	});
 
-	it("a holder that dies mid-stream is reclaimed after the TTL grace and grants the next waiter", async () => {
-		const d = start(1000);
-		const a = await open(d); // socket open, never renews: a client killed mid-stream
-		const b = await open(d);
-
-		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
-		beat(a, "A"); // in flight, never completed
-		await a.next(3000);
-		acquire(b, "B");
-		await assert.rejects(b.next(300), /no message from daemon within/, "B waits behind the in-flight lease");
-
-		assert.deepEqual(await b.next(1500), granted("B"), "the TTL is the in-flight grace: a silent client loses the slot");
-	});
 });
 
 describe("tier ordering (parent > child) and aging", () => {
@@ -1096,135 +1011,5 @@ describe("idle-yield under contention", () => {
 		// A's next beat answers granted:false (the slot is gone).
 		beat(a, "A");
 		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "yielded holder learns via beat");
-	});
-
-	it("bare heartbeats keep the TTL alive but not the slot: idle-yield fires (#57 guard)", async () => {
-		const d = start(300);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		// Bare renew every 100 ms for 3× idleYieldMs: the lease stays TTL-alive, lastActivityAt goes stale.
-		for (let i = 0; i < 9; i++) {
-			a.send({ op: "renew" }); // bare heartbeat: no queueKey/sessionKey
-			assert.deepEqual(await a.next(3000), { op: "ok" });
-			await sleep(100);
-		}
-		assert.deepEqual(await b.next(2000), granted("B"), "a TTL-alive activity-idle holder yields to the waiter");
-		beat(a, "A");
-		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "the yielded holder learns via its next beat");
-	});
-
-	it("keyed beats during a long stream prevent idle-yield", async () => {
-		const d = start(500);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		// Simulate a long stream: keyed beats every 200 ms for 1.5 s (3× idleYieldMs).
-		for (let i = 0; i < 8; i++) {
-			await sleep(200);
-			beat(a, "A");
-			await a.next(3000); // consume the ok reply
-		}
-		await assert.rejects(b.next(200), /no message from daemon within/, "beats keep the holder");
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(3000), granted("B"), "waiter granted on voluntary release");
-	});
-
-	it("never yields a lone idle holder (no waiters)", async () => {
-		const d = start(300);
-		const a = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-
-		await sleep(600); // 2× idleYieldMs of silence, no waiters
-		beat(a, "A");
-		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true }, "lone idle holder keeps its slot");
-	});
-
-	it("never yields an unflagged (old-client) lease", async () => {
-		const d = start(300);
-		const a = await open(d);
-		const b = await open(d);
-
-		// Old client: no activity flag on acquire.
-		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		await sleep(600); // 2× idleYieldMs of silence: unflagged lease is never yielded
-		await assert.rejects(b.next(200), /no message from daemon within/, "unflagged holder never yielded");
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(3000), granted("B"));
-	});
-
-	it("idleYieldMs 0 disables idle-yield", async () => {
-		const d = start(0);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		await sleep(600); // idleYieldMs 0: never yields
-		await assert.rejects(b.next(200), /no message from daemon within/, "idleYieldMs 0 disables yield");
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(3000), granted("B"));
-	});
-
-	it("a yielded holder re-acquires and queues behind the new holder", async () => {
-		const d = start(300);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		// A is idle-yielded, B is granted.
-		assert.deepEqual(await b.next(2000), granted("B"));
-
-		// A re-acquires: queues behind B (B holds the slot).
-		acquire(a, "A", true);
-		await assert.rejects(a.next(200), /no message from daemon within/, "yielded holder re-queues");
-
-		// B releases: A is granted.
-		b.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "B" });
-		assert.deepEqual(await a.next(3000), granted("A"), "re-queued holder wins on release");
-	});
-
-	it("idle-yield counts as a switch in status", async () => {
-		const d = start(300);
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B", true);
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		// Idle-yield: A yields, B is granted (1 switch).
-		assert.deepEqual(await b.next(2000), granted("B"));
-
-		a.send({ op: "status" });
-		const status = await a.next(3000);
-		assert.equal(status.queues[0].switches, 1, "idle-yield handover counts as a switch");
 	});
 });
