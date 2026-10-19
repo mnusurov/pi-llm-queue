@@ -988,6 +988,7 @@ describe("config schema validation at the daemon seam", () => {
 		mkdirSync(srcDir, { recursive: true });
 		copyFileSync(DAEMON, join(srcDir, "daemon.js"));
 		copyFileSync(decodeURIComponent(new URL("../src/config.js", import.meta.url).pathname), join(srcDir, "config.js"));
+		copyFileSync(decodeURIComponent(new URL("../src/scheduler.js", import.meta.url).pathname), join(srcDir, "scheduler.js"));
 		const configPath = join(dir, "config.json");
 		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
 		const socketPath = join(dir, "queue.sock");

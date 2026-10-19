@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 // pi-llm-queue daemon: serialises model access per endpoint over a unix socket.
 // Protocol: newline-delimited JSON. See docs/daemon-protocol.md.
+//
+// This file is the socket adapter (ADR 0004): framing, the Counted-client count + idle-exit, the
+// Sweep timer, the `status` view, the `requestedKey` echo, config resolution through config.js, and
+// emitting the decisions the Scheduler returns. All scheduling decisions live in src/scheduler.js.
 import { createConnection, createServer } from "node:net";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadValidConfig, groupKeyFor, queueEntryFor } from "./config.js";
+import { Scheduler } from "./scheduler.js";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -43,23 +48,17 @@ function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
 }
 
-// One session as a client reads it: id, tier, group label. A Lease (Holder) and a Waiter carry the
-// same three fields, so `status` reports both lists through this one view and cannot drift apart.
-function sessionView(entry) {
-	return { sessionKey: entry.sessionKey, role: entry.role, group: entry.group };
-}
-
 // Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
 // finished run can be read back from one file — the extension spawns the daemon detached and its
 // stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
 // move it. The queue key logged is the queue that owns the slot: a group's name when the client
-// addressed it by a member key. Callers pass the role off the Lease (or the Waiter, while it is
-// still queued), never off the acquire message: `status` reports the same field, so a reader can
-// never see the log and the reply disagree about the tier a session holds.
-function logEvent(event, queue, sessionKey, role, reason) {
+// addressed it by a member key. The role comes off the decision, never off the request: `status`
+// reports the same field, so a reader can never see the log and the reply disagree about the tier a
+// session holds. The wall-clock `ts` is stamped here (adapter-side), not in the Scheduler.
+function logEvent(event, queueKey, sessionKey, role, reason) {
 	const path = defaults.logFile;
 	if (!path) return;
-	const line = { event, queueKey: queue.queueKey, sessionKey, role, ts: new Date().toISOString() };
+	const line = { event, queueKey, sessionKey, role, ts: new Date().toISOString() };
 	if (reason) line.reason = reason;
 	// Best effort, swallowed: a bad path, a full disk or a log rotation race must never take the
 	// daemon down (it is spawned detached, so a crash is silent) nor reject the request that logged.
@@ -69,8 +68,6 @@ function logEvent(event, queue, sessionKey, role, reason) {
 		appendFileSync(path, `${JSON.stringify(line)}\n`, "utf8");
 	} catch {}
 }
-
-const queues = new Map();
 
 // Idle-exit (#60): the daemon self-terminates `daemonIdleExitMs` after the last counted client
 // disconnects. The default is 0 — exit at once — so daemon lifetime is the union of the live pi
@@ -120,111 +117,58 @@ function groupFor(key) {
 	return groupKeyFor(config.queues ?? {}, modelsJson, { baseUrl: key });
 }
 
-// Queue policy, re-applied on hot-reload. `enabled: false` is passthrough: unlimited slots,
-// so every session is granted immediately (status reports maxStreams null).
-function applyPolicy(queue, policy) {
+// The Scheduler resolves no config: the adapter resolves each queue's policy through config.js and
+// hands the Scheduler plain resolved values. Order: queue entry field → defaults field → hardcoded
+// fallback. `enabled: false` is passthrough: unlimited slots (Infinity), so every session is granted
+// immediately (status reports maxStreams null via JSON). The closure reads the live `config` /
+// `defaults`, so a hot-reload re-resolves through the new values.
+function resolvePolicy(key) {
+	const policy = policyFor(key);
 	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
-	queue.maxStreams = policy.enabled === false ? Infinity : pick("maxStreams", 1);
-	// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49), so the
-	// slot moves on voluntary release, abort, disconnect, or a TTL lapse alone. "fifo" opts a
-	// queue out of parent/child tiering and aging (external multi-slot queues).
-	queue.ttlMs = pick("leaseTtlMs", 30000);
-	// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after
-	// this many consecutive parent grants, or after waiting this long.
-	queue.agingAfterSlots = pick("agingAfterSlots", 3);
-	queue.agingAfterMs = pick("agingAfterMs", 60000);
-	queue.policy = pick("policy", "priority-aging");
-	queue.idleYieldMs = pick("idleYieldMs", 30000);
-	return queue;
+	return {
+		maxStreams: policy.enabled === false ? Infinity : pick("maxStreams", 1),
+		ttlMs: pick("leaseTtlMs", 30000),
+		agingAfterSlots: pick("agingAfterSlots", 3),
+		agingAfterMs: pick("agingAfterMs", 60000),
+		policy: pick("policy", "priority-aging"),
+		idleYieldMs: pick("idleYieldMs", 30000),
+	};
 }
 
-function newQueue(queueKey) {
-	return applyPolicy({ queueKey, parentGrantStreak: 0, switches: 0, holders: [], waiting: [] }, policyFor(queueKey));
-}
+const scheduler = new Scheduler(resolvePolicy);
 
-function queueFor(key) {
-	const queueKey = groupFor(key);
-	if (!queues.has(queueKey)) queues.set(queueKey, newQueue(queueKey));
-	return queues.get(queueKey);
-}
+// The adapter maps a connId (the Scheduler's connection identity) back to the live socket so a
+// `grant` decision can send its reply. The Scheduler never sees a socket object.
+let connSeq = 0;
+const connById = new Map();
 
-// A lease is the holder's record: its TTL deadline, plus the tier it was acquired with and the
-// group label it came in with, so `status` can report a Holder by tier and label and not only by
-// session id. The same object lives in conn.leases, so a client heartbeat refreshes it in place.
-function newLease(queue, sessionKey, conn, activity, role, group, now) {
-	return { queueKey: queue.queueKey, sessionKey, conn, role, group, expires: now + queue.ttlMs, activity: !!activity, lastActivityAt: now };
-}
-
-function leaseOf(queue, sessionKey) {
-	return queue.holders.find((l) => l.sessionKey === sessionKey);
-}
-
-// Pick the next waiter: an aged child (longest-waiting) jumps the queue; otherwise the
-// earliest parent, then the earliest child — FIFO within each tier (parent > child).
-function pickNext(queue, now) {
-	if (queue.policy === "fifo") return queue.waiting[0];
-	let aged = null;
-	for (const w of queue.waiting) {
-		if (w.role !== "child") continue;
-		if (now - w.enqueuedAt >= queue.agingAfterMs || queue.parentGrantStreak >= queue.agingAfterSlots) {
-			if (!aged || w.enqueuedAt < aged.enqueuedAt) aged = w;
-		}
-	}
-	if (aged) return aged;
-	return queue.waiting.find((w) => w.role === "parent") ?? queue.waiting[0];
-}
-
-function grantNext(queue, now) {
-	while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
-		const waiter = pickNext(queue, now);
-		remove(queue.waiting, waiter);
-		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
-		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity, waiter.role, waiter.group, now);
-		queue.holders.push(lease);
-		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
-		logEvent("grant", queue, lease.sessionKey, lease.role);
-		logEvent("switch", queue, lease.sessionKey, lease.role);
-		remove(waiter.conn.queued, waiter);
-		waiter.conn.leases.push(lease);
-		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
-	}
-}
-
-function remove(list, item) {
-	const at = list.indexOf(item);
-	if (at >= 0) list.splice(at, 1);
-}
-
-function release(queue, sessionKey, reason, now) {
-	const lease = leaseOf(queue, sessionKey);
-	if (lease) {
-		remove(queue.holders, lease);
-		remove(lease.conn.leases, lease);
-		// The log names the cause: a TTL reclaim is an evict — the only eviction reason after ADR
-		// 0002 — a yield is a release with reason "idle", a voluntary return a bare release.
-		logEvent(reason === "ttl" ? "evict" : "release", queue, sessionKey, lease.role, reason);
-	}
-	grantNext(queue, now);
-}
-
-// Evict holders whose lease has lapsed: a crashed session stops heartbeating and loses its slot.
-// A live holder is never preempted (#49) — every switch re-prefills the KV cache, and a
-// child-to-child preemption benefits nobody. The sweep is unconditional so `/queue` never
-// reports a ghost holder, whether or not anyone is waiting.
-function sweep() {
-	const now = Date.now();
-	for (const queue of queues.values()) {
-		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey, "ttl", now);
-		// Idle-yield: an activity-flagged holder silent past idleYieldMs with waiters present yields
-		// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
-		if (queue.idleYieldMs > 0 && queue.waiting.length > 0) {
-			for (const lease of [...queue.holders]) {
-				if (lease.activity && now - lease.lastActivityAt > queue.idleYieldMs) release(queue, lease.sessionKey, "idle", now);
+// Emit the decisions the Scheduler returned, in order: each maps to a log line and, for a grant, a
+// `granted` reply. The reply echoes the key the client asked with (the `requestedKey` echo is
+// adapter-side; the Scheduler only knows the resolved group key).
+function emit(decisions) {
+	for (const d of decisions) {
+		switch (d.type) {
+			case "grant": {
+				logEvent("grant", d.queueKey, d.sessionKey, d.role);
+				const conn = connById.get(d.connId);
+				if (conn) send(conn, { op: "granted", queueKey: conn.requestedKeys.get(d.sessionKey) ?? d.queueKey, sessionKey: d.sessionKey });
+				break;
 			}
+			case "switch":
+				logEvent("switch", d.queueKey, d.sessionKey, d.role);
+				break;
+			case "queued":
+				logEvent("queued", d.queueKey, d.sessionKey, d.role);
+				break;
+			case "release":
+				logEvent("release", d.queueKey, d.sessionKey, d.role, d.reason);
+				break;
+			case "evict":
+				logEvent("evict", d.queueKey, d.sessionKey, d.role, d.reason);
+				break;
 		}
 	}
 }
-setInterval(sweep, sweepMs).unref();
 
 function handle(msg, conn) {
 	// One clock stamp per op: every expires/lastActivityAt/enqueuedAt this op writes uses this single
@@ -245,91 +189,46 @@ function handle(msg, conn) {
 	if (msg.queueKey) msg.queueKey = groupFor(msg.queueKey);
 	switch (msg.op) {
 		case "acquire": {
-			const queue = queueFor(msg.queueKey);
-			// One read of the tier: an unlabelled request is a Parent, and the same value goes on the
-			// Lease, on the Waiter, and into the parent-grant streak that drives aging.
-			const role = msg.role ?? "parent";
-			const held = leaseOf(queue, msg.sessionKey);
-			if (held) {
-				held.expires = now + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
+			// Remember the key this session asked with, so a later queued grant echoes it.
+			conn.requestedKeys.set(msg.sessionKey, requestedKey);
+			const result = scheduler.acquire(conn.connId, msg.sessionKey, msg.role, msg.group, msg.activity, msg.queueKey, now);
+			emit(result.decisions);
+			// A re-acquire of a held slot is a TTL refresh with a `granted` reply and no Grant decision
+			// (the Grace window logs one grant and no switch); the direct-grant path's reply rides on
+			// its own `grant` decision, so only send here when no grant decision carried it.
+			if (result.granted && !result.decisions.some((d) => d.type === "grant")) {
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
-				return;
 			}
-			if (queue.holders.length < queue.maxStreams) {
-				const lease = newLease(queue, msg.sessionKey, conn, msg.activity, role, msg.group, now);
-				queue.holders.push(lease);
-				conn.leases.push(lease);
-				// A direct grant counts toward the parent-grant streak too: a parent that never
-				// queues must not starve a queued child past agingAfterSlots.
-				queue.parentGrantStreak = role === "parent" ? queue.parentGrantStreak + 1 : 0;
-				logEvent("grant", queue, lease.sessionKey, lease.role);
-				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
-				return;
-			}
-			const waiter = { sessionKey: msg.sessionKey, role, group: msg.group, requestedKey, conn, queue, enqueuedAt: now, activity: !!msg.activity };
-			queue.waiting.push(waiter);
-			conn.queued.push(waiter);
-			logEvent("queued", queue, waiter.sessionKey, waiter.role);
 			return;
 		}
 		case "release":
-			if (queues.has(msg.queueKey)) release(queues.get(msg.queueKey), msg.sessionKey, undefined, now);
+			emit(scheduler.release(conn.connId, msg.sessionKey, msg.queueKey, now));
 			send(conn, { op: "ok" });
 			return;
-		case "cancel": {
+		case "cancel":
 			// Drop a queued request the client aborted; if it was already granted, release the slot.
-			const queue = queues.get(msg.queueKey);
-			if (queue) {
-				const w = queue.waiting.find((x) => x.sessionKey === msg.sessionKey && x.conn === conn);
-				if (w) {
-					remove(queue.waiting, w);
-					remove(conn.queued, w);
-				}
-				if (leaseOf(queue, msg.sessionKey)) release(queue, msg.sessionKey, undefined, now);
-			}
+			emit(scheduler.cancel(conn.connId, msg.sessionKey, msg.queueKey, now));
 			return;
-		}
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
 		// Keyed renew: an activity beat — the holder is using the slot, so its TTL refreshes. The
 		// reply is authoritative: granted:false tells the client the slot is gone (a TTL lapse, a
 		// release, a disconnect) and it must re-queue before it streams.
 		case "renew": {
 			if (msg.sessionKey && msg.queueKey) {
-				const queue = queueFor(msg.queueKey);
-				const lease = conn.leases.find((l) => l.sessionKey === msg.sessionKey && l.queueKey === msg.queueKey);
-				const granted = !!lease && leaseOf(queue, msg.sessionKey) === lease;
-				if (granted) { lease.expires = now + queue.ttlMs; lease.lastActivityAt = now; }
+				const { granted } = scheduler.beat(conn.connId, msg.sessionKey, msg.queueKey, now);
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
-			for (const lease of [...conn.leases]) lease.expires = now + queueFor(lease.queueKey).ttlMs;
+			scheduler.heartbeat(conn.connId, now);
 			send(conn, { op: "ok" });
 			return;
 		}
-		case "role": {
+		case "role":
 			// /queue promote|demote: re-tier a live queued waiter in place (no reply, like cancel).
-			for (const queue of queues.values()) {
-				const w = queue.waiting.find((x) => x.sessionKey === msg.sessionKey && x.conn === conn);
-				if (w) {
-					w.role = msg.role === "child" ? "child" : "parent";
-					break;
-				}
-			}
+			scheduler.retier(conn.connId, msg.sessionKey, msg.role);
 			return;
-		}
 		case "status":
-			send(conn, {
-				op: "status",
-				queues: [...queues.values()].map((q) => ({
-					queueKey: q.queueKey,
-					maxStreams: q.maxStreams,
-					switches: q.switches,
-					// Holders are reported like Waiters: a raw client reads tier and group from the
-					// reply, so it needs no extension-side parsing to build a dashboard.
-					holders: q.holders.map(sessionView),
-					waiting: q.waiting.map(sessionView),
-				})),
-			});
+			send(conn, { op: "status", queues: scheduler.snapshot() });
 			return;
 		case "bye":
 			// Shutdown intent: pi's session_shutdown announces "this connection is leaving" while
@@ -337,7 +236,7 @@ function handle(msg, conn) {
 			// release leases, drop waiters, decrement the client count) arms the idle-exit at the
 			// word, so a lingering pi process cannot keep the daemon resident past its last session.
 			// No reply, like role/cancel; the connection is spent — the client destroys its socket.
-			cleanup(conn);
+			disconnect(conn);
 			return;
 		default:
 			send(conn, { op: "error", reason: `unknown op: ${msg.op}` });
@@ -345,8 +244,9 @@ function handle(msg, conn) {
 }
 
 const server = createServer((conn) => {
-	conn.leases = [];
-	conn.queued = [];
+	conn.connId = ++connSeq;
+	conn.requestedKeys = new Map();
+	connById.set(conn.connId, conn);
 	let buffer = "";
 	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the key.
 	const decoder = new TextDecoder("utf8");
@@ -371,19 +271,19 @@ const server = createServer((conn) => {
 			handle(msg, conn);
 		}
 	});
-	conn.on("close", () => cleanup(conn));
-	conn.on("error", () => cleanup(conn));
+	conn.on("close", () => disconnect(conn));
+	conn.on("error", () => disconnect(conn));
 });
 
-// A disconnect is an abort: drop the queued request and release any lease it held.
-// Iterate a copy: release() splices conn.leases, and a client can hold several leases.
-function cleanup(conn) {
-	if (conn.cleaned) return; // close and error both fire cleanup: count the disconnect once
+// A disconnect is an abort: the Scheduler releases every lease it held and drops every queued
+// request; the adapter then decrements the Counted-client count (the decrement is AFTER the
+// disconnect, per the dual-ownership crux). close and error both fire: count the disconnect once.
+function disconnect(conn) {
+	if (conn.cleaned) return;
 	conn.cleaned = true;
-	// One clock stamp per disconnect: every release this cleanup triggers uses this single value.
 	const now = Date.now();
-	for (const lease of [...(conn.leases ?? [])]) release(queueFor(lease.queueKey), lease.sessionKey, undefined, now);
-	for (const w of [...(conn.queued ?? [])]) remove(w.queue.waiting, w);
+	emit(scheduler.disconnect(conn.connId, now));
+	connById.delete(conn.connId);
 	if (conn.counted && --countedClients <= 0) scheduleIdleExit();
 }
 
@@ -430,13 +330,15 @@ process.on("SIGTERM", () => {
 // Rebuild queues from the reloaded config, carrying holders and waiters with them: adding a
 // group at runtime must not leave the endpoint's old slot set running beside the group's.
 // shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
+// This stays adapter-side (ADR 0004 consequence): it repairs the queue-key references the
+// connection records carry, which needs the config.js group rule.
 function rebuildQueues() {
 	const rebuilt = new Map();
-	for (const [key, queue] of queues) {
+	for (const [key, queue] of scheduler.queues) {
 		const target = groupFor(key);
 		let moved = rebuilt.get(target);
 		if (!moved) {
-			moved = newQueue(target);
+			moved = scheduler.newQueue(target);
 			rebuilt.set(target, moved);
 		}
 		moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
@@ -445,16 +347,21 @@ function rebuildQueues() {
 			moved.holders.push(lease);
 		}
 		for (const waiter of queue.waiting) {
-			waiter.queue = moved;
+			waiter.queueKey = target;
 			moved.waiting.push(waiter);
 		}
 	}
-	queues.clear();
-	for (const [key, queue] of rebuilt) queues.set(key, queue);
+	scheduler.queues.clear();
+	for (const [key, queue] of rebuilt) scheduler.queues.set(key, queue);
 	// One clock stamp per reload: every grant this rebuild makes uses this single value.
 	const now = Date.now();
-	for (const queue of queues.values()) grantNext(queue, now);
+	const decisions = [];
+	for (const queue of scheduler.queues.values()) scheduler.grantNext(queue, now, decisions);
+	emit(decisions);
 }
+
+// Sweep timer: the adapter reads the wall clock and hands the Scheduler a stamp.
+setInterval(() => emit(scheduler.sweepAt(Date.now())), sweepMs).unref();
 
 // Hot-reload: a config edit re-applies queue policy to live queues and grants whoever the
 // new capacity frees — no daemon restart, no pi restart. A half-written file keeps the last
@@ -475,6 +382,7 @@ if (configPath) {
 			}
 			config = next.config;
 			defaults = config.defaults ?? {};
+			scheduler.applyPolicy();
 			rebuildQueues();
 		}, 250);
 		debounce.unref();
