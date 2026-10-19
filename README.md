@@ -34,7 +34,7 @@ That single command is the whole install:
    reclaim, idle-exit after the last client leaves). Nothing to run manually, no launch agent, no
    systemd unit — and no stderr to read afterwards, which is why `logFile` is the durable record.
 3. **Config file** — `~/.pi/agent/llm-queue.json` is created for you on the first launch, and an
-   existing file is reconciled add-only on every later session start (see
+   existing file is reconciled add-only on the first session start of each pi process (see
    [Auto-starter](#auto-starter-first-launch) below). It hot-reloads on save. An empty file
    queues nothing, because queue keys are what select the providers to wrap; add a `queues`
    entry per provider/endpoint to widen the queue (reference below).
@@ -43,11 +43,15 @@ That single command is the whole install:
 
 On the first session start after install, when `~/.pi/agent/llm-queue.json` is absent, the
 extension generates a starter config from your `~/.pi/agent/models.json` and notifies you — the
-queue is live from that first session, no manual config needed. On every later session start an
-existing file is **reconciled add-only**: a self-hosted endpoint that no entry addresses gains its
-Queue key as `enabled: true`, and nothing already in the file is touched — not a tuned entry, not an
-explicit `enabled: false`, not the `defaults` block. A config the schema rejects is left alone (its
-rejection is already reported at session start).
+queue is live from that first session, no manual config needed. On the first session start of
+each later pi process an existing file is **reconciled add-only**: a self-hosted endpoint that
+no entry addresses gains its Queue key as `enabled: true`, and nothing already in the file is
+touched — not a tuned entry, not an explicit `enabled: false`, not the `defaults` block.
+Reconcile runs once per process, inside the same guard as provider registration: a session
+started later in the same process does not trigger it, and a config edited mid-process is
+hot-reloaded for queue policy and the wrap set, so a key the file is missing waits for the next
+pi process. A config the schema rejects is left alone (its rejection is already reported at
+session start).
 
 - **Self-hosted endpoints are queued** (enabled, default single slot → strict serialisation). A
   provider is self-hosted when its baseUrl host is loopback (`localhost`, `127.x`, `::1`),

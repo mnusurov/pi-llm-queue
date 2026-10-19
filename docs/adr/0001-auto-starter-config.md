@@ -8,6 +8,11 @@ Accepted (implements #37 / #38). Amended by #46 (spec #43) in two clauses: the S
 writes a `defaults` block carrying the parent queue-wait cap, and "create-if-missing, never
 overwrite" becomes add-only reconcile of a missing Queue key.
 
+The #43 review pass amended three more claims, because the docs had run ahead of the code: the
+byte-for-byte guarantee covers a tuned entry's serialized text, not the file's layout; reconcile
+runs on the first `session_start` of a pi process, not on every later one; and the 120 s cap
+binds from the next pi restart, not on the session that writes the file.
+
 ## Context
 
 A fresh install shipped with `~/.pi/agent/llm-queue.json` absent, and a missing config queues
@@ -35,21 +40,27 @@ from the user's own `~/.pi/agent/models.json`:
 - **Native exclusion.** Providers owned by native extensions are excluded from the starter.
 - **Create-if-missing, then add-only reconcile.** Write a starter only when the file is absent; the
   create guard is re-checked immediately before an atomic rename, so a racing first launch is
-  last-writer-wins with identical content. On every later `session_start` an existing file is
-  reconciled: each self-hosted, non-native endpoint that no existing entry addresses gains its Queue
-  key as `enabled: true`, and nothing already in the file is modified — not a tuned entry, not an
-  explicit `enabled: false`, not the `defaults` block. An endpoint an entry already addresses (its
+  last-writer-wins with identical content. The first `session_start` of a pi process reconciles an
+  existing file: each self-hosted, non-native endpoint that no existing entry addresses gains its
+  Queue key as `enabled: true`, and nothing already in the file is modified — not a tuned entry, not
+  an explicit `enabled: false`, not the `defaults` block. An endpoint an entry already addresses (its
   own key, a provider-name key naming it, or a Group's `match`) counts as addressed, so reconcile
   never splits a queue in two. A config the schema rejects is left alone: its rejection is already
   reported at session start, and writing into it would bury that report.
+- **Reconcile runs once per process.** Provider registration is deferred to the first
+  `session_start` and guarded one-shot, and scaffold and reconcile run inside that guard: a second
+  session started in the same pi process does not reconcile. What re-triggers a reconcile is a new
+  pi process — a restart, or a new `pi` invocation. A config edited mid-process is hot-reloaded for
+  queue policy and the wrapped provider set, so an entry the user adds by hand takes effect at once;
+  an endpoint the file is missing waits for the next process to be added.
 - **"Byte-for-byte unchanged for those keys" is the entry's text, not the file's layout.** The
   reconcile write re-serializes the whole file as `JSON.stringify(data, null, 2)`, so a tuned entry
   survives with its exact serialized text — key, fields, field order, values — while the file's own
   layout is the generator's 2-space shape: a compact or 4-space user file is reflowed by the write
   that adds a key. A file reconcile does not write (nothing missing, or a rejected config) keeps
-  every byte. Preserving a user's own indentation would need a text edit of the file rather than a
-  parse-and-reserialize, and the write is guarded on the parsed content it is based on; the entry's
-  text is what the guarantee covers, and a test pins it.
+  every byte. Keeping a user's own indentation would mean editing the file's text instead of parsing
+  and re-serializing it, and the atomic write is guarded by re-reading the raw text it was based on
+  immediately before the rename; the entry's text is what the guarantee covers, and a test pins it.
 - **Shape.** `schemaVersion: 1`, one endpoint-keyed `queues` entry per baseUrl (deduplicated,
   sorted), and a `defaults` block containing only the parent queue-wait cap `queueTimeoutMs` (120 s).
   Nothing else in `defaults`: every other field stays absent so the schema's own defaults apply, and
