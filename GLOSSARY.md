@@ -83,6 +83,19 @@ The lease's expiry horizon: a client that dies mid-stream stops refreshing and t
 reclaimed when the TTL lapses.
 _Avoid_: timeout, expiry (as an event)
 
+**Counted client**:
+A connection the daemon counts toward its own lifetime, from its first state-touching op
+(`acquire`, `renew`, `role`, `cancel`) until it closes: the daemon exits `daemonIdleExitMs`
+(default 0 = at once) after the last one goes, so its lifetime is the union of the live pi
+processes' (#60). A `status`-only connection — an Observer — changes no queue state and is never
+counted, so polling cannot keep stale code alive.
+_Avoid_: client (unqualified), watcher, resident connection
+
+**Observer**:
+A reader of `status` (the `/queue` indicator, a dashboard, a monitoring script) that opens its own
+connection and never touches queue state; invisible to the daemon's lifetime.
+_Avoid_: poller, monitor
+
 ### Scheduler
 
 **Tier**:
