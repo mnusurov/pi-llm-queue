@@ -1,6 +1,6 @@
 // pi-llm-queue extension: wraps configured providers so a session holds the endpoint's slot for
 // its whole run, keeping the KV cache warm for one session at a time.
-import { existsSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, basename, dirname } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
@@ -25,6 +25,10 @@ const DAEMON_PATH = decodeURIComponent(new URL("daemon.js", import.meta.url).pat
 const GRACE_MS = 3000;
 // Shown when a parent's queue wait exceeds queueTimeoutMs; the request stays queued.
 const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — still waiting";
+// The only defaults field a Starter config writes: a Parent's queue-wait cap, above a long Child
+// generation (the 2026-10-18 run held the Slot 11+ minutes) so a stuck queue warns visibly while
+// the normal case stays silent. Children keep an unbounded wait — this cap is parent-only.
+const STARTER_QUEUE_TIMEOUT_MS = 120000;
 
 interface QueueEntry {
 	maxStreams?: number;
@@ -59,7 +63,8 @@ export function isLocalEndpoint(baseUrl?: string): boolean {
 /**
  * Starter config for a fresh install: one queue per endpoint baseUrl (deduplicated, sorted),
  * self-hosted enabled with the default single slot, cloud as passthrough, native-owned providers
- * excluded. Null when there is nothing to scaffold: no self-hosted, non-native endpoint.
+ * excluded, and a `defaults` block carrying only the parent queue-wait cap. Null when there is
+ * nothing to scaffold: no self-hosted, non-native endpoint.
  */
 export function buildStarterConfig(providers: Record<string, any>, isNativeOwned: (name: string) => boolean) {
 	const collected: Record<string, { enabled: boolean }> = {};
@@ -72,13 +77,43 @@ export function buildStarterConfig(providers: Record<string, any>, isNativeOwned
 	if (!keys.some((key) => collected[key].enabled)) return null;
 	const queues: Record<string, { enabled: boolean }> = {};
 	for (const key of keys) queues[key] = collected[key];
-	return { schemaVersion: SCHEMA_VERSION, queues };
+	return { schemaVersion: SCHEMA_VERSION, defaults: { queueTimeoutMs: STARTER_QUEUE_TIMEOUT_MS }, queues };
 }
 
 /** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
 function matchingProviders(key: string, providers: Record<string, any>): string[] {
 	if (providers[key]) return [key];
 	return Object.keys(providers).filter((name) => providers[name]?.baseUrl === key);
+}
+
+/** True when a queue key addresses this endpoint: it names the endpoint, a provider serving it, or a provider name on it. */
+function keyAddressesEndpoint(key: string, providers: Record<string, any>, baseUrl: string): boolean {
+	return matchingProviders(key, providers).some((name) => providers[name]?.baseUrl === baseUrl);
+}
+
+/**
+ * Queue keys a Starter config would add to an existing file: self-hosted endpoints served by a
+ * non-native provider that no existing entry addresses. Add-only — a key that is already present,
+ * tuned or `enabled: false`, is left alone, and a cloud endpoint is never added, so the file's own
+ * choices always win and a deliberate passthrough stays a deliberate passthrough.
+ */
+export function reconcileStarterKeys(
+	providers: Record<string, any>,
+	queues: Record<string, QueueEntry>,
+	isNativeOwned: (name: string) => boolean,
+): string[] {
+	const keys = Object.keys(queues ?? {});
+	const added: string[] = [];
+	for (const [name, provider] of Object.entries(providers ?? {})) {
+		const baseUrl = provider?.baseUrl;
+		if (!baseUrl || isNativeOwned(name) || !isLocalEndpoint(baseUrl)) continue;
+		// An endpoint an entry already addresses — its own key, a provider-name key naming it, or a
+		// Group's match — is queued (or disabled on purpose); adding the baseUrl key would split it
+		// into a second queue and take the Slot away from the user's entry.
+		const covered = keys.some((key) => [key, ...(queues[key]?.match ?? [])].some((member) => keyAddressesEndpoint(member, providers, baseUrl)));
+		if (!covered) added.push(baseUrl);
+	}
+	return added.sort();
 }
 
 /**
@@ -456,32 +491,71 @@ export default function (pi: ExtensionAPI) {
 		watcher.unref();
 	};
 
-	// Fresh install: no config file means the queue is inert. Write a starter built from the user's
+	// Fresh install: no config file means the queue is inert. Write a Starter built from the user's
 	// own models.json so the very first launch queues, then reload it and register in this session.
+	// An existing file is reconciled add-only (ADR 0001): a self-hosted endpoint with no Queue key
+	// gains one, and nothing already in the file is modified, so manual tuning and an explicit
+	// `enabled: false` stay stable across restarts.
 	const scaffoldStarterConfig = (ctx: ExtensionContext) => {
-		if (existsSync(CONFIG_PATH)) return;
-		const starter = buildStarterConfig(modelsJson, (name) => !!ctx.modelRegistry.getRegisteredNativeProvider?.(name));
-		if (!starter) return;
+		const isNativeOwned = (name: string) => !!ctx.modelRegistry.getRegisteredNativeProvider?.(name);
+		let current: string | null;
+		try {
+			current = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : null;
+		} catch {
+			return; // an unreadable config (a directory, EACCES) must not throw in session_start
+		}
+		if (current === null) {
+			const starter = buildStarterConfig(modelsJson, isNativeOwned);
+			if (!starter || !writeStarterConfig(null, starter)) return;
+			if (!adoptStarterConfig()) return;
+			const enabled = Object.values(queues).filter((entry) => entry?.enabled !== false).length;
+			ctx.ui.notify(`pi-llm-queue: created ${CONFIG_PATH} — ${enabled} self-hosted endpoint(s) queued. Tune "enabled" / "maxStreams" there, see status with /queue.`, "info");
+			return;
+		}
+		const loaded = loadValidConfig(CONFIG_PATH);
+		// An invalid file is already reported by the config-rejected notify at session_start; writing
+		// into it would bury that report, so reconcile leaves the file to the user.
+		if (loaded.errors.length) return;
+		const present = (loaded.config.queues ?? {}) as Record<string, QueueEntry>;
+		const added = reconcileStarterKeys(modelsJson, present, isNativeOwned);
+		if (!added.length) return;
+		// Add-only: existing entries and the `defaults` block are carried over untouched.
+		const reconciled = { ...loaded.config, queues: { ...present, ...Object.fromEntries(added.map((key) => [key, { enabled: true }])) } };
+		if (!writeStarterConfig(current, reconciled)) return;
+		if (!adoptStarterConfig()) return;
+		ctx.ui.notify(
+			`pi-llm-queue: added ${added.join(", ")} to ${CONFIG_PATH} — self-hosted endpoint(s) queued; nothing existing was changed. Tune "enabled" / "maxStreams" there, see status with /queue.`,
+			"info",
+		);
+	};
+
+	// Adopt the file just written: the same session must queue the created / reconciled keys, and
+	// registerQueuedProviders runs right after this in session_start.
+	const adoptStarterConfig = () => {
+		const next = loadValidConfig(CONFIG_PATH);
+		if (next.errors.length) return false;
+		config = next.config;
+		queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+		return true;
+	};
+
+	// Atomic write: tmp file, then rename. The guard is re-checked immediately before the rename —
+	// `expected` is the content the write is based on (null for a create) — so a racing session_start
+	// or a user edit wins and this write is dropped rather than clobbering it.
+	const writeStarterConfig = (expected: string | null, data: unknown) => {
 		const tmp = `${CONFIG_PATH}.tmp-${process.pid}`;
 		try {
-			writeFileSync(tmp, `${JSON.stringify(starter, null, 2)}\n`);
-			// rename overwrites, so the create-if-missing guard is checked right before it; a racing
-			// first-launch is last-writer-wins with identical content.
-			if (existsSync(CONFIG_PATH)) return;
+			writeFileSync(tmp, `${JSON.stringify(data, null, 2)}\n`);
+			if ((existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : null) !== expected) return false;
 			renameSync(tmp, CONFIG_PATH);
+			return true;
 		} catch {
-			return; // unwritable agent dir: stay inert as before
+			return false; // unwritable agent dir: stay inert as before
 		} finally {
 			try {
 				unlinkSync(tmp);
 			} catch {}
 		}
-		const next = loadValidConfig(CONFIG_PATH);
-		if (next.errors.length) return;
-		config = next.config;
-		queues = (config.queues ?? {}) as Record<string, QueueEntry>;
-		const enabled = Object.values(queues).filter((entry) => entry?.enabled !== false).length;
-		ctx.ui.notify(`pi-llm-queue: created ${CONFIG_PATH} — ${enabled} self-hosted endpoint(s) queued. Tune "enabled" / "maxStreams" there, see status with /queue.`, "info");
 	};
 
 	pi.on("session_start", (_event, ctx) => {

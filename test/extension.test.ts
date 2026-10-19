@@ -118,10 +118,11 @@ describe("starter config generation", () => {
 		const starter = buildStarterConfig(providers, native)!;
 		assert.deepEqual(Object.keys(starter.queues), [...Object.keys(starter.queues)].sort());
 	});
-	it("carries schemaVersion 1 and no defaults block", () => {
+	it("carries schemaVersion 1, the parent queue-wait cap as its only defaults field, then queues", () => {
 		const starter = buildStarterConfig(providers, native)!;
 		assert.equal(starter.schemaVersion, 1);
-		assert.deepEqual(Object.keys(starter), ["schemaVersion", "queues"]);
+		assert.deepEqual(Object.keys(starter), ["schemaVersion", "defaults", "queues"]);
+		assert.deepEqual(starter.defaults, { queueTimeoutMs: 120000 });
 	});
 	it("returns nothing to scaffold for an empty catalog, an all-cloud catalog and an all-native catalog", () => {
 		assert.equal(buildStarterConfig({}, () => false), null);
