@@ -85,10 +85,12 @@ _Avoid_: timeout, expiry (as an event)
 
 **Counted client**:
 A connection the daemon counts toward its own lifetime, from its first state-touching op
-(`acquire`, `renew`, `role`, `cancel`) until it closes: the daemon exits `daemonIdleExitMs`
-(default 0 = at once) after the last one goes, so its lifetime is the union of the live pi
-processes' (#60). A `status`-only connection — an Observer — changes no queue state and is never
-counted, so polling cannot keep stale code alive.
+(`acquire`, `renew`, `role`, `cancel`) until it closes or says `bye`: the daemon exits
+`daemonIdleExitMs` (default 0 = at once) after the last one goes, so its lifetime is the union of
+the live pi processes' (#60). A graceful pi says `bye` at `session_shutdown` (#63), so the exit
+arms at the word, not at process death; a crash still counts as a close. A `status`-only
+connection — an Observer — changes no queue state and is never counted, so polling cannot keep
+stale code alive.
 _Avoid_: client (unqualified), watcher, resident connection
 
 **Observer**:

@@ -292,6 +292,26 @@ export class LeaseClient {
 		return msg.granted !== false;
 	}
 
+	/**
+	 * Shutdown intent (#63): announce "this client is leaving" to the daemon, then close the
+	 * socket. The daemon treats bye as a disconnect (release leases, decrement the client count),
+	 * so the idle-exit arms at the word — a pi process that lingers after its last session cannot
+	 * keep the daemon resident. Fire-and-forget: no reply, like role/cancel. Idempotent: pi
+	 * converges cancellation, reload, session replacement and exit on the same shutdown path.
+	 */
+	bye(): void {
+		if (this.heartbeat) {
+			clearInterval(this.heartbeat);
+			this.heartbeat = null;
+		}
+		const sock = this.sock;
+		if (!sock) return;
+		try {
+			sock.write(`${JSON.stringify({ op: "bye" })}\n`);
+		} catch {}
+		sock.destroy(); // the close handler clears this.sock and fail-opens any pending request
+	}
+
 	async status(): Promise<StatusReply | null> {
 		if (!(await this.connectDaemon())) return null;
 		this.refSocket();

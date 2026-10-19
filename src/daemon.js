@@ -329,6 +329,14 @@ function handle(msg, conn) {
 				})),
 			});
 			return;
+		case "bye":
+			// Shutdown intent: pi's session_shutdown announces "this connection is leaving" while
+			// the socket is still open. Treating it as a disconnect (the same cleanup a close runs:
+			// release leases, drop waiters, decrement the client count) arms the idle-exit at the
+			// word, so a lingering pi process cannot keep the daemon resident past its last session.
+			// No reply, like role/cancel; the connection is spent — the client destroys its socket.
+			cleanup(conn);
+			return;
 		default:
 			send(conn, { op: "error", reason: `unknown op: ${msg.op}` });
 	}

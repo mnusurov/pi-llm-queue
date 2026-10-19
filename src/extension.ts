@@ -652,5 +652,8 @@ export default function (pi: ExtensionAPI) {
 		state.release();
 		state.clearQueued(); // a shutdown while queued must not leave the indicator up
 		sessions.delete(state.sessionKey);
+		// The last session of this pi process says bye: the daemon counts this connection, so the
+		// idle-exit arms at the word and a lingering process cannot keep stale daemon code alive.
+		if (sessions.size === 0) lease.bye();
 	});
 }
