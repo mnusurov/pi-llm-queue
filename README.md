@@ -18,14 +18,14 @@ built-in type stripping) on macOS/Linux (unix socket). Zero runtime dependencies
 the `@earendil-works/*` peer packages.
 
 ```bash
-pi install git:github.com/mnusurov/pi-llm-queue@v0.1.0
+pi install npm:pi-llm-queue
 ```
 
-The `@v0.1.0` ref pins the install to that tag: `pi update --extensions` reconciles the checkout
-but never moves a configured ref, so a pinned install stays where you put it. Drop the ref
-(`pi install git:github.com/mnusurov/pi-llm-queue`) to follow the default branch. To try it for
-one session without writing anything to settings: `pi -e git:github.com/mnusurov/pi-llm-queue@v0.1.0`.
-From a clone, `pi install ./pi-llm-queue` loads the working tree directly, which is the dev path.
+Pin a version with `pi install npm:pi-llm-queue@0.1.0`; try one session without writing anything to
+settings with `pi -e npm:pi-llm-queue`. Git sources work too and pin by tag:
+`pi install git:github.com/mnusurov/pi-llm-queue@v0.1.0` (a git ref is pinned — `pi update
+--extensions` reconciles the checkout but never moves a configured ref), and from a clone
+`pi install ./pi-llm-queue` loads the working tree directly, which is the dev path.
 
 That single command is the whole install:
 
