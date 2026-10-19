@@ -89,8 +89,9 @@ without a switch.
 _Avoid_: cooldown, buffer
 
 **Sweep**:
-The daemon's periodic pass (`--sweep-ms`, default 1 s) that evicts leases whose TTL has lapsed, whether or not anyone is
-waiting, so `/queue` never reports a ghost holder.
+The daemon's periodic pass (`--sweep-ms`, default 1 s) that evicts leases whose TTL has lapsed,
+whether or not anyone is waiting, so `/queue` never reports a ghost holder, then idle-yields an
+activity-flagged lease silent past `idleYieldMs` when waiters are present (ADR 0003).
 _Avoid_: GC, reaper
 
 ### Roles and config
@@ -113,7 +114,9 @@ _Avoid_: alias set, bundle
 
 **Starter config**:
 The config a fresh install auto-generates from the user's own model catalog, queueing only
-self-hosted endpoints.
+self-hosted endpoints, with a `defaults` block carrying only the Parent queue-wait cap. On a later
+session start it reconciles add-only: a Queue key a self-hosted endpoint is missing is added, and
+nothing already in the file is modified.
 _Avoid_: default config, scaffold
 
 **Fail-open**:

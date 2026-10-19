@@ -1,4 +1,4 @@
-// Nothing to scaffold: a machine with no self-hosted, non-native endpoint must stay untouched —
+// Nothing to queue: a machine with no self-hosted, non-native endpoint must stay untouched —
 // no file, no notify, no wrapped provider.
 import assert from "node:assert/strict";
 import { it } from "node:test";

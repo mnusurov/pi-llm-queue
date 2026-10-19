@@ -133,7 +133,7 @@ describe("provider wrapper (queuedStream)", () => {
 		await sleep(200);
 
 		let q = await queueStatus();
-		assert.deepEqual(q.holders, ["ONE-A"], "A holds the slot");
+		assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["ONE-A"], "A holds the slot");
 		assert.deepEqual(
 			q.waiting.map((w: any) => w.sessionKey),
 			["ONE-B"],
@@ -149,7 +149,7 @@ describe("provider wrapper (queuedStream)", () => {
 		);
 
 		q = await queueStatus();
-		assert.deepEqual(q.holders, ["ONE-A"], "B did not evict A");
+		assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["ONE-A"], "B did not evict A");
 
 		pi.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn
 		await startedB;
@@ -170,7 +170,7 @@ describe("provider wrapper (queuedStream)", () => {
 		await startedA;
 
 		let q = await queueStatus();
-		assert.deepEqual(q.holders, ["RACE-A"], "A holds the slot");
+		assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["RACE-A"], "A holds the slot");
 		assert.deepEqual(
 			q.waiting.map((w: any) => w.sessionKey),
 			["RACE-B"],
@@ -184,7 +184,7 @@ describe("provider wrapper (queuedStream)", () => {
 			"B stays blocked while A's run holds the slot",
 		);
 		q = await queueStatus();
-		assert.deepEqual(q.holders, ["RACE-A"], "A's stream did not release the run's slot");
+		assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["RACE-A"], "A's stream did not release the run's slot");
 
 		pi.handlers["session_shutdown"][0]({}, ctxA); // A releases: B's turn
 		assert.equal(
@@ -392,7 +392,7 @@ describe("provider wrapper (queuedStream)", () => {
 		const raw = await connectClient(socketPath);
 		raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "RAW", role: "parent" }); // queued behind it
 
-		// The lease is gone (TTL expiry of a starved heartbeat, a disconnect release: the daemon
+		// The lease is gone (a TTL lapse of a starved heartbeat, a disconnect release: the daemon
 		// answers a beat ungranted). Here a release on its sessionKey takes the slot for RAW.
 		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "EVICTED" });
 		assert.deepEqual(await raw.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "RAW" }, "the freed slot goes to the waiter");
@@ -430,11 +430,44 @@ describe("provider wrapper (queuedStream)", () => {
 		const notes: string[] = [];
 		const ctx = makeCtx("QUEUE", undefined, { notify: (text: string) => notes.push(text), setStatus: () => {} });
 		await a.commands["queue"].handler("", ctx);
-		assert.match(notes.join("\n"), /free-api: slot FREE \(1\/passthrough\)/, "status must not read as a daemon bug");
+		assert.match(notes.join("\n"), /free-api: slot FREE parent \(1\/passthrough\)/, "status must not read as a daemon bug");
 
 		raw.send({ op: "release", queueKey: "free-api", sessionKey: "FREE" });
 		raw.close();
 		a.handlers["session_shutdown"][0]({}, ctx);
+	});
+
+	it("renders tier and group label for Holders and Waiters in the status line", async () => {
+		// The tier a session queues as comes from the env contract: pin it so the rendered line is
+		// deterministic wherever the suite runs (a lane running these tests is itself a child).
+		// The pin goes in a try/finally: an assert that fails mid-test must not leave PI_QUEUE_ROLE
+		// pinned for every suite that runs after it in this file.
+		const savedRole = process.env.PI_QUEUE_ROLE;
+		process.env.PI_QUEUE_ROLE = "parent";
+		try {
+			const a = makePi();
+			extension(a as any);
+			const ctx = start(a, "TIER-PARENT");
+			await a.handlers["agent_start"][0]({}, ctx); // the parent session holds the slot for its run
+
+			const raw = await connectClient(socketPath);
+			raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "TIER-CHILD", role: "child", group: "scout" });
+			await assert.rejects(raw.next(200), /no message from daemon within/, "the child waits behind the parent");
+
+			const notes: string[] = [];
+			const statusCtx = makeCtx("TIER-PARENT", undefined, { notify: (text: string) => notes.push(text), setStatus: () => {} });
+			await a.commands["queue"].handler("", statusCtx);
+			const line = notes.join("\n");
+			assert.match(line, /TIER-PARENT parent/, "a Holder is named with its tier beside its session id");
+			assert.match(line, /TIER-CHILD child scout/, "a Waiter is named with its tier and group label");
+
+			raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "TIER-PARENT" });
+			raw.close();
+			a.handlers["session_shutdown"][0]({}, ctx);
+		} finally {
+			if (savedRole === undefined) delete process.env.PI_QUEUE_ROLE;
+			else process.env.PI_QUEUE_ROLE = savedRole;
+		}
 	});
 });
 

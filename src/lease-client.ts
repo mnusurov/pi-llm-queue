@@ -23,6 +23,28 @@ export interface DaemonPaths {
 /** Why an acquire resolved: granted, daemon-unreachable, or aborted. */
 export type AcquireReason = "granted" | "fail-open" | "aborted";
 
+/** One entry of the status reply: a Holder or a Waiter, reported by tier and group label. */
+export interface StatusSession {
+	sessionKey: string;
+	role: Role;
+	/** The `group` label the client acquired with; absent when it sent none. */
+	group?: string;
+}
+
+export interface StatusQueue {
+	queueKey: string;
+	/** null is JSON's form of Infinity: a passthrough queue has unlimited slots. */
+	maxStreams: number | null;
+	switches: number;
+	holders: StatusSession[];
+	waiting: StatusSession[];
+}
+
+export interface StatusReply {
+	op: "status";
+	queues: StatusQueue[];
+}
+
 /**
  * Start the daemon when nothing owns the socket. No liveness probe here: the daemon's own
  * start() resolves the race (a live socket makes the second daemon exit 0, a stale socket file
@@ -187,9 +209,11 @@ export class LeaseClient {
 		const report = async () => {
 			const s = await this.status();
 			if (settled) return; // the grant landed mid-poll: never re-arm the indicator after it
-			const q = s?.queues?.find((q: any) => q.queueKey === queueKey);
-			const at = q?.waiting.findIndex((w: any) => w.sessionKey === sessionKey) ?? -1;
-			if (at >= 0) onQueued?.({ position: at + 1, holders: q.holders });
+			const q = s?.queues.find((entry) => entry.queueKey === queueKey);
+			const at = q?.waiting.findIndex((w) => w.sessionKey === sessionKey) ?? -1;
+			// The indicator names the slot holders by session id only: tier and group are for a
+			// dashboard, not for the waiting UX, which stays as it was.
+			if (q && at >= 0) onQueued?.({ position: at + 1, holders: q.holders.map((h) => h.sessionKey) });
 		};
 		const firstPoll = onQueued
 			? setTimeout(() => {
@@ -268,7 +292,7 @@ export class LeaseClient {
 		return msg.granted !== false;
 	}
 
-	async status(): Promise<any> {
+	async status(): Promise<StatusReply | null> {
 		if (!(await this.connectDaemon())) return null;
 		this.refSocket();
 		this.send({ op: "status" });

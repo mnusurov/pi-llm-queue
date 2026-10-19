@@ -2,7 +2,7 @@
 // pi-llm-queue daemon: serialises model access per endpoint over a unix socket.
 // Protocol: newline-delimited JSON. See docs/daemon-protocol.md.
 import { createConnection, createServer } from "node:net";
-import { existsSync, readFileSync, unlinkSync, watch } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadValidConfig, groupKeyFor, queueEntryFor } from "./config.js";
 
@@ -41,6 +41,33 @@ if (modelsJsonPath && existsSync(modelsJsonPath)) {
 
 function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
+}
+
+// One session as a client reads it: id, tier, group label. A Lease (Holder) and a Waiter carry the
+// same three fields, so `status` reports both lists through this one view and cannot drift apart.
+function sessionView(entry) {
+	return { sessionKey: entry.sessionKey, role: entry.role, group: entry.group };
+}
+
+// Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
+// finished run can be read back from one file — the extension spawns the daemon detached and its
+// stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
+// move it. The queue key logged is the queue that owns the slot: a group's name when the client
+// addressed it by a member key. Callers pass the role off the Lease (or the Waiter, while it is
+// still queued), never off the acquire message: `status` reports the same field, so a reader can
+// never see the log and the reply disagree about the tier a session holds.
+function logEvent(event, queue, sessionKey, role, reason) {
+	const path = defaults.logFile;
+	if (!path) return;
+	const line = { event, queueKey: queue.queueKey, sessionKey, role, ts: new Date().toISOString() };
+	if (reason) line.reason = reason;
+	// Best effort, swallowed: a bad path, a full disk or a log rotation race must never take the
+	// daemon down (it is spawned detached, so a crash is silent) nor reject the request that logged.
+	// appendFileSync, not a stream: one short line per event, on disk before the reply goes out, so
+	// a reader reads the file the moment the reply lands and a crash loses no buffered line.
+	try {
+		appendFileSync(path, `${JSON.stringify(line)}\n`, "utf8");
+	} catch {}
 }
 
 const queues = new Map();
@@ -82,7 +109,7 @@ function applyPolicy(queue, policy) {
 	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
 	queue.maxStreams = policy.enabled === false ? Infinity : pick("maxStreams", 1);
 	// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49), so the
-	// slot moves on voluntary release, abort, disconnect, or TTL expiry alone. "fifo" opts a
+	// slot moves on voluntary release, abort, disconnect, or a TTL lapse alone. "fifo" opts a
 	// queue out of parent/child tiering and aging (external multi-slot queues).
 	queue.ttlMs = pick("leaseTtlMs", 30000);
 	// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after
@@ -104,10 +131,11 @@ function queueFor(key) {
 	return queues.get(queueKey);
 }
 
-// A lease is the holder's record: its TTL deadline. The same object lives in conn.leases, so a
-// client heartbeat refreshes it in place.
-function newLease(queue, sessionKey, conn, activity) {
-	return { queueKey: queue.queueKey, sessionKey, conn, expires: Date.now() + queue.ttlMs, activity: !!activity, lastActivityAt: Date.now() };
+// A lease is the holder's record: its TTL deadline, plus the tier it was acquired with and the
+// group label it came in with, so `status` can report a Holder by tier and label and not only by
+// session id. The same object lives in conn.leases, so a client heartbeat refreshes it in place.
+function newLease(queue, sessionKey, conn, activity, role, group) {
+	return { queueKey: queue.queueKey, sessionKey, conn, role, group, expires: Date.now() + queue.ttlMs, activity: !!activity, lastActivityAt: Date.now() };
 }
 
 function leaseOf(queue, sessionKey) {
@@ -135,9 +163,11 @@ function grantNext(queue) {
 		const waiter = pickNext(queue);
 		remove(queue.waiting, waiter);
 		queue.parentGrantStreak = waiter.role === "parent" ? queue.parentGrantStreak + 1 : 0;
-		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity);
+		const lease = newLease(queue, waiter.sessionKey, waiter.conn, waiter.activity, waiter.role, waiter.group);
 		queue.holders.push(lease);
 		queue.switches++; // handing the slot to a new session is the switch that re-prefills the KV cache
+		logEvent("grant", queue, lease.sessionKey, lease.role);
+		logEvent("switch", queue, lease.sessionKey, lease.role);
 		remove(waiter.conn.queued, waiter);
 		waiter.conn.leases.push(lease);
 		send(waiter.conn, { op: "granted", queueKey: waiter.requestedKey, sessionKey: waiter.sessionKey });
@@ -154,18 +184,21 @@ function release(queue, sessionKey, reason) {
 	if (lease) {
 		remove(queue.holders, lease);
 		remove(lease.conn.leases, lease);
+		// The log names the cause: a TTL reclaim is an evict — the only eviction reason after ADR
+		// 0002 — a yield is a release with reason "idle", a voluntary return a bare release.
+		logEvent(reason === "ttl" ? "evict" : "release", queue, sessionKey, lease.role, reason);
 	}
 	grantNext(queue);
 }
 
-// Evict holders whose lease expired: a crashed session stops heartbeating and loses its slot.
+// Evict holders whose lease has lapsed: a crashed session stops heartbeating and loses its slot.
 // A live holder is never preempted (#49) — every switch re-prefills the KV cache, and a
 // child-to-child preemption benefits nobody. The sweep is unconditional so `/queue` never
 // reports a ghost holder, whether or not anyone is waiting.
 function sweep() {
 	const now = Date.now();
 	for (const queue of queues.values()) {
-		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey);
+		for (const lease of [...queue.holders]) if (now > lease.expires) release(queue, lease.sessionKey, "ttl");
 		// Idle-yield: an activity-flagged holder silent past idleYieldMs with waiters present yields
 		// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
 		if (queue.idleYieldMs > 0 && queue.waiting.length > 0) {
@@ -190,6 +223,9 @@ function handle(msg, conn) {
 	switch (msg.op) {
 		case "acquire": {
 			const queue = queueFor(msg.queueKey);
+			// One read of the tier: an unlabelled request is a Parent, and the same value goes on the
+			// Lease, on the Waiter, and into the parent-grant streak that drives aging.
+			const role = msg.role ?? "parent";
 			const held = leaseOf(queue, msg.sessionKey);
 			if (held) {
 				held.expires = Date.now() + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
@@ -197,18 +233,20 @@ function handle(msg, conn) {
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
-				const lease = newLease(queue, msg.sessionKey, conn, msg.activity);
+				const lease = newLease(queue, msg.sessionKey, conn, msg.activity, role, msg.group);
 				queue.holders.push(lease);
 				conn.leases.push(lease);
 				// A direct grant counts toward the parent-grant streak too: a parent that never
 				// queues must not starve a queued child past agingAfterSlots.
-				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
+				queue.parentGrantStreak = role === "parent" ? queue.parentGrantStreak + 1 : 0;
+				logEvent("grant", queue, lease.sessionKey, lease.role);
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
-			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
+			const waiter = { sessionKey: msg.sessionKey, role, group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
+			logEvent("queued", queue, waiter.sessionKey, waiter.role);
 			return;
 		}
 		case "release":
@@ -230,7 +268,7 @@ function handle(msg, conn) {
 		}
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
 		// Keyed renew: an activity beat — the holder is using the slot, so its TTL refreshes. The
-		// reply is authoritative: granted:false tells the client the slot is gone (TTL expiry, a
+		// reply is authoritative: granted:false tells the client the slot is gone (a TTL lapse, a
 		// release, a disconnect) and it must re-queue before it streams.
 		case "renew": {
 			if (msg.sessionKey && msg.queueKey) {
@@ -263,8 +301,10 @@ function handle(msg, conn) {
 					queueKey: q.queueKey,
 					maxStreams: q.maxStreams,
 					switches: q.switches,
-					holders: q.holders.map((l) => l.sessionKey),
-					waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role, group: w.group })),
+					// Holders are reported like Waiters: a raw client reads tier and group from the
+					// reply, so it needs no extension-side parsing to build a dashboard.
+					holders: q.holders.map(sessionView),
+					waiting: q.waiting.map(sessionView),
 				})),
 			});
 			return;
@@ -360,7 +400,7 @@ process.on("SIGTERM", () => {
 });
 
 // Rebuild queues from the reloaded config, carrying holders and waiters with them: adding a
-// group at runtime must not leave the endpoint's old slot pool running beside the group's.
+// group at runtime must not leave the endpoint's old slot set running beside the group's.
 // shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
 function rebuildQueues() {
 	const rebuilt = new Map();

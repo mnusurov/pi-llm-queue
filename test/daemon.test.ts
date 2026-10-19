@@ -215,7 +215,7 @@ describe("lease lifecycle and no preemption", () => {
 	});
 
 	// No preemption (#49): a live holder is never switched away. The slot moves only on
-	// voluntary release, abort, disconnect, or TTL expiry of a dead client.
+	// voluntary release, abort, disconnect, or the TTL lapse of a dead client.
 	it("no preemption: a silent holder keeps the slot and the waiter is granted only on release", async () => {
 		const d = start();
 		const a = await open(d);
@@ -308,7 +308,7 @@ describe("lease lifecycle and no preemption", () => {
 	});
 });
 
-describe("priority tiers and aging", () => {
+describe("tier ordering (parent > child) and aging", () => {
 	const daemons: Daemon[] = [];
 	const clients: Client[] = [];
 	const open = async (d: Daemon) => {
@@ -549,7 +549,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		a.send({ op: "status" });
 		const status = await a.next(3000);
 		assert.equal(status.queues.length, 1, "strata and llama on one endpoint share one queue");
-		assert.deepEqual(status.queues[0].holders, ["A"]);
+		assert.deepEqual(status.queues[0].holders, [{ sessionKey: "A", role: "parent" }], "a Holder with no group label reports its tier");
 
 		a.close();
 		b.close();
@@ -690,7 +690,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		d.stop();
 	});
 
-	it("hot-reloads a new group without leaving the endpoint's old slot pool behind", async () => {
+	it("hot-reloads a new group without leaving the endpoint's old slot set behind", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
 		const a = await connectClient(d.socketPath);
 		const b = await connectClient(d.socketPath);
@@ -703,7 +703,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: { gpu: { match: [GPU], maxStreams: 1 } } }));
 		await sleep(600); // reload debounce + queue rebuild
 		release(a, GPU, "A");
-		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the migrated queue keeps holder and waiter in one slot pool");
+		assert.deepEqual(await b.next(5000), granted(GPU, "B"), "the migrated queue keeps holder and waiter in one slot set");
 
 		a.close();
 		b.close();
@@ -734,6 +734,46 @@ describe("observability: status counters", () => {
 
 		a.send({ op: "status" });
 		assert.equal((await a.next(3000)).queues[0].switches, 1, "the settle-and-handoff switch is the one a normal run makes");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("reports tier and group label for every Holder and Waiter", async () => {
+		// A raw socket client builds a dashboard from the reply alone: a Holder is no longer a bare
+		// session id, and its reported tier is the one it queued as (direct grant and grantNext).
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+
+		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "P", role: "parent", group: "interactive" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "P" });
+		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "C", role: "child", group: "scout" });
+		await assert.rejects(b.next(200), /no message from daemon within/, "the child waits behind the parent");
+
+		a.send({ op: "status" });
+		const queueOf = (s: any) => s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
+		const status = queueOf(await a.next(3000));
+		assert.deepEqual(
+			[status.holders, status.waiting],
+			[
+				[{ sessionKey: "P", role: "parent", group: "interactive" }],
+				[{ sessionKey: "C", role: "child", group: "scout" }],
+			],
+			"a Holder carries role and group label exactly like a Waiter",
+		);
+
+		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "P" });
+		assert.deepEqual(await a.next(3000), { op: "ok" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "C" }, "the freed slot goes to the child");
+
+		a.send({ op: "status" });
+		assert.deepEqual(
+			queueOf(await a.next(3000)).holders,
+			[{ sessionKey: "C", role: "child", group: "scout" }],
+			"a Holder granted from the waiting list keeps the tier and label it queued as",
+		);
 
 		a.close();
 		b.close();
