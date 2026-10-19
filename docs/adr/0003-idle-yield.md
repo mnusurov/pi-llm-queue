@@ -77,3 +77,41 @@ mechanism.
   `reason: "ttl"`). No new event types.
 - `status` is unchanged — after a yield the parent is honestly neither Holder nor Waiter (it is
   not requesting).
+
+## Amendment (2026-10-19, #57): idle is "no keyed beat", not "between streams"
+
+Date: 2026-10-19
+
+Status: Accepted (amends the Decision's item 1; the daemon's item 2 is unchanged).
+
+A parallel implementer run (two Children, one queue, 2026-10-19) showed the client-side rule
+above is wrong: a Child inside a 9-minute tool call (a `bash` running tests) sends no keyed
+beat, goes activity-stale, and is idle-yielded mid-run — the two lanes alternated
+re-prefilling each other's KV cache, which is the harm the queue exists to prevent. Measured
+on 990 sessions: the 30 s default fires inside 9.06 % of compute tool calls.
+
+**Amended client rule**: the keyed beat is run-scoped, not stream-scoped. The client starts
+one keyed beat per held lease at the Grant (`agent_start` grant, stream grant) and stops it at
+release (settle grace, abort, shutdown) or when a beat answers `granted: false`. While the run
+sits in a **blocking tool** — one that waits on another agent or the user (`subagent`,
+`subagent_wait`, `bg_wait`, `ask_user`, `contact_supervisor`, `intercom`; configurable via
+`defaults.blockingTools`) — the beat pauses, so the Parent→Child handover that motivated this
+ADR is preserved.
+
+Consequences of the amendment:
+
+- Idle is defined as "no keyed beat". For a pi client that means: dead client, stalled event
+  loop, or parked on an agent/user. A compute-busy Holder is never idle; idle-yield is a
+  stall guard plus the Parent→Child handover, never a tool-pause handover.
+- `idleYieldMs` keeps its 30 s default. With run-scoped beats the threshold is purely
+  handover latency, not work interruption. Rejected alternatives:
+  - *Raise the threshold only* (60 s cuts interruptions to 2.72 %, 120 s to 0.69 %): doubles
+    to quadruples the Parent→Child handover latency for everyone, and a live 300 s experiment
+    showed the failure mode — a Child parked in `contact_supervisor` held the Slot ~18 minutes
+    and starved its sibling. 120 s remains documented for clients that do not beat per run
+    (raw socket clients, e2e scripts), where the threshold is their only protection.
+  - *A daemon-side `runActive` protocol flag*: the daemon would have to model pi's run
+    lifecycle; the client already knows it, and the version-skew `activity` flag pattern
+    says activity truth belongs in the client's beats.
+- The daemon is unchanged: keyed renew refreshes `lastActivityAt`, bare heartbeat refreshes
+  only the TTL; the sweep and the `activity` capability flag stand as decided above.

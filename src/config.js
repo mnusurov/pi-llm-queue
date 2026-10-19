@@ -27,6 +27,9 @@ const FIELDS = {
 	enabled: { kind: "bool", queuesOnly: true },
 	match: { kind: "strings", queuesOnly: true },
 	idleYieldMs: { kind: "nonNegNum" },
+	// #57: tools that park the run on another agent or the user. The client pauses its run-scoped
+	// keyed beat while one is in flight, so a parked Holder idle-yields. Client-side: defaults only.
+	blockingTools: { kind: "strings", defaultsOnly: true },
 	failOpen: { kind: "bool", defaultsOnly: true },
 	queueTimeoutMs: { kind: "posNum", defaultsOnly: true },
 	daemonIdleExitMs: { kind: "nonNegNum", defaultsOnly: true },

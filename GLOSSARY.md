@@ -53,8 +53,9 @@ _Avoid_: lock, ticket
 
 **Beat**:
 A keyed lease refresh: the holder's report that it is using the slot. The daemon's only view of
-stream activity, and its reply is the authoritative grant state. Keyed beats during streaming
-refresh `lastActivityAt`; between streams they stop, enabling idle-yield.
+stream activity, and its reply is the authoritative grant state. Keyed beats refresh
+`lastActivityAt` for the whole live run — streaming and compute tools alike — and pause only
+while the run is parked in a blocking tool, enabling idle-yield (ADR 0003 + amendment).
 _Avoid_: ping, signal
 
 **Heartbeat**:
