@@ -8,7 +8,7 @@ export const SCHEMA_VERSION = 1;
 
 /**
  * @typedef {object} FieldSpec
- * @property {"posInt"|"nonNegInt"|"posNum"|"nonNegNum"|"bool"|"strings"|"enum"} kind
+ * @property {"posInt"|"nonNegInt"|"posNum"|"nonNegNum"|"bool"|"strings"|"enum"|"path"} kind
  * @property {string[]} [values]
  * @property {number} [min] Accepted floor for a number field (inclusive).
  * @property {boolean} [defaultsOnly] Valid in `defaults` only; a per-queue entry with it is rejected.
@@ -30,6 +30,8 @@ const FIELDS = {
 	failOpen: { kind: "bool", defaultsOnly: true },
 	queueTimeoutMs: { kind: "posNum", defaultsOnly: true },
 	daemonIdleExitMs: { kind: "nonNegNum", defaultsOnly: true },
+	// The daemon's event log path (#47): a daemon-wide file, never a per-queue one.
+	logFile: { kind: "path", defaultsOnly: true },
 };
 
 const DESC = {
@@ -39,6 +41,7 @@ const DESC = {
 	nonNegNum: "a number >= 0",
 	bool: "true or false",
 	strings: "an array of strings",
+	path: "a non-empty string path",
 };
 
 const REJECT = "the whole config is rejected and defaults are used";
@@ -70,6 +73,8 @@ function checkValue(path, value, spec) {
 			return typeof value === "boolean" ? null : bad(DESC.bool);
 		case "strings":
 			return Array.isArray(value) && value.every((m) => typeof m === "string") ? null : bad(DESC.strings);
+		case "path":
+			return typeof value === "string" && value.trim() ? null : bad(DESC.path);
 		case "enum":
 			return typeof value === "string" && spec.values.includes(value) ? null : bad(`one of ${spec.values.map((v) => `"${v}"`).join(" or ")}`);
 	}
