@@ -48,6 +48,14 @@ function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
 }
 
+// One session as a client reads it: id, tier, group label. A Lease (Holder) and a Waiter carry the
+// same three fields, so `status` reports both lists through this one view and cannot drift apart
+// (protocol:15). The Scheduler's snapshot returns the raw records; this is the single place that
+// maps a record to the wire shape (ADR 0004: the status view is adapter-side).
+function sessionView(entry) {
+	return { sessionKey: entry.sessionKey, role: entry.role, group: entry.group };
+}
+
 // Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
 // finished run can be read back from one file — the extension spawns the daemon detached and its
 // stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
@@ -228,7 +236,18 @@ function handle(msg, conn) {
 			scheduler.retier(conn.connId, msg.sessionKey, msg.role);
 			return;
 		case "status":
-			send(conn, { op: "status", queues: scheduler.snapshot() });
+			send(conn, {
+				op: "status",
+				queues: scheduler.snapshot().map((q) => ({
+					queueKey: q.queueKey,
+					maxStreams: q.maxStreams,
+					switches: q.switches,
+					// Holders are reported like Waiters: a raw client reads tier and group from the
+					// reply, so it needs no extension-side parsing to build a dashboard.
+					holders: q.holders.map(sessionView),
+					waiting: q.waiting.map(sessionView),
+				})),
+			});
 			return;
 		case "bye":
 			// Shutdown intent: pi's session_shutdown announces "this connection is leaving" while

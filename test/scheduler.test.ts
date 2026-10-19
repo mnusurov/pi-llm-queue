@@ -435,6 +435,10 @@ describe("requestedKey echo (in memory)", () => {
 // smoke. The adapter's serialisation of this shape is its own contract, tested on the wire.
 describe("status view (in memory)", () => {
 	const queueOf = (h: SchedulerHarness, queueKey = QUEUE_KEY) => h.snapshot().find((q) => q.queueKey === queueKey);
+	// The snapshot returns raw Holder/Waiter records; the adapter's sessionView maps them to the wire
+	// shape. The test projects the same three fields to assert the tier/group property over the raw source.
+	const view = (list: { sessionKey: string; role: string; group: string }[] | undefined) =>
+		(list ?? []).map((e) => ({ sessionKey: e.sessionKey, role: e.role, group: e.group }));
 
 	it("reports tier and group label for every Holder and Waiter", () => {
 		const h = new SchedulerHarness();
@@ -447,7 +451,7 @@ describe("status view (in memory)", () => {
 
 		// A Holder is not a bare session id: it carries role and group exactly like a Waiter.
 		assert.deepEqual(
-			[queueOf(h)?.holders, queueOf(h)?.waiting],
+			[view(queueOf(h)?.holders), view(queueOf(h)?.waiting)],
 			[
 				[{ sessionKey: "P", role: "parent", group: "interactive" }],
 				[{ sessionKey: "C", role: "child", group: "scout" }],
@@ -456,7 +460,7 @@ describe("status view (in memory)", () => {
 
 		h.release(a, "P");
 		assert.deepEqual(
-			queueOf(h)?.holders,
+			view(queueOf(h)?.holders),
 			[{ sessionKey: "C", role: "child", group: "scout" }],
 			"a Holder granted from the waiting list keeps the tier and label it queued as",
 		);

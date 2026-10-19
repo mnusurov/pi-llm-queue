@@ -264,15 +264,17 @@ export class Scheduler {
 		return decisions;
 	}
 
-	// snapshot: the raw queue state for the adapter's `status` view. The adapter maps it to the wire
-	// shape (sessionView, maxStreams Infinity -> JSON null) so the Scheduler never serialises.
+	// snapshot: the raw queue state for the adapter's `status` view. It returns the live Holder (Lease)
+	// and Waiter records plus the counters the status op needs (maxStreams, switches); it does NOT
+	// build the wire shape. The adapter maps each record to the wire shape (sessionView, maxStreams
+	// Infinity -> JSON null) so the Scheduler never serialises (ADR 0004: the status view is adapter-side).
 	snapshot() {
 		return [...this.queues.values()].map((q) => ({
 			queueKey: q.queueKey,
 			maxStreams: q.maxStreams,
 			switches: q.switches,
-			holders: q.holders.map((l) => ({ sessionKey: l.sessionKey, role: l.role, group: l.group })),
-			waiting: q.waiting.map((w) => ({ sessionKey: w.sessionKey, role: w.role, group: w.group })),
+			holders: q.holders,
+			waiting: q.waiting,
 		}));
 	}
 }
