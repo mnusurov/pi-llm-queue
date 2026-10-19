@@ -263,7 +263,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-wrapper.test.ts`       | provider wrapper (queuedStream); config hot-reload (provider set)                                                                                                           |
 | `test/extension-timeout.test.ts`       | queueTimeoutMs visible warning — a parent warned past the cap stays queued                                                                                                  |
 | `test/extension-config-watch.test.ts`  | config created after startup                                                                                                                                                |
-| `test/extension-starter.test.ts`       | starter config on first launch; reconcile of an existing config on session start                                                                                            |
+| `test/extension-starter.test.ts`       | starter config on first launch; reconcile of an existing config on session start, the tuned entry's exact text, and the reconciled key as a live queue at the daemon socket                                  |
 | `test/extension-starter-empty.test.ts` | (top-level test) creates no config when every endpoint is cloud or native-owned                                                                                             |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,

@@ -1,10 +1,12 @@
 // Fresh install: a missing llm-queue.json means an inert queue. The first session_start must
 // generate a Starter config from models.json and make the queue live in that same session.
 import assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { closeAllClients, connectClient, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const STUB_API = "stub-starter-api";
 const LOCAL_URL = "http://192.168.1.50:8000/v1";
@@ -52,6 +54,26 @@ const makeCtx = (notifies: string[]) => ({
 });
 
 const startSession = (pi: any, notifies: string[]) => pi.handlers["session_start"].forEach((h: any) => h({}, makeCtx(notifies)));
+
+// The daemon seam for a reconciled key: the daemon creates a queue on the first acquire, so
+// "`/queue` shows the queue" is proved by driving one acquire and reading `status` back.
+const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
+const socketPath = join(agentDir, "llm-queue.sock");
+const daemons: ChildProcess[] = [];
+
+/** A daemon serving the agent dir's config — the very file reconcile just wrote. */
+const serveConfig = async () => {
+	const proc = spawn(process.execPath, [DAEMON, "--socket", socketPath, "--config", configPath, "--models-json", join(agentDir, "models.json")], { stdio: "ignore" });
+	proc.unref();
+	daemons.push(proc);
+	await waitForDaemon(socketPath);
+};
+
+after(() => {
+	for (const proc of daemons) proc.kill();
+	closeAllClients();
+	stopAllDaemons();
+});
 
 describe("starter config on first launch", () => {
 	it("creates the config once, notifies, and queues the self-hosted providers in the same session", () => {
@@ -114,6 +136,27 @@ describe("reconcile of an existing config on session start", () => {
 		assert.deepEqual(Object.keys(pi.registered).sort(), ["extra", "strata"], "the reconciled endpoint is wrapped without a pi restart");
 		assert.equal(added.length, 1, `one notify naming the added endpoint: ${JSON.stringify(added)}`);
 		assert.ok(added[0].includes(LOCAL_URL) && added[0].includes(configPath), `the notify names the endpoint and the file: ${added[0]}`);
+	});
+
+	// #46 box 2: "`/queue` shows the queue". A queue exists at the daemon only after its first
+	// acquire, so the reconciled key has to be driven once before status can name it.
+	it("queues the added key at the daemon: one acquire makes it visible in status", async () => {
+		sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [CLOUD_URL]: { enabled: false } } }));
+		await serveConfig();
+		const client = await connectClient(socketPath);
+
+		client.send({ op: "acquire", queueKey: LOCAL_URL, sessionKey: "S", role: "parent", activity: true });
+		assert.deepEqual(await client.next(3000), { op: "granted", queueKey: LOCAL_URL, sessionKey: "S" }, "the added key is a queue the daemon grants");
+		client.send({ op: "status" });
+		const status = await client.next(3000);
+		assert.deepEqual(
+			status.queues.map((q: any) => q.queueKey),
+			[LOCAL_URL],
+			"from its first acquire on, the reconciled endpoint is a queue a reader sees — no more silent passthrough",
+		);
+
+		client.send({ op: "release", queueKey: LOCAL_URL, sessionKey: "S" });
+		client.close();
 	});
 
 	it("adds only the missing self-hosted key, leaving tuned entries, an explicit false, defaults, cloud and native alone", () => {
