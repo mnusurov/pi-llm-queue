@@ -63,6 +63,8 @@ function logEvent(event, queue, sessionKey, role, reason) {
 	if (reason) line.reason = reason;
 	// Best effort, swallowed: a bad path, a full disk or a log rotation race must never take the
 	// daemon down (it is spawned detached, so a crash is silent) nor reject the request that logged.
+	// appendFileSync, not a stream: one short line per event, on disk before the reply goes out, so
+	// a reader reads the file the moment the reply lands and a crash loses no buffered line.
 	try {
 		appendFileSync(path, `${JSON.stringify(line)}\n`, "utf8");
 	} catch {}

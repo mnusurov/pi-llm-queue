@@ -2,7 +2,7 @@
 // is readable from one file. The seam is the daemon's own file output: script a scenario through
 // the socket protocol, then read the file back. No daemon internals, no new protocol op.
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -205,6 +205,41 @@ describe("daemon event log", () => {
 		}
 
 		assert.deepEqual(readEvents(file).map((line) => line.event), ["grant"], "the grace window logs one grant and no switch");
+	});
+
+	// The docs claim the path is read per event, so a hot-reload can turn the log on, off, or move
+	// it. Seam: write the config file, drive the protocol, read the log files — no daemon internals.
+	it("follows logFile across a hot-reload: on, moved, then off", async () => {
+		const first = logPath();
+		const second = logPath();
+		const d = start({ logFile: first });
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", "child");
+		await assert.rejects(b.next(200), /no message from daemon within/, "B queues behind A");
+		assert.deepEqual(eventLines(first).map((line) => line.event), ["grant", "queued"], "the configured path receives the events of the running queue");
+
+		// move: the same daemon, a new path, no restart
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1, logFile: second }, queues: {} }));
+		await sleep(600); // reload debounce
+		release(a, "A");
+		assert.deepEqual(await b.next(3000), granted("B"), "the queued child is granted after the reload");
+		assert.deepEqual(eventLines(second).map((line) => line.event), ["release", "grant", "switch"], "after the reload the events land in the moved file");
+		assert.deepEqual(eventLines(first).map((line) => line.event), ["grant", "queued"], "the old file stops receiving events: a move, not a copy");
+
+		// off: unset logFile and the same daemon writes no file at all
+		const c = await open(d);
+		const written = readdirSync(dir).filter((name) => name.endsWith(".jsonl")).sort();
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
+		await sleep(600);
+		release(b, "B");
+		acquire(c, "C");
+		assert.deepEqual(await c.next(3000), granted("C"), "the queue keeps serving with the log off");
+		assert.deepEqual(eventLines(second).map((line) => line.event), ["release", "grant", "switch"], "with logFile unset nothing more is written: off, not silently moved");
+		assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".jsonl")).sort(), written, "turning the log off creates no new file");
 	});
 
 	it("writes no log file when logFile is unset, and serves exactly as before", async () => {
