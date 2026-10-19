@@ -31,61 +31,6 @@ describe("daemon socket protocol", () => {
 		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
 	});
 
-	it("grants queued sessions in arrival order (FIFO)", async () => {
-		const c = await connectClient(d.socketPath);
-		const e = await connectClient(d.socketPath);
-
-		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
-		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "C", role: "parent" });
-		e.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "D", role: "parent" });
-		await assert.rejects(c.next(200), /no message from daemon within/);
-
-		const order = [];
-		const clients = [b, c, e];
-		for (let i = 0; i < 3; i++) {
-			const granted = await clients[i].next(3000);
-			order.push(granted.sessionKey);
-			clients[i].send({ op: "release", queueKey: QUEUE_KEY, sessionKey: granted.sessionKey });
-		}
-		assert.deepEqual(order, ["B", "C", "D"]);
-		c.close();
-		e.close();
-	});
-
-	it("drops a queued session that disconnects, so the next waiter takes its place", async () => {
-		const holder = await connectClient(d.socketPath);
-		const impatient = await connectClient(d.socketPath);
-		const patient = await connectClient(d.socketPath);
-
-		holder.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "H", role: "parent" });
-		assert.deepEqual(await holder.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "H" });
-
-		patient.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "P", role: "parent" });
-		impatient.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "I", role: "parent" });
-		await assert.rejects(impatient.next(200), /no message from daemon within/);
-		impatient.close();
-
-		holder.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "H" });
-		assert.deepEqual(await patient.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "P" });
-		holder.close();
-		patient.close();
-	});
-
-	it("releases a held slot when its holder disconnects", async () => {
-		const holder = await connectClient(d.socketPath);
-		const waiter = await connectClient(d.socketPath);
-
-		holder.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "HH", role: "parent" });
-		assert.deepEqual(await holder.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "HH" });
-
-		waiter.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "W", role: "parent" });
-		await assert.rejects(waiter.next(200), /no message from daemon within/);
-
-		holder.close(); // disconnect while holding: the slot must free for W
-		assert.deepEqual(await waiter.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "W" });
-		waiter.close();
-	});
-
 	it("answers renew with ok", async () => {
 		const c = await connectClient(d.socketPath);
 		c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey: "A" });
@@ -93,27 +38,6 @@ describe("daemon socket protocol", () => {
 		c.close();
 	});
 
-	it("drops a queued request on cancel without granting it later", async () => {
-		const holder = await connectClient(d.socketPath);
-		const canceller = await connectClient(d.socketPath);
-		const next = await connectClient(d.socketPath);
-
-		holder.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "H", role: "parent" });
-		assert.deepEqual(await holder.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "H" });
-
-		canceller.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "X", role: "parent" });
-		next.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "N", role: "parent" });
-		await assert.rejects(next.next(200), /no message from daemon within/);
-
-		canceller.send({ op: "cancel", queueKey: QUEUE_KEY, sessionKey: "X" });
-		holder.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "H" });
-		// X was cancelled: N (queued after X) takes the slot, not X.
-		assert.deepEqual(await next.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "N" });
-		await assert.rejects(canceller.next(300), /no message from daemon within/);
-		holder.close();
-		canceller.close();
-		next.close();
-	});
 });
 
 // Lease lifecycle: TTL reclaim, heartbeat, and no preemption. Asserted through
@@ -138,7 +62,6 @@ describe("lease lifecycle and no preemption", () => {
 	const acquire = (c: Client, sessionKey: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
 	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
-	const QUEUE_KEY2 = "http://model.test/v2";
 
 	after(() => {
 		for (const c of clients) c.close();
@@ -179,28 +102,11 @@ describe("lease lifecycle and no preemption", () => {
 		assert.deepEqual(await b.next(1500), granted("B"), "the waiter is granted on voluntary release");
 	});
 
-	it("no preemption: many requests over a long run never switch the slot away", async () => {
-		const d = start();
-		const a = await open(d);
-		const b = await open(d);
-
-		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
-		acquire(b, "B");
-
-		for (let i = 0; i < 12; i++) {
-			beat(a, "A"); // 12 requests: the old monopoly request-count quantum evicted here
-			assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true });
-		}
-		await sleep(150); // 3 sweep ticks after 12 requests: the old request-count quantum evicted here
-		await assert.rejects(b.next(200), /no message from daemon within/, "a busy live holder keeps the slot");
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(1500), granted("B"));
-	});
-
 	// The quanta are gone from the schema, so a pre-#49 config carrying them is rejected outright
-	// and the daemon serves defaults: preemption cannot be re-enabled from config.
+	// and the daemon serves defaults: preemption cannot be re-enabled from config. The scheduling half
+	// of this assertion (many beats, no preemption) is a Scheduler property and runs in memory in
+	// test/scheduler.test.ts; the driver takes plain resolved policy values, so the schema rejection
+	// itself can only be shown on the wire.
 	it("a config carrying the removed quanta falls back to defaults and never preempts", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 60000, idleQuantumMs: 0, monopolyRequests: 1, monopolyMs: 0 }, queues: {} }, undefined, undefined, 50);
 		daemons.push(d);
@@ -261,31 +167,6 @@ describe("tier ordering (parent > child) and aging", () => {
 		assert.deepEqual(await child.next(3000), granted("C"));
 	});
 
-	it("grants queued parents in arrival order (FIFO within tier)", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
-		daemons.push(d);
-		const h = await open(d);
-		const a = await open(d);
-		const b = await open(d);
-		const e = await open(d);
-
-		acquire(h, "H", "parent");
-		assert.deepEqual(await h.next(3000), granted("H"));
-		acquire(a, "A", "parent");
-		acquire(b, "B", "parent");
-		acquire(e, "C", "parent");
-		await assert.rejects(a.next(200), /no message from daemon within/);
-
-		const order: string[] = [];
-		release(h, "H");
-		for (const cl of [a, b, e]) {
-			const g = await cl.next(3000);
-			order.push(g.sessionKey);
-			release(cl, g.sessionKey);
-		}
-		assert.deepEqual(order, ["A", "B", "C"]);
-	});
-
 	it("boosts a child that has waited past agingAfterMs ahead of a parent", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 300, agingAfterSlots: 1000 }, queues: {} });
 		daemons.push(d);
@@ -303,73 +184,6 @@ describe("tier ordering (parent > child) and aging", () => {
 		assert.deepEqual(await child.next(3000), granted("C"), "aged child jumps ahead of the parent");
 	});
 
-	it("boosts the longest-waiting child after agingAfterSlots consecutive parent grants", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 100000, agingAfterSlots: 2 }, queues: {} });
-		daemons.push(d);
-		const h = await open(d);
-		const child = await open(d);
-		const p1 = await open(d);
-		const p2 = await open(d);
-		const p3 = await open(d);
-
-		acquire(h, "H", "parent");
-		assert.deepEqual(await h.next(3000), granted("H"));
-		acquire(child, "C", "child");
-		acquire(p1, "P1", "parent");
-		acquire(p2, "P2", "parent");
-		acquire(p3, "P3", "parent");
-		await assert.rejects(child.next(200), /no message from daemon within/);
-
-		release(h, "H");
-		// H's direct grant is streak 1, P1's queued grant is streak 2 → the child is boosted next.
-		assert.deepEqual(await p1.next(3000), granted("P1"));
-		release(p1, "P1");
-		// streak reached agingAfterSlots: the child is boosted ahead of the remaining parents
-		assert.deepEqual(await child.next(3000), granted("C"), "aged by parent-grant streak");
-		release(child, "C");
-		assert.deepEqual(await p2.next(3000), granted("P2"));
-		release(p2, "P2");
-		assert.deepEqual(await p3.next(3000), granted("P3"));
-	});
-
-	it("counts direct (free-slot) parent grants toward the aging streak", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1, agingAfterMs: 100000, agingAfterSlots: 2 }, queues: {} });
-		daemons.push(d);
-		const p1 = await open(d);
-		const p2 = await open(d);
-		const child = await open(d);
-		const p3 = await open(d);
-
-		acquire(p1, "P1", "parent");
-		assert.deepEqual(await p1.next(3000), granted("P1")); // streak 1 (fast path)
-		release(p1, "P1");
-		acquire(p2, "P2", "parent");
-		assert.deepEqual(await p2.next(3000), granted("P2")); // streak 2 (fast path)
-		acquire(child, "C", "child");
-		acquire(p3, "P3", "parent");
-		await assert.rejects(child.next(200), /no message from daemon within/);
-
-		release(p2, "P2");
-		assert.deepEqual(await child.next(3000), granted("C"), "fast-path grants aged the child past P3");
-	});
-
-	it("re-tiers a queued waiter on the role op (promote a child ahead of a parent)", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
-		daemons.push(d);
-		const h = await open(d);
-		const child = await open(d);
-		const parent = await open(d);
-
-		acquire(h, "H", "parent");
-		assert.deepEqual(await h.next(3000), granted("H"));
-		acquire(child, "C", "child");
-		acquire(parent, "P", "parent");
-		await assert.rejects(parent.next(200), /no message from daemon within/);
-
-		child.send({ op: "role", sessionKey: "C", role: "parent" }); // promote the queued child
-		release(h, "H");
-		assert.deepEqual(await child.next(3000), granted("C"), "promoted child now leads the parent tier (enqueued first)");
-	});
 });
 
 describe("queue policy resolution", () => {
@@ -655,72 +469,6 @@ describe("observability: status counters", () => {
 		d.stop();
 	});
 
-	it("reports tier and group label for every Holder and Waiter", async () => {
-		// A raw socket client builds a dashboard from the reply alone: a Holder is no longer a bare
-		// session id, and its reported tier is the one it queued as (direct grant and grantNext).
-		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
-		const a = await connectClient(d.socketPath);
-		const b = await connectClient(d.socketPath);
-
-		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "P", role: "parent", group: "interactive" });
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "P" });
-		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "C", role: "child", group: "scout" });
-		await assert.rejects(b.next(200), /no message from daemon within/, "the child waits behind the parent");
-
-		a.send({ op: "status" });
-		const queueOf = (s: any) => s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
-		const status = queueOf(await a.next(3000));
-		assert.deepEqual(
-			[status.holders, status.waiting],
-			[
-				[{ sessionKey: "P", role: "parent", group: "interactive" }],
-				[{ sessionKey: "C", role: "child", group: "scout" }],
-			],
-			"a Holder carries role and group label exactly like a Waiter",
-		);
-
-		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "P" });
-		assert.deepEqual(await a.next(3000), { op: "ok" });
-		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "C" }, "the freed slot goes to the child");
-
-		a.send({ op: "status" });
-		assert.deepEqual(
-			queueOf(await a.next(3000)).holders,
-			[{ sessionKey: "C", role: "child", group: "scout" }],
-			"a Holder granted from the waiting list keeps the tier and label it queued as",
-		);
-
-		a.close();
-		b.close();
-		d.stop();
-	});
-
-	it("reports queue depth per tier in status", async () => {
-		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
-		const a = await connectClient(d.socketPath);
-		const b = await connectClient(d.socketPath);
-
-		acquire(a, "A", "parent");
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
-		acquire(b, "P", "parent");
-		acquire(b, "C", "child");
-		await assert.rejects(b.next(200), /no message from daemon within/);
-
-		a.send({ op: "status" });
-		const status = await a.next(3000);
-		assert.deepEqual(
-			status.queues[0].waiting.map((w: any) => [w.sessionKey, w.role]),
-			[
-				["P", "parent"],
-				["C", "child"],
-			],
-			"status carries the tier of every waiter so /queue can report per-tier depth",
-		);
-
-		a.close();
-		b.close();
-		d.stop();
-	});
 });
 
 // Idle-exit (#8): the daemon self-terminates after daemonIdleExitMs with zero clients, and a

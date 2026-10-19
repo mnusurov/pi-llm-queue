@@ -196,3 +196,252 @@ describe("idle yield (in memory)", () => {
 		assert.equal(h.switches(QUEUE_KEY), 1, "the idle-yield handover counts as a switch");
 	});
 });
+
+// The serialisation family, migrated off the socket seam (spec #65 phase C). The queue order is a
+// Scheduler property: arrival order, disconnect-drop, cancel-drop. The socket suite keeps one smoke
+// test for the wire path (`serialises two sessions...`); these assert the decisions directly.
+describe("serialisation (in memory)", () => {
+	it("grants queued sessions in arrival order (FIFO)", () => {
+		const h = new SchedulerHarness();
+		const first = h.connect();
+		const second = h.connect();
+		const third = h.connect();
+
+		h.acquire(first, "A", { role: "parent" }); // direct grant into the free slot
+		h.acquire(second, "B", { role: "parent" });
+		h.acquire(third, "C", { role: "parent" });
+		assert.deepEqual(h.grantsFor(second), [], "the slot is taken: both park as Waiters");
+
+		// Each release hands the slot to the earliest waiter; the order is the arrival order.
+		h.release(first, "A");
+		assert.deepEqual(h.grantedSessions(second), ["B"]);
+		h.release(second, "B");
+		assert.deepEqual(h.grantedSessions(third), ["C"]);
+	});
+
+	it("drops a queued session that disconnects, and grants the patient one", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const impatient = h.connect();
+		const patient = h.connect();
+
+		h.acquire(holder, "H", { role: "parent" });
+		h.acquire(patient, "P", { role: "parent" });
+		h.acquire(impatient, "I", { role: "parent" });
+		assert.deepEqual(h.grantsFor(impatient), [], "the impatient client is queued ahead of P");
+
+		h.disconnect(impatient); // a close drops the queued request, no reply, no grant
+		h.release(holder, "H");
+		assert.deepEqual(h.grantedSessions(patient), ["P"], "the dropped waiter is skipped, P takes the slot");
+		assert.deepEqual(h.grantsFor(impatient), [], "the disconnected client is never granted");
+	});
+
+	it("releases a held slot when its holder disconnects", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const waiter = h.connect();
+
+		h.acquire(holder, "HH", { role: "parent" });
+		h.acquire(waiter, "W", { role: "parent" });
+		assert.deepEqual(h.grantsFor(waiter), [], "W waits behind the holder");
+
+		h.disconnect(holder); // a close while holding frees the slot and hands it on
+		assert.deepEqual(h.grantedSessions(waiter), ["W"]);
+		assert.deepEqual(h.holders(QUEUE_KEY), ["W"], "no phantom holder remains");
+	});
+
+	it("drops a queued request on cancel and grants the next waiter", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const canceller = h.connect();
+		const next = h.connect();
+
+		h.acquire(holder, "H", { role: "parent" });
+		h.acquire(canceller, "X", { role: "parent" });
+		h.acquire(next, "N", { role: "parent" });
+		assert.deepEqual(h.grantsFor(next), [], "N queues behind X");
+
+		h.cancel(canceller, "X"); // an abort drops X from the waiting list
+		h.release(holder, "H");
+		assert.deepEqual(h.grantedSessions(next), ["N"], "N (queued after X) takes the slot, not X");
+		assert.deepEqual(h.grantsFor(canceller), [], "the cancelled request is never granted");
+	});
+});
+
+// Tier ordering (parent > child), migrated off the socket seam. The socket suite keeps the
+// parent-beats-child smoke; FIFO-within-tier and the role re-tier op are Scheduler properties.
+describe("tier ordering (in memory)", () => {
+	it("grants queued parents in arrival order (FIFO within tier)", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const a = h.connect();
+		const b = h.connect();
+		const c = h.connect();
+
+		h.acquire(holder, "H", { role: "parent" });
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+		h.acquire(c, "C", { role: "parent" });
+		assert.deepEqual(h.grantsFor(a), [], "all three parents wait behind H");
+
+		// One slot: each release grants exactly the next parent in arrival order.
+		h.release(holder, "H");
+		assert.deepEqual(h.grantedSessions(a), ["A"]);
+		h.release(a, "A");
+		assert.deepEqual(h.grantedSessions(b), ["B"]);
+		h.release(b, "B");
+		assert.deepEqual(h.grantedSessions(c), ["C"]);
+	});
+
+	it("re-tiers a queued waiter on the role op (promote a child ahead of a parent)", () => {
+		const h = new SchedulerHarness();
+		const holder = h.connect();
+		const child = h.connect();
+		const parent = h.connect();
+
+		h.acquire(holder, "H", { role: "parent" });
+		h.acquire(child, "C", { role: "child" });
+		h.acquire(parent, "P", { role: "parent" });
+		assert.deepEqual(h.grantsFor(child), [], "as a child, C ranks behind P");
+
+		h.retier(child, "C", "parent"); // /queue promote: the waiter is re-tiered in place
+		h.release(holder, "H");
+		assert.deepEqual(h.grantedSessions(child), ["C"], "promoted, C leads the parent tier (it enqueued first)");
+		h.release(child, "C");
+		assert.deepEqual(h.grantedSessions(parent), ["P"]);
+	});
+});
+
+// Aging (the anti-starvation pair), migrated off the socket seam. These are the streak regressions:
+// the bump lives in one Grant path, so the direct-grant fast path and the queued path cannot drift.
+// Instants are exact: agingAfterMs is never crossed (agingAfterMs 100000, clock stays at 0), so the
+// boost can only come from the streak.
+describe("aging (in memory)", () => {
+	it("boosts the longest-waiting child after agingAfterSlots consecutive parent grants", () => {
+		const h = new SchedulerHarness({ agingAfterMs: 100000, agingAfterSlots: 2 });
+		const holder = h.connect();
+		const child = h.connect();
+		const p1 = h.connect();
+		const p2 = h.connect();
+		const p3 = h.connect();
+
+		h.acquire(holder, "H", { role: "parent" }); // direct grant: streak 1
+		h.acquire(child, "C", { role: "child" });
+		h.acquire(p1, "P1", { role: "parent" });
+		h.acquire(p2, "P2", { role: "parent" });
+		h.acquire(p3, "P3", { role: "parent" });
+		assert.deepEqual(h.grantsFor(child), [], "agingAfterMs is not crossed: the child waits");
+
+		h.release(holder, "H");
+		// streak 1 < agingAfterSlots: the earliest parent wins, and its grant makes the streak 2.
+		assert.deepEqual(h.grantedSessions(p1), ["P1"]);
+		h.release(p1, "P1");
+		// streak 2 == agingAfterSlots: the child is boosted ahead of the remaining parents.
+		assert.deepEqual(h.grantedSessions(child), ["C"], "aged by the parent-grant streak, not by the clock");
+		h.release(child, "C");
+		// a child grant resets the streak: P2 (earliest parent) is next, then P3.
+		assert.deepEqual(h.grantedSessions(p2), ["P2"]);
+		h.release(p2, "P2");
+		assert.deepEqual(h.grantedSessions(p3), ["P3"]);
+	});
+
+	it("counts direct (free-slot) parent grants toward the aging streak", () => {
+		const h = new SchedulerHarness({ agingAfterMs: 100000, agingAfterSlots: 2 });
+		const p1 = h.connect();
+		const p2 = h.connect();
+		const child = h.connect();
+		const p3 = h.connect();
+
+		h.acquire(p1, "P1", { role: "parent" }); // streak 1: a direct grant, never queued
+		h.release(p1, "P1");
+		h.acquire(p2, "P2", { role: "parent" }); // streak 2: the fast path counts too
+		h.acquire(child, "C", { role: "child" });
+		h.acquire(p3, "P3", { role: "parent" });
+		assert.deepEqual(h.grantsFor(child), [], "C is queued behind P2");
+
+		h.release(p2, "P2");
+		// The streak is already 2 from the fast-path grants: C jumps ahead of P3, the only parent.
+		assert.deepEqual(h.grantedSessions(child), ["C"], "fast-path grants aged the child past P3");
+	});
+});
+
+// No preemption (#49 / ADR 0002), migrated off the socket seam. The socket suite keeps the silent-
+// holder smoke; the long-run version — many requests, many sweeps, no Switch — is a Scheduler
+// property, and the driver runs it at exact instants with no sweep timer.
+describe("no preemption (in memory)", () => {
+	it("many requests over a long run never switch the slot away", () => {
+		const h = new SchedulerHarness(); // the daemon's resolved defaults, quanta included as absent
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+		assert.deepEqual(h.grantsFor(b), [], "B queues behind a live holder");
+
+		// 12 keyed beats and 12 sweeps spread over 1.2 s: the old request-count and idle quanta evicted
+		// A here. A live holder is never preempted — only a TTL lapse, a release, an abort, a yield.
+		for (let i = 0; i < 12; i++) {
+			h.advance(100);
+			h.beat(a, "A");
+			h.sweepAt();
+		}
+		assert.deepEqual(h.grantsFor(b), [], "a busy live holder keeps the slot across 12 beats and sweeps");
+		assert.equal(h.switches(QUEUE_KEY), 0, "no Switch in the whole run");
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"]);
+
+		h.release(a, "A");
+		assert.deepEqual(h.grantedSessions(b), ["B"], "the waiter is granted on voluntary release");
+	});
+});
+
+// The status view (tier, group label, per-tier depth, switch counter), migrated off the socket seam.
+// The Scheduler's snapshot is the source `status` reports; the socket suite keeps the handover-switch
+// smoke. The adapter's serialisation of this shape is its own contract, tested on the wire.
+describe("status view (in memory)", () => {
+	const queueOf = (h: SchedulerHarness, queueKey = QUEUE_KEY) => h.snapshot().find((q) => q.queueKey === queueKey);
+
+	it("reports tier and group label for every Holder and Waiter", () => {
+		const h = new SchedulerHarness();
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "P", { role: "parent", group: "interactive" });
+		h.acquire(b, "C", { role: "child", group: "scout" });
+		assert.deepEqual(h.grantsFor(b), [], "the child waits behind the parent");
+
+		// A Holder is not a bare session id: it carries role and group exactly like a Waiter.
+		assert.deepEqual(
+			[queueOf(h)?.holders, queueOf(h)?.waiting],
+			[
+				[{ sessionKey: "P", role: "parent", group: "interactive" }],
+				[{ sessionKey: "C", role: "child", group: "scout" }],
+			],
+		);
+
+		h.release(a, "P");
+		assert.deepEqual(
+			queueOf(h)?.holders,
+			[{ sessionKey: "C", role: "child", group: "scout" }],
+			"a Holder granted from the waiting list keeps the tier and label it queued as",
+		);
+	});
+
+	it("reports queue depth per tier in status", () => {
+		const h = new SchedulerHarness();
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "P", { role: "parent" });
+		h.acquire(b, "C", { role: "child" }); // one connection may park several Waiters
+
+		assert.deepEqual(
+			queueOf(h)?.waiting.map((w: { sessionKey: string; role: string }) => [w.sessionKey, w.role]),
+			[
+				["P", "parent"],
+				["C", "child"],
+			],
+			"every waiter carries its tier, so /queue can report per-tier depth",
+		);
+	});
+});
