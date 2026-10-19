@@ -25,7 +25,7 @@ export interface Decision {
 	connId?: string;
 	queueKey: string;
 	sessionKey: string;
-	role: string;
+	tier: string;
 	requestedKey?: string;
 	reason?: string;
 }

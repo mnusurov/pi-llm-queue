@@ -438,10 +438,11 @@ describe("requestedKey echo (in memory)", () => {
 // smoke. The adapter's serialisation of this shape is its own contract, tested on the wire.
 describe("status view (in memory)", () => {
 	const queueOf = (h: SchedulerHarness, queueKey = QUEUE_KEY) => h.snapshot().find((q) => q.queueKey === queueKey);
-	// The snapshot returns raw Holder/Waiter records; the adapter's sessionView maps them to the wire
-	// shape. The test projects the same three fields to assert the tier/group property over the raw source.
-	const view = (list: { sessionKey: string; role: string; group: string }[] | undefined) =>
-		(list ?? []).map((e) => ({ sessionKey: e.sessionKey, role: e.role, group: e.group }));
+	// The snapshot returns raw Holder/Waiter records (tier under the Scheduler's word); the adapter's
+	// sessionView renames it to the wire `role`. The test projects the same three fields, renaming
+	// tier→role as the adapter does, to assert the tier/group property over the raw source.
+	const view = (list: { sessionKey: string; tier: string; group: string }[] | undefined) =>
+		(list ?? []).map((e) => ({ sessionKey: e.sessionKey, role: e.tier, group: e.group }));
 
 	it("reports tier and group label for every Holder and Waiter", () => {
 		const h = new SchedulerHarness();
@@ -479,7 +480,7 @@ describe("status view (in memory)", () => {
 		h.acquire(b, "C", { role: "child" }); // one connection may park several Waiters
 
 		assert.deepEqual(
-			queueOf(h)?.waiting.map((w: { sessionKey: string; role: string }) => [w.sessionKey, w.role]),
+			queueOf(h)?.waiting.map((w: { sessionKey: string; tier: string }) => [w.sessionKey, w.tier]),
 			[
 				["P", "parent"],
 				["C", "child"],

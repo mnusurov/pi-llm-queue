@@ -49,11 +49,10 @@ function send(conn, msg) {
 }
 
 // One session as a client reads it: id, tier, group label. A Lease (Holder) and a Waiter carry the
-// same three fields, so `status` reports both lists through this one view and cannot drift apart
-// (protocol:15). The Scheduler's snapshot returns the raw records; this is the single place that
-// maps a record to the wire shape (ADR 0004: the status view is adapter-side).
+// tier under the Scheduler's word (`tier`); the wire field is `role` (protocol:15). This is the one
+// boundary that renames it, so `status` reports both lists through one view and cannot drift apart.
 function sessionView(entry) {
-	return { sessionKey: entry.sessionKey, role: entry.role, group: entry.group };
+	return { sessionKey: entry.sessionKey, role: entry.tier, group: entry.group };
 }
 
 // Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
@@ -157,7 +156,7 @@ function emit(decisions) {
 	for (const d of decisions) {
 		switch (d.type) {
 			case "grant": {
-				logEvent("grant", d.queueKey, d.sessionKey, d.role);
+				logEvent("grant", d.queueKey, d.sessionKey, d.tier);
 				const conn = connById.get(d.connId);
 				// Echo the key the request asked with (the per-request `requestedKey` the Scheduler
 				// carries on the decision), falling back to the resolved queue key for a direct grant.
@@ -165,16 +164,16 @@ function emit(decisions) {
 				break;
 			}
 			case "switch":
-				logEvent("switch", d.queueKey, d.sessionKey, d.role);
+				logEvent("switch", d.queueKey, d.sessionKey, d.tier);
 				break;
 			case "queued":
-				logEvent("queued", d.queueKey, d.sessionKey, d.role);
+				logEvent("queued", d.queueKey, d.sessionKey, d.tier);
 				break;
 			case "release":
-				logEvent("release", d.queueKey, d.sessionKey, d.role, d.reason);
+				logEvent("release", d.queueKey, d.sessionKey, d.tier, d.reason);
 				break;
 			case "evict":
-				logEvent("evict", d.queueKey, d.sessionKey, d.role, d.reason);
+				logEvent("evict", d.queueKey, d.sessionKey, d.tier, d.reason);
 				break;
 		}
 	}

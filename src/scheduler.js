@@ -89,13 +89,13 @@ export class Scheduler {
 		if (queue.policy === "fifo") return queue.waiting[0];
 		let aged = null;
 		for (const w of queue.waiting) {
-			if (w.role !== "child") continue;
+			if (w.tier !== "child") continue;
 			if (now - w.enqueuedAt >= queue.agingAfterMs || queue.parentGrantStreak >= queue.agingAfterSlots) {
 				if (!aged || w.enqueuedAt < aged.enqueuedAt) aged = w;
 			}
 		}
 		if (aged) return aged;
-		return queue.waiting.find((w) => w.role === "parent") ?? queue.waiting[0];
+		return queue.waiting.find((w) => w.tier === "parent") ?? queue.waiting[0];
 	}
 
 	// The single Grant path: the Aging streak is bumped here once, so the direct-grant fast path and
@@ -106,7 +106,7 @@ export class Scheduler {
 			queueKey: queue.queueKey,
 			sessionKey: requester.sessionKey,
 			connId: requester.connId,
-			role: requester.role,
+			tier: requester.tier,
 			group: requester.group,
 			expires: now + queue.ttlMs,
 			activity: !!requester.activity,
@@ -116,15 +116,15 @@ export class Scheduler {
 		this.pushLease(lease);
 		// A direct grant counts toward the parent-grant streak too: a parent that never queues must
 		// not starve a queued child past agingAfterSlots.
-		queue.parentGrantStreak = lease.role === "parent" ? queue.parentGrantStreak + 1 : 0;
+		queue.parentGrantStreak = lease.tier === "parent" ? queue.parentGrantStreak + 1 : 0;
 		// The grant carries the requester's `requestedKey` (the key it asked with, opaque to the
 		// Scheduler) so the adapter echoes it per-request: a session queued on two group members gets
 		// each grant keyed by the key that request used, never the other's (protocol:228-232).
-		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, role: lease.role, requestedKey: requester.requestedKey });
+		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, tier: lease.tier, requestedKey: requester.requestedKey });
 		if (fromWaiting) {
 			// Handing the Slot to a new session is the Switch that re-prefills the KV cache.
 			queue.switches++;
-			decisions.push({ type: "switch", queueKey: queue.queueKey, sessionKey: lease.sessionKey, role: lease.role });
+			decisions.push({ type: "switch", queueKey: queue.queueKey, sessionKey: lease.sessionKey, tier: lease.tier });
 		}
 		return lease;
 	}
@@ -144,7 +144,7 @@ export class Scheduler {
 	// Otherwise the request parks as a Waiter. Returns { granted, decisions }.
 	acquire(connId, sessionKey, tier, group, activity, queueKey, requestedKey, now) {
 		const queue = this.queueFor(queueKey);
-		const role = tier ?? "parent";
+		tier = tier ?? "parent";
 		const held = this.leaseOf(queue, sessionKey);
 		if (held) {
 			held.expires = now + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
@@ -152,13 +152,13 @@ export class Scheduler {
 		}
 		const decisions = [];
 		if (queue.holders.length < queue.maxStreams) {
-			this.grantLease(queue, { sessionKey, connId, activity, role, group, requestedKey }, now, false, decisions);
+			this.grantLease(queue, { sessionKey, connId, activity, tier, group, requestedKey }, now, false, decisions);
 			return { granted: true, refreshed: false, decisions };
 		}
-		const waiter = { sessionKey, role, group, connId, queueKey, requestedKey, enqueuedAt: now, activity: !!activity };
+		const waiter = { sessionKey, tier, group, connId, queueKey, requestedKey, enqueuedAt: now, activity: !!activity };
 		queue.waiting.push(waiter);
 		this.pushQueued(connId, waiter);
-		decisions.push({ type: "queued", connId, queueKey: queue.queueKey, sessionKey, role });
+		decisions.push({ type: "queued", connId, queueKey: queue.queueKey, sessionKey, tier });
 		return { granted: false, refreshed: false, decisions };
 	}
 
@@ -212,11 +212,11 @@ export class Scheduler {
 
 	// retier (/queue promote|demote): re-tier a live queued waiter in place (no reply, like cancel).
 	retier(connId, sessionKey, tier) {
-		const role = tier === "child" ? "child" : "parent";
+		tier = tier === "child" ? "child" : "parent";
 		for (const queue of this.queues.values()) {
 			const w = queue.waiting.find((x) => x.sessionKey === sessionKey && x.connId === connId);
 			if (w) {
-				w.role = role;
+				w.tier = tier;
 				break;
 			}
 		}
@@ -246,8 +246,8 @@ export class Scheduler {
 		if (lease) {
 			remove(queue.holders, lease);
 			remove(this.connLeases.get(lease.connId) ?? [], lease);
-			if (reason === "ttl") decisions.push({ type: "evict", queueKey: queue.queueKey, sessionKey, role: lease.role, reason: "ttl" });
-			else decisions.push({ type: "release", queueKey: queue.queueKey, sessionKey, role: lease.role, reason });
+			if (reason === "ttl") decisions.push({ type: "evict", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason: "ttl" });
+			else decisions.push({ type: "release", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason });
 		}
 		this.grantNext(queue, now, decisions);
 	}
