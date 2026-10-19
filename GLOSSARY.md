@@ -100,6 +100,12 @@ _Avoid_: poller, monitor
 
 ### Scheduler
 
+**Scheduler**:
+The daemon's deciding part: the rule that picks which Waiter takes a Slot next, and when a Lease
+ends. It answers who holds, who waits, and when a Switch happens. It never speaks to a client and
+never writes to a log: those are the daemon's doing, not its decision.
+_Avoid_: daemon, dispatcher, scheduler pass, engine
+
 **Tier**:
 A requester's priority class — `parent` (interactive) above `child` (subagent) — that orders the
 waiting list.
@@ -116,9 +122,9 @@ without a switch.
 _Avoid_: cooldown, buffer
 
 **Sweep**:
-The daemon's periodic pass (`--sweep-ms`, default 1 s) that evicts leases whose TTL has lapsed,
-whether or not anyone is waiting, so `/queue` never reports a ghost holder, then idle-yields an
-activity-flagged lease silent past `idleYieldMs` when waiters are present (ADR 0003).
+The daemon's periodic pass that reclaims Leases whose TTL has lapsed, whether or not anyone is
+waiting, so `/queue` never reports a ghost Holder, and — when Waiters are present — Yields the Slot
+from a Holder whose Beat has gone silent past `idleYieldMs` (ADR 0003).
 _Avoid_: GC, reaper
 
 ### Roles and config
