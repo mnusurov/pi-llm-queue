@@ -305,6 +305,7 @@ export default function (pi: ExtensionAPI) {
 		release() {
 			this.cancelPendingRelease();
 			this.stopBeat();
+			this.blockingCalls.clear(); // a lost tool_execution_end must not silence the beat of later runs
 			if (this.heldQueueKey) lease.release(this.heldQueueKey, this.sessionKey);
 			this.heldQueueKey = null;
 		}
@@ -411,7 +412,10 @@ export default function (pi: ExtensionAPI) {
 				out.end();
 			} finally {
 				// A run claimed the slot meanwhile (agent_start set heldQueueKey): leave the lease to it.
-				if (selfQueued && state.heldQueueKey !== queueKey) lease.release(queueKey, sessionKey);
+				if (selfQueued && state.heldQueueKey !== queueKey) {
+					state.stopBeat(); // stop at release: the beat must not outlive the lease it beats
+					lease.release(queueKey, sessionKey);
+				}
 				// No run is coming to re-arm: this lone request resumed the session, so restart the grace.
 				else if (inGrace && !state.runActive) state.armGraceRelease();
 			}

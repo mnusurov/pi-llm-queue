@@ -62,6 +62,17 @@ _Avoid_: ping, signal
 A keyless lease refresh that keeps a live session's leases alive.
 _Avoid_: keepalive, ping
 
+**Blocking Tool**:
+A tool that parks the run on another agent or the user (`subagent`, `bg_wait`, `ask_user`, …;
+configurable via `defaults.blockingTools`). The run-scoped beat pauses while one is in flight, so
+a parked Holder yields the Slot to the agent it waits on (ADR 0003 amendment).
+_Avoid_: waiting tool, long tool
+
+**Compute Tool**:
+A tool that does work itself (`bash`, `read`, `edit`, …) — the complement of a Blocking Tool. The
+run keeps beating through it: a compute-busy Holder is never idle.
+_Avoid_: short tool, local tool
+
 **In-flight**:
 A request whose stream is running on the slot. The daemon cannot see the stream and tracks nothing
 for it: a live holder is never switched away, so an in-flight request is safe by that rule.
