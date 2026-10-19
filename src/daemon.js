@@ -221,6 +221,9 @@ function handle(msg, conn) {
 	switch (msg.op) {
 		case "acquire": {
 			const queue = queueFor(msg.queueKey);
+			// One read of the tier: an unlabelled request is a Parent, and the same value goes on the
+			// Lease, on the Waiter, and into the parent-grant streak that drives aging.
+			const role = msg.role ?? "parent";
 			const held = leaseOf(queue, msg.sessionKey);
 			if (held) {
 				held.expires = Date.now() + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
@@ -228,17 +231,17 @@ function handle(msg, conn) {
 				return;
 			}
 			if (queue.holders.length < queue.maxStreams) {
-				const lease = newLease(queue, msg.sessionKey, conn, msg.activity, msg.role ?? "parent", msg.group);
+				const lease = newLease(queue, msg.sessionKey, conn, msg.activity, role, msg.group);
 				queue.holders.push(lease);
 				conn.leases.push(lease);
 				// A direct grant counts toward the parent-grant streak too: a parent that never
 				// queues must not starve a queued child past agingAfterSlots.
-				queue.parentGrantStreak = (msg.role ?? "parent") === "parent" ? queue.parentGrantStreak + 1 : 0;
+				queue.parentGrantStreak = role === "parent" ? queue.parentGrantStreak + 1 : 0;
 				logEvent("grant", queue, lease.sessionKey, lease.role);
 				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
 				return;
 			}
-			const waiter = { sessionKey: msg.sessionKey, role: msg.role ?? "parent", group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
+			const waiter = { sessionKey: msg.sessionKey, role, group: msg.group, requestedKey, conn, queue, enqueuedAt: Date.now(), activity: !!msg.activity };
 			queue.waiting.push(waiter);
 			conn.queued.push(waiter);
 			logEvent("queued", queue, waiter.sessionKey, waiter.role);
