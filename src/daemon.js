@@ -401,7 +401,9 @@ if (configPath) {
 			}
 			config = next.config;
 			defaults = config.defaults ?? {};
-			scheduler.applyPolicy();
+			// rebuildQueues rebuilds every live queue through scheduler.newQueue (which re-resolves the
+			// new policy), so a separate scheduler.applyPolicy() here is dead: its effect on the old
+			// queues is discarded by the rebuild. One rebuild, one policy resolution.
 			rebuildQueues();
 		}, 250);
 		debounce.unref();
