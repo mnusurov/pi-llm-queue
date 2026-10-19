@@ -29,6 +29,10 @@ const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — st
 // generation (the 2026-10-18 run held the Slot 11+ minutes) so a stuck queue warns visibly while
 // the normal case stays silent. Children keep an unbounded wait — this cap is parent-only.
 const STARTER_QUEUE_TIMEOUT_MS = 120000;
+// Tools that park the run on another agent or the user: the run-scoped keyed beat pauses while one
+// is in flight, so a parked Holder idle-yields the Slot to the agent it waits on (#57, ADR 0003).
+// Compute tools (bash, read, edit, …) keep beating: a busy Holder is never idle.
+const DEFAULT_BLOCKING_TOOLS = ["subagent", "subagent_wait", "bg_wait", "ask_user", "contact_supervisor", "intercom"];
 
 interface QueueEntry {
 	maxStreams?: number;
@@ -209,6 +213,37 @@ export default function (pi: ExtensionAPI) {
 		// True between agent_start and agent_settled: a run owns the slot, so a stream that ends must
 		// not re-arm the grace release the run will re-arm at settle instead.
 		runActive = false;
+		// Run-scoped keyed beats: one per held lease (keyed by queueKey), started at the grant, stopped
+		// at that lease's release. The daemon's activity clock advances for the whole live run —
+		// streaming and compute tools alike — and pauses only while a blocking tool is in flight, so
+		// idle-yield fires for a Holder parked on another agent, never for one busy in a tool (#57).
+		private readonly beatTimers = new Map<string, ReturnType<typeof setInterval>>();
+		readonly blockingCalls = new Set<string>();
+
+		startBeat(queueKey: string) {
+			this.stopBeat(queueKey);
+			const timer = setInterval(() => {
+				if (this.blockingCalls.size) return; // parked on an agent/user: silence lets idle-yield fire
+				lease.beat(queueKey, this.sessionKey).then((granted) => {
+					if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
+				}, () => {});
+			}, heartbeatMs);
+			timer.unref();
+			this.beatTimers.set(queueKey, timer);
+		}
+
+		stopBeat(queueKey?: string) {
+			if (queueKey === undefined) {
+				for (const timer of this.beatTimers.values()) clearInterval(timer);
+				this.beatTimers.clear();
+			} else {
+				const timer = this.beatTimers.get(queueKey);
+				if (timer) {
+					clearInterval(timer);
+					this.beatTimers.delete(queueKey);
+				}
+			}
+		}
 		// The run's acquire started at agent_start, still awaiting the grant. pi does not await the
 		// handler, so the first stream can arrive first; it must join this acquire, not queue again.
 		private pendingAcquire: { queueKey: string; promise: Promise<AcquireReason> } | null = null;
@@ -276,8 +311,12 @@ export default function (pi: ExtensionAPI) {
 
 		release() {
 			this.cancelPendingRelease();
-			if (this.heldQueueKey) lease.release(this.heldQueueKey, this.sessionKey);
-			this.heldQueueKey = null;
+			if (this.heldQueueKey) {
+				this.stopBeat(this.heldQueueKey);
+				lease.release(this.heldQueueKey, this.sessionKey);
+				this.heldQueueKey = null;
+			}
+			this.blockingCalls.clear(); // a lost tool_execution_end must not silence the beat of later runs
 		}
 	}
 
@@ -348,22 +387,13 @@ export default function (pi: ExtensionAPI) {
 					if (reason === "granted") {
 						if (wasHeld) state.heldQueueKey = queueKey; // the run re-took its slot
 						else selfQueued = true;
+						state.startBeat(queueKey); // the run-scoped beat covers this grant too
 					}
 				}
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
-				// In-flight keyed beat: while streaming, send a keyed beat every heartbeatMs so the
-				// daemon sees activity and never idle-yields the slot. Between streams (tool exec,
-				// blocked subagent) no keyed beats — the daemon idle-yields the holder when waiters exist.
-				const activityBeat = (state.heldQueueKey === queueKey || selfQueued)
-					? setInterval(() => lease.beat(queueKey, sessionKey), heartbeatMs)
-					: null;
-				activityBeat?.unref();
-				try {
-					for await (const event of impl.streamSimple(model, context, options)) out.push(event);
-				} finally {
-					if (activityBeat) clearInterval(activityBeat);
-				}
+				// The run-scoped beat (started at the grant) covers the stream: no stream-scoped beat here.
+				for await (const event of impl.streamSimple(model, context, options)) out.push(event);
 				out.end();
 			} catch (error) {
 				out.push({
@@ -391,7 +421,10 @@ export default function (pi: ExtensionAPI) {
 				out.end();
 			} finally {
 				// A run claimed the slot meanwhile (agent_start set heldQueueKey): leave the lease to it.
-				if (selfQueued && state.heldQueueKey !== queueKey) lease.release(queueKey, sessionKey);
+				if (selfQueued && state.heldQueueKey !== queueKey) {
+					state.stopBeat(queueKey); // stop at release: the beat must not outlive the lease it beats
+					lease.release(queueKey, sessionKey);
+				}
 				// No run is coming to re-arm: this lone request resumed the session, so restart the grace.
 				else if (inGrace && !state.runActive) state.armGraceRelease();
 			}
@@ -591,7 +624,21 @@ export default function (pi: ExtensionAPI) {
 		state.clearQueued();
 		// Only a grant claims a lease: an abort/fail-open must not mark the slot held. A stream that
 		// joined this acquire shares the grant and must not release it per-stream (#55).
-		if (reason === "granted") state.heldQueueKey = queueKey;
+		if (reason === "granted") {
+			state.heldQueueKey = queueKey;
+			state.startBeat(queueKey); // beat for the whole run: the daemon sees activity, not just streams
+		}
+	});
+
+	// Blocking-tool nesting (#57): while a tool that waits on another agent or the user is in
+	// flight, the run-scoped beat pauses, so idle-yield hands the Slot to the very agent the run
+	// waits on. Compute tools keep beating. The set is config: defaults.blockingTools.
+	pi.on("tool_execution_start", (event, ctx) => {
+		const tools = config.defaults?.blockingTools ?? DEFAULT_BLOCKING_TOOLS;
+		if (tools.includes(event.toolName)) ensureState(ctx.sessionManager.getSessionId()).blockingCalls.add(event.toolCallId);
+	});
+	pi.on("tool_execution_end", (event, ctx) => {
+		ensureState(ctx.sessionManager.getSessionId()).blockingCalls.delete(event.toolCallId);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {

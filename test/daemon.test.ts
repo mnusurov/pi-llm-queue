@@ -1005,6 +1005,27 @@ describe("idle-yield under contention", () => {
 		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "yielded holder learns via beat");
 	});
 
+	it("bare heartbeats keep the TTL alive but not the slot: idle-yield fires (#57 guard)", async () => {
+		const d = start(300);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A", true);
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B", true);
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// Bare renew every 100 ms for 3× idleYieldMs: the lease stays TTL-alive, lastActivityAt goes stale.
+		for (let i = 0; i < 9; i++) {
+			a.send({ op: "renew" }); // bare heartbeat: no queueKey/sessionKey
+			assert.deepEqual(await a.next(3000), { op: "ok" });
+			await sleep(100);
+		}
+		assert.deepEqual(await b.next(2000), granted("B"), "a TTL-alive activity-idle holder yields to the waiter");
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "the yielded holder learns via its next beat");
+	});
+
 	it("keyed beats during a long stream prevent idle-yield", async () => {
 		const d = start(500);
 		const a = await open(d);

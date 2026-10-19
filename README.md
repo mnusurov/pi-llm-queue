@@ -119,9 +119,10 @@ to upgrade pi-llm-queue instead of failing silently.
 | `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim — the crash grace). Minimum `1000`. |
 | `enabled` | `true` | `false` = passthrough: provider unwrapped, fully parallel. An endpoint (baseUrl) key wins over a provider-name key naming the same endpoint. |
 | `match` | — | Explicit resource group: baseUrls and/or provider names sharing one queue. |
-| `idleYieldMs` | `30000` | Idle-yield threshold: an activity-flagged holder silent this long with a waiter queued yields the slot. `0` disables. |
+| `idleYieldMs` | `30000` | Idle-yield threshold: an activity-flagged holder with no keyed beat this long yields the slot when a waiter is queued. The pi client beats for the whole run except while parked in a blocking tool (ADR 0003), so this is a dead-client/stall guard and the Parent→Child handover latency — never a tool-pause handover. Non-beating clients (raw socket, e2e scripts) have no run-scoped beat: use `120000` there to protect long builds/e2e from mid-run yield. `0` disables. |
 | `failOpen` | `true` | Daemon unreachable → pass through. `false` → hard-error. `defaults` only. |
 | `queueTimeoutMs` | unlimited | Parent queue-wait warning threshold → visible warning, stays queued. Child is always unlimited. `defaults` only. The Starter config ships `120000`. |
+| `blockingTools` | `["subagent","subagent_wait","bg_wait","ask_user","contact_supervisor","intercom"]` | Tools that park the run on another agent or the user: the run-scoped keyed beat pauses while one is in flight, so a parked holder yields the slot to the agent it waits on (ADR 0003). Add a custom waiting tool here. `defaults` only. |
 | `daemonIdleExitMs` | `60000` | Daemon self-exit after the last client disconnects. `defaults` only. |
 | `logFile` | — (no file) | Daemon event log path: one JSON line per queue event — `grant`, `switch`, `queued`, `release` (`reason: "idle"` for an idle yield), `evict` (`reason: "ttl"` for a TTL reclaim) — each carrying `event`, `queueKey`, `sessionKey`, `role`, `ts` (+ `reason`). Best-effort: an unwritable path leaves the daemon serving. `defaults` only. |
 

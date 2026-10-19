@@ -18,6 +18,7 @@ describe("config schema validation", () => {
 					agingAfterMs: 60000,
 					failOpen: true,
 					queueTimeoutMs: 120000,
+					blockingTools: ["subagent", "bg_wait"],
 					daemonIdleExitMs: 60000,
 					logFile: "/tmp/queue-events.jsonl",
 				},
@@ -86,11 +87,23 @@ describe("config schema validation", () => {
 	// the daemon serves defaults, so no preemption can be re-enabled from config.
 	it("rejects the removed session-switch quanta as unknown fields", () => {
 		assert.deepEqual(validateConfig({ defaults: { idleQuantumMs: 120000, monopolyRequests: 12, monopolyMs: 180000 } }), [
-			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
-			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
-			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
+			"defaults.idleQuantumMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, blockingTools, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
+			"defaults.monopolyRequests is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, blockingTools, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
+			"defaults.monopolyMs is an unknown field (known: maxStreams, policy, leaseTtlMs, agingAfterSlots, agingAfterMs, idleYieldMs, blockingTools, failOpen, queueTimeoutMs, daemonIdleExitMs, logFile)",
 		]);
 		assert.match(validateConfig({ queues: { zen: { idleQuantumMs: 1 } } })[0], /^queues\.zen\.idleQuantumMs is an unknown field/);
+	});
+
+	// #57: the blocking-tool set pauses the client's run-scoped keyed beat, so a Holder parked
+	// on another agent yields the Slot. Client-side concern: defaults only, the daemon ignores it.
+	it("accepts blockingTools in defaults and rejects it per queue", () => {
+		assert.deepEqual(validateConfig({ defaults: { blockingTools: ["subagent", "intercom"] } }), []);
+		assert.deepEqual(validateConfig({ defaults: { blockingTools: [] } }), []);
+		assert.deepEqual(validateConfig({ defaults: { blockingTools: "subagent" } }), ['defaults.blockingTools must be an array of strings (got "subagent")']);
+		assert.deepEqual(validateConfig({ defaults: { blockingTools: [1] } }), ["defaults.blockingTools must be an array of strings (got [1])"]);
+		assert.deepEqual(validateConfig({ queues: { zen: { blockingTools: ["subagent"] } } }), [
+			"queues.zen.blockingTools is only valid in defaults (the whole config is rejected and defaults are used)",
+		]);
 	});
 
 	it("flags defaults-only fields set per queue", () => {
