@@ -440,29 +440,34 @@ describe("provider wrapper (queuedStream)", () => {
 	it("renders tier and group label for Holders and Waiters in the status line", async () => {
 		// The tier a session queues as comes from the env contract: pin it so the rendered line is
 		// deterministic wherever the suite runs (a lane running these tests is itself a child).
+		// The pin goes in a try/finally: an assert that fails mid-test must not leave PI_QUEUE_ROLE
+		// pinned for every suite that runs after it in this file.
 		const savedRole = process.env.PI_QUEUE_ROLE;
 		process.env.PI_QUEUE_ROLE = "parent";
-		const a = makePi();
-		extension(a as any);
-		const ctx = start(a, "TIER-PARENT");
-		await a.handlers["agent_start"][0]({}, ctx); // the parent session holds the slot for its run
+		try {
+			const a = makePi();
+			extension(a as any);
+			const ctx = start(a, "TIER-PARENT");
+			await a.handlers["agent_start"][0]({}, ctx); // the parent session holds the slot for its run
 
-		const raw = await connectClient(socketPath);
-		raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "TIER-CHILD", role: "child", group: "scout" });
-		await assert.rejects(raw.next(200), /no message from daemon within/, "the child waits behind the parent");
+			const raw = await connectClient(socketPath);
+			raw.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "TIER-CHILD", role: "child", group: "scout" });
+			await assert.rejects(raw.next(200), /no message from daemon within/, "the child waits behind the parent");
 
-		const notes: string[] = [];
-		const statusCtx = makeCtx("TIER-PARENT", undefined, { notify: (text: string) => notes.push(text), setStatus: () => {} });
-		await a.commands["queue"].handler("", statusCtx);
-		const line = notes.join("\n");
-		assert.match(line, /TIER-PARENT parent/, "a Holder is named with its tier beside its session id");
-		assert.match(line, /TIER-CHILD child scout/, "a Waiter is named with its tier and group label");
+			const notes: string[] = [];
+			const statusCtx = makeCtx("TIER-PARENT", undefined, { notify: (text: string) => notes.push(text), setStatus: () => {} });
+			await a.commands["queue"].handler("", statusCtx);
+			const line = notes.join("\n");
+			assert.match(line, /TIER-PARENT parent/, "a Holder is named with its tier beside its session id");
+			assert.match(line, /TIER-CHILD child scout/, "a Waiter is named with its tier and group label");
 
-		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "TIER-PARENT" });
-		raw.close();
-		a.handlers["session_shutdown"][0]({}, ctx);
-		if (savedRole === undefined) delete process.env.PI_QUEUE_ROLE;
-		else process.env.PI_QUEUE_ROLE = savedRole;
+			raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "TIER-PARENT" });
+			raw.close();
+			a.handlers["session_shutdown"][0]({}, ctx);
+		} finally {
+			if (savedRole === undefined) delete process.env.PI_QUEUE_ROLE;
+			else process.env.PI_QUEUE_ROLE = savedRole;
+		}
 	});
 });
 
