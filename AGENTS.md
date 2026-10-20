@@ -11,6 +11,10 @@ Integration is a PR merged with `gh pr merge --squash`: squash only, and pushing
 
 Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge-policy.md`.
 
+## Coding standards
+
+Rules for all code — JS/TS split, test seams, design, comments, errors, and docs: `CODING_STANDARDS.md`.
+
 ## Agent skills
 
 ### Issue tracker
