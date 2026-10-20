@@ -51,6 +51,13 @@ The timed right of a holder to keep its slot, renewed by beats and heartbeats; r
 daemon when it stops being refreshed.
 _Avoid_: lock, ticket
 
+**Lease verdict**:
+The one answer shape for a lease decision: `held`, `passthrough`, `lost`, or `cancelled`. Each verb
+returns only the values it can produce — `acquire` gives `held`, `passthrough`, or `cancelled`;
+`beat` gives `held`, `lost`, or `passthrough`. An unreachable daemon with `failOpen: false` is an
+error (`DaemonUnreachableError`), not a verdict.
+_Avoid_: acquire reason, beat result, lease status
+
 **Beat**:
 A keyed lease refresh: the holder's report that it is using the slot. The daemon's only view of
 stream activity, and its reply is the authoritative grant state. Keyed beats refresh
