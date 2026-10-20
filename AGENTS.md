@@ -6,7 +6,8 @@ warmth on constrained local model servers.
 ## Merge policy
 
 Integration is a PR merged with `gh pr merge --squash`: squash only, and pushing straight to
-`main` is not a path. `gh pr merge` is silent on a pipe: done when
+`main` is not a path — `main` is protected, so a direct push is refused, admins included.
+`gh pr merge` is silent on a pipe: done when
 `gh pr view <n> --json state -q .state` returns `MERGED`.
 
 Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge-policy.md`.
@@ -14,6 +15,12 @@ Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge
 ## Coding standards
 
 Rules for all code — JS/TS split, test seams, design, comments, errors, and docs: `CODING_STANDARDS.md`.
+
+## Checks
+
+`npm run check` (typecheck + the public-export contract check + the doc check) and `npm test` (the
+suite) both run in CI on node 22 and 24: `.github/workflows/ci.yml`. Both must be green before a
+commit.
 
 ## Agent skills
 
@@ -27,7 +34,7 @@ Canonical five-role defaults. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-Single-context: `GLOSSARY.md` + `docs/adr/` at root. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` + `docs/adr/` at root (index: `docs/adr/README.md`). See `docs/agents/domain.md`.
 
 ### LLM queue
 

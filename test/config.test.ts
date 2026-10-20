@@ -1,3 +1,6 @@
+// The config module at its own seam (ADR 0001): schema validation, config file loading, the
+// defaults table, the policy cascade (resolveQueuePolicy) and the keyed beat period. No daemon, no
+// pi — the module decides, the test reads decisions.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

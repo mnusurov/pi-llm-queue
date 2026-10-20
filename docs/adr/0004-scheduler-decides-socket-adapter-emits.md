@@ -59,3 +59,32 @@ scope is a protocol fact ("a bare `renew` heartbeats every lease of the connecti
   queued path.
 - `GLOSSARY.md` gains **Scheduler** as a term, and **Sweep** loses `--sweep-ms` and the 1 s
   interval: the glossary carries no implementation details.
+
+## Amendment (2026-10-20, #100): the whole batch is logged before any reply goes out
+
+Date: 2026-10-20
+
+Status: Accepted (amends the Decision's "in the returned order" clause; the Scheduler, the decision
+list and the wire protocol are unchanged).
+
+The Decision says the socket adapter "maps each decision to a reply and a log line in the returned
+order". Read as *the log line, then the reply, for each decision in turn*, that ordering let a
+reply outrun the log: a handover is two decisions — the grant and the switch it causes — and the
+`granted` reply went out between their two log lines. The peer process can wake on another core
+and read the event log in that gap, so a reader saw a grant with no switch. The event-log sink
+already promised the opposite — every event a reply caused is on disk before that reply goes out
+(#47) — and the promise was the one the code broke.
+
+**Amended adapter rule**: the adapter writes the whole batch's log lines first and sends the
+replies after. The log order is still the returned order; what changed is that no reply leaves
+before the batch it belongs to is on disk. A reader that opens the file the moment a reply lands
+sees the whole story.
+
+Consequences of the amendment:
+
+- The `grant` decision's reply and the `switch` decision's log line no longer interleave: one
+  decision batch, one write, then the replies.
+- Nothing else moves. The decision list, the log's field shape, the reply's shape and the order of
+  the log lines are exactly as decided above.
+- The rule is now testable as a promise rather than a race: the log's completeness at reply time
+  is asserted over repeated handovers in `test/daemon-event-log.test.ts`.

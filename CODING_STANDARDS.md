@@ -37,7 +37,14 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
 - One module owns a policy. Call it rather than re-deriving its rule elsewhere (ADR 0005).
 - Keep test-only overrides out of public types. Inject config or a collaborator instead.
 - Scrutinize optional parameters: every optional field is a branch. Add one only when absence has
-  meaning; centralize defaults in `src/config.js`.
+  meaning.
+- A default's home follows where its value comes from. A config default — the value the code
+  substitutes for a field the config file omits — lives in `src/config.js`: the `DEFAULTS` policy
+  table, or the schema's own tables for the fields outside the policy. A behaviour constant — a
+  window, a cap or a period the code owns whatever the config says, like the Run's Grace or the
+  100 KB line cap — lives beside the code that owns it, not in the config table. A value the code
+  writes into a config file is the generator's opinion and belongs to the module that writes it
+  (ADR 0001: the Starter writes the parent queue-wait cap).
 - A daemon flag and its config field change together.
 
 ## Comments
@@ -49,7 +56,8 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
   next line rots as soon as the code moves, and a stale comment is worse than none.
 - Update or delete a comment in the same change that invalidates it.
 - Public exports get JSDoc for the contract callers need — purpose, inputs, and failure modes — not
-  a play-by-play of the implementation.
+  a play-by-play of the implementation. The check (`npm run check:jsdoc`) enforces that the block
+  exists; whether the contract says the right thing is the reviewer's call.
 
 ## Errors and protocol
 

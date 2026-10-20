@@ -2,7 +2,7 @@
 // is readable from one file. The seam is the daemon's own file output: script a scenario through
 // the socket protocol, then read the file back. No daemon internals, no new protocol op.
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -18,6 +18,9 @@ const readEvents = (path: string) =>
 		.split("\n")
 		.filter((line) => line.trim())
 		.map((line) => JSON.parse(line));
+
+// The log file is created by the daemon's first write, so a count before the first event is zero.
+const eventCount = (path: string) => (existsSync(path) ? readEvents(path).length : 0);
 
 // ts is a wall-clock timestamp, so it cannot be a literal in an expected sequence; assert it
 // separately ("carries a timestamp") and compare the rest of the line exactly.
@@ -43,6 +46,20 @@ describe("daemon event log", () => {
 	const release = (c: Client, sessionKey: string) => c.send({ op: "release", queueKey: QUEUE_KEY, sessionKey });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
 	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+
+	// The session is a Waiter: asked of the daemon's own status view, polled with a deadline.
+	// Presence is polled, never slept for — and it must be a Waiter, or the handover that follows
+	// is a direct grant and never writes a switch line.
+	const waiting = async (c: Client, sessionKey: string) => {
+		for (let attempt = 0; attempt < 100; attempt++) {
+			c.send({ op: "status" });
+			const reply = await c.next(3000);
+			const queue = reply.queues?.find((q: { queueKey: string }) => q.queueKey === QUEUE_KEY);
+			if (queue?.waiting?.some((w: { sessionKey: string }) => w.sessionKey === sessionKey)) return;
+			await sleep(5);
+		}
+		throw new Error(`${sessionKey} never queued`);
+	};
 
 	after(() => {
 		for (const c of clients) c.close();
@@ -71,6 +88,46 @@ describe("daemon event log", () => {
 			{ event: "grant", queueKey: QUEUE_KEY, sessionKey: "B", role: "child", reason: undefined },
 			{ event: "switch", queueKey: QUEUE_KEY, sessionKey: "B", role: "child", reason: undefined },
 		]);
+	});
+
+	// The log must not be behind the reply. The sink promises that every event a reply caused is on
+	// disk before that reply goes out, so a reader that opens the file the moment the reply lands
+	// sees the whole story. The window is a race — the peer process can wake on another core while
+	// the daemon is still writing the batch — so the handover repeats: with the promise broken the
+	// reader sees a grant with no switch, with it the file is always complete.
+	it("the whole handover is on disk when the reply lands", async () => {
+		const file = logPath();
+		const d = start({ logFile: file });
+		for (let handover = 1; handover <= 50; handover++) {
+			const a = await open(d);
+			const b = await open(d);
+			const before = eventCount(file);
+
+			acquire(a, "A");
+			assert.deepEqual(await a.next(3000), granted("A"));
+			acquire(b, "B", "child");
+			await waiting(b, "B");
+			release(a, "A");
+			assert.deepEqual(await b.next(3000), granted("B"));
+
+			// The file is read the moment the reply lands — no round trip in between, because the
+			// window between the daemon's reply and its log write is what this pins.
+			// grant A, queued B, release A, grant B, switch B: five events, all of them on disk
+			// before the reply that caused them went out.
+			assert.equal(
+				eventCount(file),
+				before + 5,
+				`handover ${handover}: the log must hold every event of the batch when the reply lands`,
+			);
+
+			// Release B before closing, so the teardown is settled and writes no event of its own:
+			// a connection that closes while holding the Slot releases it, and that release is an
+			// event the next handover would otherwise have to account for.
+			release(b, "B");
+			assert.deepEqual(await b.next(3000), { op: "ok" });
+			a.close();
+			b.close();
+		}
 	});
 
 	it("every event carries the queue key, session key, role and a timestamp", async () => {

@@ -47,6 +47,12 @@ export function resolveRole(env: Record<string, string | undefined>): Role {
 	return "parent";
 }
 
+/**
+ * The pi Extension entry: registers the queued providers and the `/queue` command, and turns pi
+ * events into Lease operations. pi calls it with its ExtensionAPI at load time; it registers
+ * handlers and returns nothing. The config it reads may be missing or invalid — the session then
+ * runs on the defaults and says so, rather than refusing to load.
+ */
 export default function (pi: ExtensionAPI) {
 	const modelsJson = readProviders(MODELS_JSON_PATH);
 	// Startup config load: any failure falls back to defaults and surfaces through ui.notify at

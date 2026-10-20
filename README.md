@@ -141,9 +141,9 @@ was granted with until it releases the Slot.
 
 - **Tests are stub-only.** `make test` (typecheck + `node --test`) drives the daemon socket seam
   and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint.
-  47 suites, the count `node --test` reports, plus one top-level test in
-  `starter-config.test.ts`; `test/harness.ts` is the daemon socket seam, not a suite. The
-  per-suite list is in [docs/daemon-protocol.md](docs/daemon-protocol.md#tests).
+  Every suite states what it pins in its own header comment; `test/harness.ts` is the daemon
+  socket seam, not a suite. `make check` is the gate beside it: typecheck, the public-export
+  contract check, the doc check.
   `make e2e` is the human-run tracer bullet (two real pi sessions against a stub endpoint).
   Real cache-warmth validation against llama.cpp is done (#10).
 - **Serial subagents.** This repo's own implementing sessions run on a local model: launch
@@ -155,14 +155,11 @@ was granted with until it releases the Slot.
   daemon while implementing so sessions share the endpoint instead of thrashing it. Tests and
   typecheck (`make test`) need no GPU.
 
-## Design decisions (from grilling session)
+## Design decisions
 
-- Client-side architecture, starter config and config file: [ADR 0001](docs/adr/0001-auto-starter-config.md).
-- No preemption on a live holder: [ADR 0002](docs/adr/0002-no-preemption.md).
-- Idle yield and the run-scoped keyed beat: [ADR 0003](docs/adr/0003-idle-yield.md).
-- Scheduler decides, socket adapter emits: [ADR 0004](docs/adr/0004-scheduler-decides-socket-adapter-emits.md).
-- One module owns queue addressing: [ADR 0005](docs/adr/0005-one-module-owns-queue-addressing.md).
-- Domain vocabulary: [GLOSSARY.md](GLOSSARY.md).
+Structural and behavioural choices are recorded as ADRs; the index in
+[docs/adr/README.md](docs/adr/README.md) says which one to read. Domain vocabulary:
+[GLOSSARY.md](GLOSSARY.md).
 
 ## Subagent launches (batch pattern)
 
@@ -173,24 +170,5 @@ parent is woken once at the end, so its large context is re-prefilled once, not
 once per child. Idle-yield (ADR 0003) ensures a blocked parent yields the slot to its
 children when it stops streaming; the parent re-queues after the batch completes.
 
-Status: tracer bullet (#2) implemented — daemon socket protocol, FIFO scheduler, extension
-provider wrapper with turn-based lease, daemon autostart, fail-open. Lease TTL + heartbeat and the
-session switch on release are implemented (#3); the session-switch quanta (#3) were removed by
-#49 — see ADR 0002. Tier ordering
-(parent > child, FIFO within tier), aging anti-starvation, the role/group env contract and
-`/queue promote|demote` are implemented (#4). Per-endpoint queues with explicit `match` groups,
-`enabled: false` passthrough, the config schema (all fields accepted; `queueTimeoutMs` / `failOpen` /
-`daemonIdleExitMs` implemented in #8) and config hot-reload
-(daemon + extension) are implemented (#5). Observability (#7) — the queued footer indicator, the
-`/queue` status (slot holder, per-tier queue depth, session-switch counts) and JSON status — is
-implemented. Fail-open hardening + idle-exit (#8) — `failOpen` (default true), the `queueTimeoutMs`
-parent queue-wait warning (child unlimited) and the daemon `daemonIdleExitMs` idle-exit — is implemented;
-the daemon now exits with the last counted client and an Observer polling `status` no longer keeps it alive (#60);
-packaging + docs (#9) — npm package, versioned config schema validation, install/config/env/dev docs —
-is implemented; e2e cache-warmth validation (#10) is human-run; the auto-starter (#37/#38) — a
-starter `llm-queue.json` generated from `models.json` on first launch — is implemented. Idle-yield
-(#51) — an idle Holder yields its Slot when Waiters exist, `blockSubagentLaunch` deleted,
-`queueTimeoutMs` warn-only — is implemented (ADR 0003). Queue observability (#43) — `status` and
-`/queue` reporting tier and group label for Holders and Waiters (#45), the Starter config's
-`defaults` queue-wait cap and add-only reconcile (#46, amending ADR 0001), the daemon's `logFile`
-event log (#47) and this documentation pass (#48) — is implemented.
+Status: what landed is in the issue tracker, what it changed is in the ADRs above, and how it got
+there is in the commit history. This file describes the product, not the changelog.

@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { closeAllClients, connectClient, pollUntil, sleep, exited, stopAllDaemons, waitForDaemon, type Client } from "./harness.ts";
+import { connectClient, sleep, waitForDaemon, type Client } from "./harness.ts";
 
 export { closeAllClients, connectClient, exited, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon, QUEUE_KEY } from "./harness.ts";
 export type { Client, Daemon } from "./harness.ts";

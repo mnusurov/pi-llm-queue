@@ -1,3 +1,6 @@
+// The lease client against a real daemon: the verdicts (held / passthrough / lost / cancelled),
+// the fail-open policy, daemon autostart, the heartbeat against the TTL, status and the re-tier
+// op. Real daemon, stub endpoint; no pi Extension.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
@@ -5,7 +8,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { DaemonUnreachableError, LeaseClient, ensureDaemon } from "../src/lease-client.ts";
+import { DaemonUnreachableError, LeaseClient } from "../src/lease-client.ts";
 import { heartbeatMs } from "../src/config.js";
 import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
