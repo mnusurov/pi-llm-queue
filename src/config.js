@@ -20,6 +20,10 @@ export const DEFAULTS = {
 	agingAfterMs: 60000,
 	policy: "priority-aging",
 	idleYieldMs: 30000,
+	// Tools that park the Run on another agent or the user: the client pauses the Run's keyed Beat
+	// while one is in flight, so a parked Holder idle-yields the Slot to the agent it waits on
+	// (#57, ADR 0003). Compute tools (bash, read, edit, …) keep beating: a busy Holder is never idle.
+	blockingTools: ["subagent", "subagent_wait", "bg_wait", "ask_user", "contact_supervisor", "intercom"],
 };
 
 /**

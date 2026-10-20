@@ -121,6 +121,17 @@ The short window after a run settles during which a new run by the same session 
 without a switch.
 _Avoid_: cooldown, buffer
 
+**Run**:
+The span from `agent_start` to `agent_settled` in one session: the unit that holds a
+Slot across streams and tools. A Run's Beat is run-scoped; requests outside a Run
+(compaction, classifier, nested calls) hold only for their own stream.
+_Avoid_: turn, job
+
+**Parked**:
+A Run whose Blocking Tool is in flight. Its Beat pauses, so idle-yield can hand the
+Slot to the agent it waits on.
+_Avoid_: blocked, waiting (Waiter is the queue concept)
+
 **Sweep**:
 The daemon's periodic pass that reclaims Leases whose TTL has lapsed, whether or not anyone is
 waiting, so `/queue` never reports a ghost Holder, and — when Waiters are present — Yields the Slot
