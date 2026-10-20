@@ -1,15 +1,15 @@
 .PHONY: test typecheck check e2e
 
 typecheck:
-	npx tsc --noEmit
+	npm run typecheck
 
-# The guardrail: typecheck, the public-export contract check, the doc check.
-check: typecheck
-	node scripts/check-jsdoc.mjs
-	node scripts/check-docs.mjs
+# The gate: typecheck, the public-export contract check, the doc check. The list lives in
+# package.json — this target only names it.
+check:
+	npm run check
 
-test: check
-	node --test test/*.test.ts
+test: typecheck
+	npm test
 
 # Human-run tracer bullet: spawns real pi sessions against a stub endpoint.
 e2e:

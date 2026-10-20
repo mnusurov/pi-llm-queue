@@ -139,10 +139,11 @@ was granted with until it releases the Slot.
 
 ## Dev notes
 
-- **Tests are stub-only.** `make test` (typecheck + the public-export contract check + `node --test`)
-  drives the daemon socket seam and the thin pi-glue seam with stub endpoints only — it never
-  touches a real model endpoint. Every suite states what it pins in its own header comment;
-  `test/harness.ts` is the daemon socket seam, not a suite.
+- **Tests are stub-only.** `make test` (typecheck + `node --test`) drives the daemon socket seam
+  and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint.
+  Every suite states what it pins in its own header comment; `test/harness.ts` is the daemon
+  socket seam, not a suite. `make check` is the gate beside it: typecheck, the public-export
+  contract check, the doc check.
   `make e2e` is the human-run tracer bullet (two real pi sessions against a stub endpoint).
   Real cache-warmth validation against llama.cpp is done (#10).
 - **Serial subagents.** This repo's own implementing sessions run on a local model: launch

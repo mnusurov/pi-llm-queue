@@ -10,21 +10,12 @@
 // The check answers presence, not quality: whether a contract says the right thing stays the
 // reviewer's call. Scope: src/ — the package publishes src/, and test/ is not public API.
 // Usage: node scripts/check-jsdoc.mjs
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { repoRoot, walk } from "./lib/repo.mjs";
 
-const repo = decodeURIComponent(new URL("..", import.meta.url).pathname);
-const src = join(repo, "src");
-
-const sources = [];
-const walk = (dir) => {
-	for (const entry of readdirSync(dir, { withFileTypes: true })) {
-		const path = join(dir, entry.name);
-		if (entry.isDirectory()) walk(path);
-		else if (/\.(ts|js)$/.test(entry.name)) sources.push(path);
-	}
-};
-walk(src);
+const src = join(repoRoot, "src");
+const sources = walk(src, (name) => /\.(ts|js)$/.test(name));
 
 // `export { x } from "./y"` re-exports: the contract lives at the declaration site, not here.
 const KINDS = "function|class|interface|type|enum|const|let|var";
@@ -67,7 +58,7 @@ for (const path of sources) {
 		if (!declaration) continue;
 		const name = declaration[1] ? "default export" : (NAME.exec(line)?.[1] ?? "export");
 		if (jsdocAbove(lines, i)) continue;
-		findings.push(`${relative(repo, path)}:${i + 1}: exported \`${name}\` has no JSDoc contract`);
+		findings.push(`${relative(repoRoot, path)}:${i + 1}: exported \`${name}\` has no JSDoc contract`);
 	}
 }
 
@@ -76,4 +67,4 @@ if (findings.length > 0) {
 	console.error(`\n${findings.length} export(s) without a JSDoc contract.`);
 	process.exit(1);
 }
-console.log(`OK: every export in ${relative(repo, src)} carries a JSDoc contract.`);
+console.log(`OK: every export in ${relative(repoRoot, src)} carries a JSDoc contract.`);

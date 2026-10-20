@@ -16,24 +16,15 @@
 // The rules come from the rot-audit skill's recipes, made executable. Usage: node scripts/check-docs.mjs
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
+import { repoRoot, walk } from "./lib/repo.mjs";
 
-const repo = decodeURIComponent(new URL("..", import.meta.url).pathname);
-const adrDir = join(repo, "docs", "adr");
+const adrDir = join(repoRoot, "docs", "adr");
 
 // A backticked path is only checked when it could be a repo path: it has a slash, and either it
 // names a file (a dot) or it starts at a directory the repo actually has.
 const ROOTS = new Set(["src", "test", "docs", "scripts", ".github"]);
 
-const markdown = [];
-const walk = (dir) => {
-	for (const entry of readdirSync(dir, { withFileTypes: true })) {
-		if (entry.name === "node_modules" || entry.name === ".git") continue;
-		const path = join(dir, entry.name);
-		if (entry.isDirectory()) walk(path);
-		else if (entry.name.endsWith(".md")) markdown.push(path);
-	}
-};
-walk(repo);
+const markdown = walk(repoRoot, (name) => name.endsWith(".md"));
 
 /** The lines that make claims: fenced code blocks and blockquotes are illustrations. */
 const claimLines = (text) => {
@@ -77,15 +68,13 @@ const headings = (path) => {
 /** Where a path could live: beside the file that names it, or at a repo root. */
 const candidates = (from, path) => [
 	resolve(dirname(from), path),
-	resolve(repo, path),
-	resolve(repo, "docs", path),
-	resolve(adrDir, path),
+	resolve(repoRoot, path),
 ];
 
 const existsSomewhere = (from, path) => candidates(from, path).some((candidate) => existsSync(candidate));
 
 const findings = [];
-const report = (file, line, message) => findings.push(`${relative(repo, file)}:${line}: ${message}`);
+const report = (file, line, message) => findings.push(`${relative(repoRoot, file)}:${line}: ${message}`);
 
 for (const file of markdown) {
 	const text = readFileSync(file, "utf8");
@@ -102,7 +91,7 @@ for (const file of markdown) {
 				continue;
 			}
 			if (anchor && !headings(resolved).has(anchor.toLowerCase())) {
-				report(file, line, `link anchor \`#${anchor}\` is not a heading in ${relative(repo, resolved)}`);
+				report(file, line, `link anchor \`#${anchor}\` is not a heading in ${relative(repoRoot, resolved)}`);
 			}
 		}
 

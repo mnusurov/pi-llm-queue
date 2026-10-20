@@ -278,9 +278,9 @@ periods follow the edit and live beats restart under the new period. `failOpen` 
 
 ## Tests
 
-`make test` (`npx tsc --noEmit`, then the public-export contract check, then `node --test
-test/*.test.ts`) drives these seams and never touches a real model endpoint. Every suite states what
-it pins in its own header comment, so the list of suites lives with the code it describes.
+`make test` (`npx tsc --noEmit`, then `node --test test/*.test.ts`) drives these seams and never
+touches a real model endpoint. Every suite states what it pins in its own header comment, so the
+list of suites lives with the code it describes.
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
 `waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,

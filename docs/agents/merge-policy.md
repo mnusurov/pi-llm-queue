@@ -16,8 +16,8 @@ them, don't restate them:
     gh api repos/mnusurov/pi-llm-queue/branches/main/protection \
       --jq '{checks: .required_status_checks.contexts, pr: (.required_pull_request_reviews != null), approvals: .required_pull_request_reviews.required_approving_review_count, admins: .enforce_admins.enabled}'
 
-A PR needs no approval to merge (one maintainer), but it does need the checks green and the branch
-up to date with `main` — the protection requires that, not the review.
+The protection requires the checks and an up-to-date branch, not a review: the repo has one
+maintainer.
 
 ## Work committed on local `main` moves to a branch
 

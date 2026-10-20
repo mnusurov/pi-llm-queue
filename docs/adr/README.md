@@ -23,6 +23,8 @@ Amended records — read the amendment, not only the original decision:
 - **0002** refined by 0003: an idle-yield adds a fifth cause of a Switch.
 - **0003** amended twice: 2026-10-19 (#57) — idle is "no keyed beat", not "between streams";
   2026-10-20 (#81) — the beat period follows the queue's own policy.
+- **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that
+  batch goes out.
 
 The next record takes the next number. Where a fact belongs: [`docs/agents/domain.md`](../agents/domain.md).
 The vocabulary the records use: [`GLOSSARY.md`](../../GLOSSARY.md).
