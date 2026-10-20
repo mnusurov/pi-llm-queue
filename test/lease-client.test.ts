@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
-import { LeaseClient, ensureDaemon } from "../src/lease-client.ts";
+import { DaemonUnreachableError, LeaseClient, ensureDaemon } from "../src/lease-client.ts";
 import { heartbeatMs } from "../src/config.js";
 import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
@@ -17,10 +17,11 @@ const QUEUE_KEY2 = "http://model.test/v2";
 describe("lease client", () => {
 	after(stopAllDaemons);
 
-	it("fails open when the daemon is unreachable", async () => {
+	it("answers passthrough when the daemon is unreachable", async () => {
 		const lease = new LeaseClient({ socketPath: "/tmp/pi-llm-queue-absent.sock" });
-		const outcome = await raceWithSleep(lease.acquire(QUEUE_KEY, "S", "parent"), 500);
-		assert.equal(outcome, "resolved");
+		// The race proves the request resolves (fail-open) rather than hanging on a dead socket.
+		const outcome = await Promise.race([lease.acquire(QUEUE_KEY, "S", "parent"), sleep(500).then(() => "pending")]);
+		assert.deepEqual(outcome, { kind: "passthrough" });
 	});
 
 	it("serialises two sessions through the client api", async () => {
@@ -50,7 +51,7 @@ describe("lease client", () => {
 		const b = new LeaseClient({ socketPath: d.socketPath });
 
 		assert.equal(await raceWithSleep(a.acquire(GPU, "A", "parent"), 3000), "resolved", "acquire on a grouped endpoint resolves: the reply echoes the requested key");
-		assert.equal(await a.beat(GPU, "A"), true, "an activity beat on a grouped endpoint is granted");
+		assert.deepEqual(await a.beat(GPU, "A"), { kind: "held" }, "an activity beat on a grouped endpoint is held");
 
 		const bAcquire = b.acquire(ZEN, "B", "parent");
 		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "the group's single slot is shared across endpoints");
@@ -139,6 +140,7 @@ describe("lease client", () => {
 		assert.equal(await raceWithSleep(queued, 300), "pending");
 		d.stop(); // daemon dies while C is queued
 		assert.equal(await raceWithSleep(queued, 3000), "resolved");
+		assert.deepEqual(await queued, { kind: "passthrough" }, "a daemon death mid-acquire passes through");
 		c.close();
 		holder.close();
 	});
@@ -189,8 +191,8 @@ describe("lease client", () => {
 	});
 
 	it("reports an unreachable status as null when the socket dies mid-request", async () => {
-		// A daemon that dies with a status in flight resolves the pending request as {op:"fail-open"}.
-		// Handing that sentinel to /queue crashes it on `.queues.map`: status must answer null instead.
+		// A daemon that dies with a status in flight resolves the pending request with the close
+		// signal. Handing that to /queue crashes it on `.queues.map`: status must answer null instead.
 		const dir = mkdtempSync(join(tmpdir(), "llm-queue-status-die-"));
 		const socketPath = join(dir, "status.sock");
 		const server = createServer((conn) => conn.once("data", () => conn.destroy()));
@@ -199,6 +201,61 @@ describe("lease client", () => {
 		const c = new LeaseClient({ socketPath });
 		try {
 			assert.equal(await c.status(), null);
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
+	it("answers held to a beat on a live lease", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath });
+
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		assert.deepEqual(await a.beat(QUEUE_KEY, "A"), { kind: "held" }, "a live lease beats held");
+
+		a.close();
+		d.stop();
+	});
+
+	it("answers lost to a beat once the daemon no longer grants the slot", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath });
+
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		a.release(QUEUE_KEY, "A");
+		assert.deepEqual(await a.beat(QUEUE_KEY, "A"), { kind: "lost" }, "a released lease beats lost");
+
+		a.close();
+		d.stop();
+	});
+
+	it("answers passthrough when the daemon dies mid-beat", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-beat-die-"));
+		const socketPath = join(dir, "beat.sock");
+		const server = createServer((conn) => conn.once("data", () => conn.destroy()));
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.deepEqual(await c.beat(QUEUE_KEY, "B"), { kind: "passthrough" }, "a daemon death mid-beat passes through");
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
+	it("throws DaemonUnreachableError when the daemon dies mid-beat and failOpen is false", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-beat-die-closed-"));
+		const socketPath = join(dir, "beat.sock");
+		const server = createServer((conn) => conn.once("data", () => conn.destroy()));
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath, failOpen: false });
+		try {
+			await assert.rejects(c.beat(QUEUE_KEY, "B"), DaemonUnreachableError);
 		} finally {
 			c.close();
 			server.close();
@@ -283,6 +340,7 @@ describe("lease client", () => {
 		assert.equal(await raceWithSleep(queued, 300), "pending");
 		ac.abort();
 		assert.equal(await raceWithSleep(queued, 3000), "resolved");
+		assert.deepEqual(await queued, { kind: "cancelled" }, "an aborted acquire is cancelled");
 		// The cancel dropped C: releasing H must not grant a phantom C, so a fresh acquirer gets the slot.
 		holder.release(QUEUE_KEY, "H");
 		const next = new LeaseClient({ socketPath: d.socketPath });
@@ -336,8 +394,8 @@ describe("lease client", () => {
 			[
 				`import { LeaseClient } from ${JSON.stringify(leasePath)};`,
 				`const lease = new LeaseClient({ socketPath: process.argv[2] });`,
-				`const reason = await lease.acquire(${JSON.stringify(QUEUE_KEY)}, "CHILD", "parent", undefined, undefined, () => {});`,
-				"console.log(`GRANTED ${reason}`);",
+				`const verdict = await lease.acquire(${JSON.stringify(QUEUE_KEY)}, "CHILD", "parent", undefined, undefined, () => {});`,
+				"console.log(`GRANTED ${verdict.kind}`);",
 				"lease.close();",
 			].join("\n"),
 		);
@@ -355,15 +413,20 @@ describe("lease client", () => {
 		holder.release(QUEUE_KEY, "H");
 		const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
 		assert.equal(code, 0);
-		assert.match(out, /GRANTED granted/, "the child was granted its slot once it freed");
+		assert.match(out, /GRANTED held/, "the child was granted its slot once it freed");
 
 		holder.close();
 		d.stop();
 	});
 
-	it("fails closed (hard error) when failOpen is false and the daemon is unreachable", async () => {
+	it("throws DaemonUnreachableError from acquire when failOpen is false and the daemon is unreachable", async () => {
 		const lease = new LeaseClient({ socketPath: "/tmp/pi-llm-queue-absent.sock", failOpen: false });
-		await assert.rejects(lease.acquire(QUEUE_KEY, "S", "parent"), /failOpen is false/);
+		await assert.rejects(lease.acquire(QUEUE_KEY, "S", "parent"), DaemonUnreachableError);
+	});
+
+	it("throws DaemonUnreachableError from beat when failOpen is false and the daemon is unreachable", async () => {
+		const lease = new LeaseClient({ socketPath: "/tmp/pi-llm-queue-absent.sock", failOpen: false });
+		await assert.rejects(lease.beat(QUEUE_KEY, "S"), DaemonUnreachableError);
 	});
 
 	it("fails closed when the daemon dies mid-wait and failOpen is false", async () => {
@@ -375,7 +438,7 @@ describe("lease client", () => {
 		const queued = c.acquire(QUEUE_KEY, "C", "parent");
 		assert.equal(await raceWithSleep(queued, 300), "pending", "C is queued behind H");
 		d.stop(); // daemon dies mid-wait: failOpen:false must hard-error, not pass through
-		await assert.rejects(queued, /failOpen is false/);
+		await assert.rejects(queued, DaemonUnreachableError);
 		holder.close();
 	});
 
@@ -426,7 +489,7 @@ describe("lease client", () => {
 				`await lease.acquire(OTHER, "CHILD", "parent");`,
 				`const queued = lease.acquire(${JSON.stringify(QUEUE_KEY)}, "CHILD", "parent");`,
 				`await lease.beat(OTHER, "CHILD"); // a finished op: must not free the socket under the queued acquire`,
-				"console.log(`GRANTED ${await queued}`);",
+				"console.log(`GRANTED ${(await queued).kind}`);",
 				"lease.close();",
 			].join("\n"),
 		);
@@ -443,7 +506,7 @@ describe("lease client", () => {
 		holder.release(QUEUE_KEY, "H");
 		const code = await new Promise<number | null>((resolve) => child.on("exit", resolve));
 		assert.equal(code, 0);
-		assert.match(out, /GRANTED granted/, "the child was granted its slot once it freed");
+		assert.match(out, /GRANTED held/, "the child was granted its slot once it freed");
 
 		holder.close();
 		d.stop();

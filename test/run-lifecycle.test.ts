@@ -2,7 +2,8 @@
 // and the parked Blocking Tool set. Fake LeasePort + fake Clock: no daemon, no sockets, no sleep.
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { RunLifecycle, SessionRegistry, type AcquireReason, type Clock, type LeasePort, type Timer } from "../src/run-lifecycle.ts";
+import { RunLifecycle, SessionRegistry, type Clock, type LeasePort, type Timer } from "../src/run-lifecycle.ts";
+import type { AcquireVerdict, BeatVerdict } from "../src/lease-verdict.ts";
 
 const GRACE_MS = 3000;
 const BEAT_MS = 100;
@@ -51,9 +52,11 @@ class FakeLease implements LeasePort {
 	readonly releases: string[] = [];
 	readonly beats: string[] = [];
 	readonly held = new Set<string>();
-	/** Answers the next keyed beat false, as a daemon that yielded the slot does. */
+	/** Answers the next keyed beat lost, as a daemon that yielded the slot does. */
 	lost = false;
-	private deferred: { queueKey: string; resolve: (reason: AcquireReason) => void } | null = null;
+	/** Answers every keyed beat passthrough, as an unreachable daemon does. */
+	passthrough = false;
+	private deferred: { queueKey: string; resolve: (verdict: AcquireVerdict) => void } | null = null;
 
 	deferNextAcquire(): void {
 		this.manual = true;
@@ -66,14 +69,14 @@ class FakeLease implements LeasePort {
 		this.manual = false;
 		if (!pending) throw new Error("no deferred acquire to grant");
 		this.held.add(pending.queueKey);
-		pending.resolve("granted");
+		pending.resolve({ kind: "held" });
 	}
 
-	acquire(queueKey: string, _signal?: AbortSignal): Promise<AcquireReason> {
+	acquire(queueKey: string, _signal?: AbortSignal): Promise<AcquireVerdict> {
 		this.acquires.push(queueKey);
 		if (this.manual) return new Promise((resolve) => (this.deferred = { queueKey, resolve }));
 		this.held.add(queueKey);
-		return Promise.resolve("granted");
+		return Promise.resolve({ kind: "held" });
 	}
 
 	release(queueKey: string): void {
@@ -81,13 +84,13 @@ class FakeLease implements LeasePort {
 		this.held.delete(queueKey);
 	}
 
-	beat(queueKey: string): Promise<boolean> {
+	beat(queueKey: string): Promise<BeatVerdict> {
 		this.beats.push(queueKey);
 		if (this.lost) {
 			this.held.delete(queueKey);
-			return Promise.resolve(false);
+			return Promise.resolve({ kind: "lost" });
 		}
-		return Promise.resolve(true);
+		return Promise.resolve({ kind: this.passthrough ? "passthrough" : "held" });
 	}
 }
 
@@ -239,7 +242,18 @@ describe("RunLifecycle: Beat gate", () => {
 		assert.ok(lease.beats.length > before, "the stale parked id did not silence the new Run");
 	});
 
-	it("a beat answered false stops the timer; the next stream re-queues", async () => {
+	it("a passthrough beat streams unqueued without re-queuing", async () => {
+		const { lease, lifecycle } = make();
+		await lifecycle.startRun("q");
+		lease.passthrough = true;
+
+		const acquires = lease.acquires.length;
+		await lifecycle.withSlot("q", undefined, async () => "stream");
+		assert.equal(lease.acquires.length, acquires, "passthrough keeps the Run's path: no re-queue");
+		assert.equal(lifecycle.holds("q"), true, "the Run's lease is unchanged by a passthrough beat");
+	});
+
+	it("a beat answered lost stops the timer; the next stream re-queues", async () => {
 		const { lease, clock, lifecycle } = make();
 		await lifecycle.startRun("q");
 		lease.lost = true;

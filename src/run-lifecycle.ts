@@ -2,8 +2,8 @@
 // per session holds the ordering rules. No pi, addressing, daemon, socket, or LeaseClient import:
 // the ports are injected, so the rules are testable without a daemon (ADR 0007).
 
-/** Why an acquire resolved. Structurally the LeaseClient's reply; the client is never imported. */
-export type AcquireReason = "granted" | "fail-open" | "aborted";
+// Type-only: the shared verdict, not the LeaseClient (ADR 0007).
+import type { AcquireVerdict, BeatVerdict } from "./lease-verdict.ts";
 
 /** Opaque handle from Clock; the production adapter returns Node's Timeout object. */
 export type Timer = unknown;
@@ -24,9 +24,9 @@ export interface LeasePort {
 			onQueued(info: { position: number; holders: string[] }): void;
 			onWaitCap(): void;
 		},
-	): Promise<AcquireReason>;
+	): Promise<AcquireVerdict>;
 	release(queueKey: string): void;
-	beat(queueKey: string): Promise<boolean>;
+	beat(queueKey: string): Promise<BeatVerdict>;
 }
 
 /** The footer indicator and user-visible warnings; the Extension maps it onto pi's ui. */
@@ -84,7 +84,7 @@ export class RunLifecycle {
 	private readonly leases = new Map<string, LeaseState>();
 	/** Orthogonal to `state`: a Run can be held or in Grace while a Blocking Tool is in flight. */
 	private readonly parked = new Set<string>();
-	private readonly pendingAcquire = new Map<string, Promise<AcquireReason>>();
+	private readonly pendingAcquire = new Map<string, Promise<AcquireVerdict>>();
 
 	private releaseTimer: Timer | null = null;
 	private queuedInfo: QueuedInfo | null = null;
@@ -118,10 +118,10 @@ export class RunLifecycle {
 		// Attach the abort path before awaiting: Esc while queued must cancel the Run's lease.
 		signal?.addEventListener("abort", () => this.release(), { once: true });
 
-		const reason = await this.acquire(queueKey, signal);
+		const verdict = await this.acquire(queueKey, signal);
 		this.clearQueued();
-		// Only a grant claims a lease: an abort/fail-open must not mark the Slot held.
-		if (reason !== "granted") {
+		// Only a held lease claims the Slot: cancelled and passthrough must not mark it held.
+		if (verdict.kind !== "held") {
 			this.state = "idle";
 			return;
 		}
@@ -149,13 +149,14 @@ export class RunLifecycle {
 
 		let selfQueued = false;
 		try {
-			// A held lease beats: the Run keeps the Slot across tool executions. A beat answered
-			// ungranted means the daemon no longer grants it — re-queue before streaming.
-			const retained = wasHeld && (await this.lease.beat(queueKey));
+			// A held lease beats: the Run keeps the Slot across tool executions. A lost beat means
+			// the daemon no longer grants it — re-queue before streaming; passthrough still streams.
+			const beat = wasHeld ? await this.lease.beat(queueKey) : null;
+			const retained = beat !== null && beat.kind !== "lost";
 			if (!retained) {
-				const reason = await this.acquire(queueKey, signal);
+				const verdict = await this.acquire(queueKey, signal);
 				this.clearQueued();
-				if (reason === "granted") {
+				if (verdict.kind === "held") {
 					const runOwns = wasHeld || this.leases.get(queueKey)?.owner === "run";
 					if (runOwns) this.claim(queueKey, "run"); // the Run re-took, or won, the Slot
 					else {
@@ -215,8 +216,8 @@ export class RunLifecycle {
 	private beatNow(queueKey: string): void {
 		if (!this.shouldBeat(queueKey)) return;
 		this.lease.beat(queueKey).then(
-			(granted) => {
-				if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
+			(verdict) => {
+				if (verdict.kind === "lost") this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
 			},
 			() => {},
 		);
@@ -265,7 +266,7 @@ export class RunLifecycle {
 	}
 
 	/** Acquire this Queue once: a concurrent call for the same Queue shares the request (#55). */
-	private acquire(queueKey: string, signal?: AbortSignal): Promise<AcquireReason> {
+	private acquire(queueKey: string, signal?: AbortSignal): Promise<AcquireVerdict> {
 		const pending = this.pendingAcquire.get(queueKey);
 		if (pending) return pending;
 

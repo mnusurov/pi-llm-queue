@@ -3,6 +3,7 @@
 import { connect, type Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { readJsonLines } from "./socket-lines.js";
+import type { AcquireVerdict, BeatVerdict } from "./lease-verdict.ts";
 
 export type Role = "parent" | "child";
 
@@ -21,8 +22,19 @@ export interface DaemonPaths {
 	queueTimeoutMs?: number;
 }
 
-/** Why an acquire resolved: granted, daemon-unreachable, or aborted. */
-export type AcquireReason = "granted" | "fail-open" | "aborted";
+/**
+ * The daemon is unreachable and `failOpen` is false. A typed error, not a verdict: the operator
+ * chose to make the queue a single point of failure, so a request must fail rather than slip through.
+ */
+export class DaemonUnreachableError extends Error {
+	constructor() {
+		super("pi-llm-queue: daemon unreachable and failOpen is false");
+		this.name = "DaemonUnreachableError";
+	}
+}
+
+/** Internal socket-close signal: a dead connection is not a daemon message and has no wire shape. */
+const CLOSED = Symbol("lease socket closed");
 
 /** One entry of the status reply: a Holder or a Waiter, reported by tier and group label. */
 export interface StatusSession {
@@ -69,9 +81,12 @@ export async function ensureDaemon({ socketPath, daemonPath, configPath, modelsJ
 	child.unref();
 }
 
+/** A socket reply, or the internal close signal — the two things a pending request resolves with. */
+type DaemonReply = Record<string, any> | typeof CLOSED;
+
 interface Pending {
 	match: (msg: any) => boolean;
-	resolve: (msg: any) => void;
+	resolve: (msg: DaemonReply) => void;
 }
 
 export class LeaseClient {
@@ -105,7 +120,13 @@ export class LeaseClient {
 	// failOpen: false and the daemon is gone → the request hard-errors (the queue is a
 	// single point of failure by the operator's explicit choice).
 	private unreachable(): never {
-		throw new Error("pi-llm-queue: daemon unreachable and failOpen is false");
+		throw new DaemonUnreachableError();
+	}
+
+	/** The Fail-open policy for an unreachable daemon: pass through unqueued, or refuse. */
+	private passthrough(): { kind: "passthrough" } {
+		if (!this.failOpen) this.unreachable();
+		return { kind: "passthrough" };
 	}
 
 	private async connectDaemon(): Promise<boolean> {
@@ -130,7 +151,7 @@ export class LeaseClient {
 				sock.on("close", () => {
 					this.sock = null;
 					const wakers = this.pending.splice(0, this.pending.length);
-					for (const p of wakers) p.resolve({ op: "fail-open" });
+					for (const p of wakers) p.resolve(CLOSED);
 				});
 				this.sock = sock;
 				sock.unref(); // never keep pi's process alive through the lease connection
@@ -170,13 +191,14 @@ export class LeaseClient {
 		this.sock?.write(`${JSON.stringify(msg)}\n`);
 	}
 
-	private read(match: (msg: any) => boolean): Promise<any> {
+	private read(match: (msg: any) => boolean): Promise<DaemonReply> {
 		return new Promise((resolve) => this.pending.push({ match, resolve }));
 	}
 
 	/**
-	 * Resolves when the slot is granted, when the daemon is unreachable, or when
-	 * `signal` aborts (the queued request is cancelled at the daemon first).
+	 * Resolves `held` when the slot is granted, `passthrough` when the daemon is unreachable, or
+	 * `cancelled` when `signal` aborts (the queued request is cancelled at the daemon first).
+	 * Throws `DaemonUnreachableError` instead of `passthrough` when `failOpen` is false.
 	 * `onQueued` fires while the request waits, so the caller can show a live indicator.
 	 */
 	async acquire(
@@ -187,11 +209,8 @@ export class LeaseClient {
 		signal?: AbortSignal,
 		onQueued?: (info: { position: number; holders: string[] }) => void,
 		onTimeout?: () => void,
-	): Promise<AcquireReason> {
-		if (!(await this.connectDaemon())) {
-			if (!this.failOpen) this.unreachable();
-			return "fail-open";
-		}
+	): Promise<AcquireVerdict> {
+		if (!(await this.connectDaemon())) return this.passthrough();
 		this.refSocket();
 		this.send({ op: "acquire", queueKey, sessionKey, role, group, activity: true });
 		const granted = (msg: any) => msg.op === "granted" && msg.queueKey === queueKey && msg.sessionKey === sessionKey;
@@ -223,9 +242,9 @@ export class LeaseClient {
 				}, 300)
 			: null;
 		firstPoll?.unref();
-		const reason = await new Promise<AcquireReason>((resolve) => {
+		const verdict = await new Promise<AcquireVerdict>((resolve) => {
 			let done = false;
-			const finish = (r: AcquireReason) => {
+			const finish = (r: AcquireVerdict) => {
 				if (done) return;
 				done = true;
 				if (timer) clearTimeout(timer);
@@ -236,10 +255,10 @@ export class LeaseClient {
 				const at = this.pending.indexOf(entry);
 				if (at >= 0) this.pending.splice(at, 1);
 				this.send({ op: "cancel", queueKey, sessionKey });
-				finish("aborted");
+				finish({ kind: "cancelled" });
 			};
-			// Grant delivery passes the granted msg; a daemon death mid-wait passes {op:"fail-open"}.
-			entry.resolve = (msg: any) => finish(msg && msg.op === "fail-open" ? "fail-open" : "granted");
+			// Grant delivery passes the granted msg; a daemon death mid-wait passes the close signal.
+			entry.resolve = (msg) => finish(msg === CLOSED ? { kind: "passthrough" } : { kind: "held" });
 			this.pending.push(entry);
 			if (signal) {
 				if (signal.aborted) {
@@ -260,9 +279,8 @@ export class LeaseClient {
 		if (poll) clearInterval(poll);
 		settled = true;
 		this.unrefSocket();
-		// A daemon that died mid-wait resolves the pending acquire as fail-open: honour failOpen here too.
-		if (reason === "fail-open" && !this.failOpen) this.unreachable();
-		return reason;
+		// A daemon that died mid-wait passed through: honour failOpen for that verdict too.
+		return verdict.kind === "passthrough" ? this.passthrough() : verdict;
 	}
 
 	release(queueKey: string, sessionKey: string): void {
@@ -276,20 +294,17 @@ export class LeaseClient {
 
 	/**
 	 * Activity beat: the holder is using the slot, so its TTL refreshes.
-	 * Resolves false when the daemon no longer grants the slot (TTL expiry, a release, a
-	 * disconnect) — the caller must re-queue.
+	 * Resolves `lost` when the daemon no longer grants the slot (TTL expiry, a release) — the
+	 * caller must re-queue — and `passthrough` when the daemon is unreachable, mid-beat included.
 	 */
-	async beat(queueKey: string, sessionKey: string): Promise<boolean> {
-		if (!(await this.connectDaemon())) {
-			if (!this.failOpen) this.unreachable();
-			return true; // fail-open: stream unqueued
-		}
+	async beat(queueKey: string, sessionKey: string): Promise<BeatVerdict> {
+		if (!(await this.connectDaemon())) return this.passthrough();
 		this.refSocket(); // the reply must keep the process/worker alive while we await it
 		this.send({ op: "renew", queueKey, sessionKey });
 		const msg = await this.read((m) => m.op === "ok" && m.queueKey === queueKey && m.sessionKey === sessionKey);
 		this.unrefSocket();
-		if (msg.op === "fail-open" && !this.failOpen) this.unreachable(); // daemon died mid-beat
-		return msg.granted !== false;
+		if (msg === CLOSED) return this.passthrough(); // daemon died mid-beat
+		return msg.granted === false ? { kind: "lost" } : { kind: "held" };
 	}
 
 	/**
@@ -309,7 +324,7 @@ export class LeaseClient {
 		try {
 			sock.write(`${JSON.stringify({ op: "bye" })}\n`);
 		} catch {}
-		sock.destroy(); // the close handler clears this.sock and fail-opens any pending request
+		sock.destroy(); // the close handler clears this.sock and releases any pending request
 	}
 
 	async status(): Promise<StatusReply | null> {
@@ -318,9 +333,9 @@ export class LeaseClient {
 		this.send({ op: "status" });
 		const msg = await this.read((m) => m.op === "status");
 		this.unrefSocket();
-		// A close mid-request resolves every pending request with {op:"fail-open"}: never hand that
-		// sentinel to /queue, which expects a StatusReply and would throw on `.queues.map`.
-		return msg.op === "status" ? msg : null;
+		// A close mid-request resolves every pending request with the close signal: never hand it
+		// to /queue, which expects a StatusReply and would throw on `.queues.map`.
+		return msg === CLOSED ? null : (msg as StatusReply);
 	}
 
 	close(): void {
