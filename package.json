@@ -1,6 +1,6 @@
 {
   "name": "pi-llm-queue",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pi extension + local daemon that serialises LLM access to protect KV-cache warmth",
   "type": "module",
   "license": "MIT",

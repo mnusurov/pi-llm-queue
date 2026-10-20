@@ -21,9 +21,9 @@ dependencies; pi supplies the `@earendil-works/*` peer packages.
 pi install npm:pi-llm-queue
 ```
 
-Pin a version with `pi install npm:pi-llm-queue@0.1.0`; try one session without writing anything to
+Pin a version with `pi install npm:pi-llm-queue@0.1.1`; try one session without writing anything to
 settings with `pi -e npm:pi-llm-queue`. Git sources work too and pin by tag:
-`pi install git:github.com/mnusurov/pi-llm-queue@v0.1.0` (a git ref is pinned — `pi update
+`pi install git:github.com/mnusurov/pi-llm-queue@v0.1.1` (a git ref is pinned — `pi update
 --extensions` reconciles the checkout but never moves a configured ref), and from a clone
 `pi install ./pi-llm-queue` loads the working tree directly, which is the dev path.
 
