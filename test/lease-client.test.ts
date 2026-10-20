@@ -228,6 +228,50 @@ describe("lease client", () => {
 		}
 	});
 
+	it("reassembles a reply split inside a multi-byte character", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-frag-utf8-"));
+		const socketPath = join(dir, "frag-utf8.sock");
+		const server = createServer((conn) => {
+			conn.once("data", () => {
+				const reply = Buffer.from(`${JSON.stringify({ op: "granted", queueKey: QUEUE_KEY, sessionKey: "café✅" })}\n`);
+				const split = reply.indexOf(0xc3) + 1; // between the two bytes of "é"
+				conn.write(reply.subarray(0, split));
+				setTimeout(() => conn.write(reply.subarray(split)), 50);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.equal(await raceWithSleep(c.acquire(QUEUE_KEY, "café✅", "parent"), 2000), "resolved");
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
+	it("drops a reply line over 100 KB with no newline and fails the pending request open", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-oversize-"));
+		const socketPath = join(dir, "oversize.sock");
+		let closed = () => {};
+		const disconnected = new Promise<void>((resolve) => (closed = resolve));
+		const server = createServer((conn) => {
+			conn.on("error", () => {});
+			conn.on("close", closed);
+			conn.write("x".repeat(200_000)); // no newline: the client must cap the line buffer
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.equal(await raceWithSleep(c.acquire(QUEUE_KEY, "BIG", "parent"), 2000), "resolved");
+			await disconnected;
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
 	it("cancels a queued acquire when the abort signal fires", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
 		await waitForDaemon(d.socketPath);

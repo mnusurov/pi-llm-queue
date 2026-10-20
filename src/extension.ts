@@ -101,7 +101,7 @@ function reconcileStarterKeys(
 	isNativeOwned: (name: string) => boolean,
 ): string[] {
 	const keys = Object.keys(queues ?? {});
-	const added: string[] = [];
+	const added = new Set<string>();
 	for (const [name, provider] of Object.entries(providers ?? {})) {
 		const baseUrl = provider?.baseUrl;
 		if (!baseUrl || isNativeOwned(name) || !isLocalEndpoint(baseUrl)) continue;
@@ -109,9 +109,9 @@ function reconcileStarterKeys(
 		// Group's match — is queued (or disabled on purpose); adding the baseUrl key would split it
 		// into a second queue and take the Slot away from the user's entry.
 		const covered = keys.some((key) => membersOf(key, queues[key]).some((member) => keyAddressesEndpoint(member, providers, baseUrl)));
-		if (!covered) added.push(baseUrl);
+		if (!covered) added.add(baseUrl);
 	}
-	return added.sort();
+	return [...added].sort();
 }
 
 /**

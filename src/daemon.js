@@ -12,6 +12,7 @@ import { basename, dirname } from "node:path";
 import { loadValidConfig, DEFAULTS } from "./config.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
 import { Scheduler } from "./scheduler.js";
+import { readJsonLines } from "./socket-lines.js";
 
 const args = process.argv.slice(2);
 const arg = (name) => {
@@ -293,36 +294,19 @@ function handle(msg, conn) {
 const server = createServer((conn) => {
 	conn.connId = ++connSeq;
 	connById.set(conn.connId, conn);
-	let buffer = "";
-	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the key.
-	const decoder = new TextDecoder("utf8");
-	conn.on("data", (chunk) => {
-		buffer += decoder.decode(chunk, { stream: true });
-		// A peer that never sends a newline must not grow the daemon's memory without bound.
-		if (buffer.length > 1e5) {
-			conn.destroy();
-			return;
-		}
-		const lines = buffer.split("\n");
-		buffer = lines.pop();
-		for (const line of lines) {
-			if (!line.trim()) continue;
-			let msg;
-			try {
-				msg = JSON.parse(line);
-			} catch {
-				send(conn, { op: "error", reason: "invalid json" });
-				continue;
-			}
+	readJsonLines(
+		conn,
+		(msg) => {
 			// Any JSON value parses: only an object can be a message. A `null` line reaching the op
 			// handler used to throw on msg.op and exit the daemon, dropping every lease and waiter.
 			if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
 				send(conn, { op: "error", reason: "message must be a JSON object" });
-				continue;
+				return;
 			}
 			handle(msg, conn);
-		}
-	});
+		},
+		() => send(conn, { op: "error", reason: "invalid json" }),
+	);
 	conn.on("close", () => disconnect(conn));
 	conn.on("error", () => disconnect(conn));
 });
@@ -443,8 +427,7 @@ if (configPath) {
 			config = next.config;
 			defaults = config.defaults ?? {};
 			// rebuildQueues rebuilds every live queue through scheduler.newQueue (which re-resolves the
-			// new policy), so a separate scheduler.applyPolicy() here is dead: its effect on the old
-			// queues is discarded by the rebuild. One rebuild, one policy resolution.
+			// new policy); one rebuild, one policy resolution.
 			rebuildQueues();
 		}, 250);
 		debounce.unref();
