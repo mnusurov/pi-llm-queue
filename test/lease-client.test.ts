@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { LeaseClient, ensureDaemon } from "../src/lease-client.ts";
 import { heartbeatMs } from "../src/config.js";
-import { DAEMON, QUEUE_KEY, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
+import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
@@ -242,7 +242,10 @@ describe("lease client", () => {
 
 		const seen: any[] = [];
 		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent", undefined, undefined, (info) => seen.push(info));
-		await sleep(1500);
+		// The first status report fires at 300 ms (lease-client.ts): poll for it with the 1500 ms bound
+		// the sleep used. The 2 s poll cadence is the next test's subject — a queued process must live
+		// through a 300 ms first poll and a 2 s follow-up; the window below proves reporting stops.
+		await pollUntil(() => seen.length > 0, 1500, "waiting for the first status report of the waiting acquire");
 		assert.ok(seen.length, "a waiting acquire reports its queue position");
 		assert.equal(seen[0].position, 1);
 		assert.deepEqual(seen[0].holders, ["A"], "the report names the session holding the slot");

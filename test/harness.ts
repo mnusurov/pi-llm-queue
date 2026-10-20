@@ -57,6 +57,32 @@ export function startDaemon(config: Record<string, any> = { defaults: { maxStrea
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Presence waits poll, absence windows sleep (#79).
+ *
+ * A fixed sleep that waits for a thing to *happen* overshoots the moment the condition becomes
+ * true — that overshoot is the suite's wall time. Poll `check` every `tickMs` until it is true and
+ * return as soon as it is; the bound is the sleep's own length, so the test proves the same thing
+ * over the same span, and a condition that never arrives fails with `message` at the bound. A test
+ * that asserts a thing *did not* happen keeps its full fixed sleep: absence needs the whole span.
+ */
+export async function pollUntil(check: () => boolean | Promise<boolean>, boundMs: number, message: string, tickMs = 100): Promise<void> {
+	const deadline = Date.now() + boundMs;
+	for (;;) {
+		// A check that throws — a status round-trip that timed out under parallel load — is "not yet".
+		// The bound and `message` decide the failure, so a transport hiccup cannot mask the real one.
+		let ok = false;
+		try {
+			ok = await check();
+		} catch {
+			ok = false;
+		}
+		if (ok) return;
+		if (Date.now() >= deadline) throw new Error(`${message} — not observed within ${boundMs} ms`);
+		await sleep(tickMs);
+	}
+}
+
 /** True when the daemon process exits within ms, false if it is still alive after that. */
 export const exited = (proc: ChildProcess, ms: number) =>
 	new Promise<boolean>((resolve) => {
