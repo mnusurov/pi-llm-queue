@@ -285,7 +285,7 @@ describe("queue policy resolution", () => {
 			const proc = spawn(process.execPath, [DAEMON, "--socket", join(dir, `s-${contents.length}.sock`), "--config", configPath, "--models-json", modelsJsonPath], { stdio: ["ignore", "ignore", "pipe"] });
 			let stderr = "";
 			proc.stderr.on("data", (chunk) => (stderr += chunk));
-			await sleep(120); // the report is written during startup, before the daemon listens: 10× the write
+			await sleep(120); // the report is written during startup, before the daemon listens: slack, not a condition
 			proc.kill();
 			return stderr;
 		};

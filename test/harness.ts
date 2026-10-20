@@ -69,7 +69,15 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 export async function pollUntil(check: () => boolean | Promise<boolean>, boundMs: number, message: string, tickMs = 100): Promise<void> {
 	const deadline = Date.now() + boundMs;
 	for (;;) {
-		if (await check()) return;
+		// A check that throws — a status round-trip that timed out under parallel load — is "not yet".
+		// The bound and `message` decide the failure, so a transport hiccup cannot mask the real one.
+		let ok = false;
+		try {
+			ok = await check();
+		} catch {
+			ok = false;
+		}
+		if (ok) return;
 		if (Date.now() >= deadline) throw new Error(`${message} — not observed within ${boundMs} ms`);
 		await sleep(tickMs);
 	}
