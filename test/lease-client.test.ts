@@ -188,6 +188,23 @@ describe("lease client", () => {
 		d.stop();
 	});
 
+	it("reports an unreachable status as null when the socket dies mid-request", async () => {
+		// A daemon that dies with a status in flight resolves the pending request as {op:"fail-open"}.
+		// Handing that sentinel to /queue crashes it on `.queues.map`: status must answer null instead.
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-status-die-"));
+		const socketPath = join(dir, "status.sock");
+		const server = createServer((conn) => conn.once("data", () => conn.destroy()));
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.equal(await c.status(), null);
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
 	it("reassembles a reply split across socket chunks", async () => {
 		// Socket reads are not line-aligned: a grant arriving in two writes must still resolve
 		// the acquire, not die on a JSON fragment.

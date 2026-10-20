@@ -156,8 +156,9 @@ keeps the last good config.
 - **`logFile`** — the daemon's event log path (`defaults` only, a `path` string). Unset: no file,
   and the daemon behaves exactly as before (its stderr is discarded when the extension spawns it
   detached). Set: the daemon appends one JSON line per queue event, so a finished run can be read
-  back from a single file. Every line carries `event`, `queueKey`, `sessionKey`, `role` and `ts`
-  (ISO timestamp), plus `reason` where the event has one. The vocabulary is the scheduler's own:
+  back from a single file. Every line carries `event`, `queueKey` and `ts` (ISO timestamp); scheduler
+  events also carry `sessionKey` and `role`, and an event may carry `reason`. The vocabulary is the
+  scheduler's own, plus one adapter event:
 
   | event     | when                                                                                          |
   | --------- | --------------------------------------------------------------------------------------------- |
@@ -166,11 +167,13 @@ keeps the last good config.
   | `queued`  | an `acquire` parks as a waiter                                                                  |
   | `release` | the slot returns — voluntary release, a disconnect, a `cancel` of a granted slot; `reason: "idle"` for an idle yield (ADR 0003) |
   | `evict`   | a TTL reclaim — `reason: "ttl"`, the only eviction after ADR 0002                               |
+  | `config`  | a hot-reload leaves more holders than the new `maxStreams` allows — `reason: "over-capacity"`, plus `holders` and `maxStreams` (#82) |
 
   The logged `queueKey` is the queue that owns the slot — a group's name when the client addressed
-  it by a member key — and the logged `role` is the tier off the lease (or off the waiter, while it
-  is still queued), the same field `status` reports, so the log and the reply cannot disagree about
-  who holds what. The path is read per event, so a hot-reload can turn the log on, off, or move it.
+  it by a member key. For a scheduler event, the logged `role` is the tier off the lease (or off the
+  waiter, while it is still queued), the same field `status` reports, so the log and the reply cannot
+  disagree about who holds what. The path is read per event, so a hot-reload can turn the log on, off,
+  or move it.
   **Best effort**: every write is swallowed on failure — an unwritable path, a full disk or a log
   rotation race leaves the daemon serving requests, because observability must never become an
   availability risk.
@@ -203,12 +206,17 @@ keeps the last good config.
 The daemon watches `llm-queue.json` (250 ms debounce, directory watch so atomic saves keep
 working), re-applies queue policy to live queues, and rebuilds them through the reloaded
 groups — holders and waiters move with their queue, so an endpoint never ends up with two
-slot sets. A widened `maxStreams` grants waiting sessions at once. The extension watches the
-same file and re-resolves its wrapped provider set (registering new providers, unregistering
-removed ones). A half-written file keeps the last good config. No daemon or pi restart is
-needed; the client's per-queue beat periods follow the edit and live beats restart under the new
-period. `failOpen` and `queueTimeoutMs` are read once at connect and are the fields that need a
-pi restart.
+slot sets. A widened `maxStreams` grants waiting sessions at once. A reload can also lower a
+queue's `maxStreams` below its live holder count — merging two one-slot endpoint queues into a
+one-slot group does exactly that. No-preemption means the daemon cannot take a slot from a live
+Holder: the Holders keep streaming until they release, `status` reports the transient over-capacity
+(for example `2/1`), and the daemon writes a `config` event with `reason: "over-capacity"` when
+`logFile` is set. No additional request is granted until the count is back under the limit; the
+overrun drains as each Holder releases its slot. The extension watches the same file and re-resolves
+its wrapped provider set (registering new providers, unregistering removed ones). A half-written
+file keeps the last good config. No daemon or pi restart is needed; the client's per-queue beat
+periods follow the edit and live beats restart under the new period. `failOpen` and
+`queueTimeoutMs` are read once at connect and are the fields that need a pi restart.
 
 ## Client contract
 
@@ -277,9 +285,9 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | file                                   | suites                                                                                                                                                                     |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `test/config.test.ts`                  | config schema validation; config file loading                                                                                                                               |
-| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; daemon lifetime: counted clients and status invisibility (#60); config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
+| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload (including a merge over capacity); observability: status counters; daemon idle-exit; daemon lifetime: counted clients and status invisibility (#60); config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
 | `test/daemon-event-log.test.ts`        | daemon event log — the `logFile` seam: the JSON-lines sequence of a handover, every event's fields, a TTL reclaim as `evict` + `reason: "ttl"`, an idle yield as `release` + `reason: "idle"`, an unwritable path that leaves the daemon serving, the path followed across a hot-reload (on, moved, off), no file when `logFile` is unset |
-| `test/lease-client.test.ts`            | lease client; daemon autostart                                                                                                                                              |
+| `test/lease-client.test.ts`            | lease client; daemon autostart; fail-open status replies resolve to null                                                                                                   |
 | `test/extension.test.ts`               | self-hosted endpoint detection; starter config generation; role resolution                                                                                                  |
 | `test/extension-wrapper.test.ts`       | provider wrapper (queuedStream); config hot-reload (provider set)                                                                                                           |
 | `test/extension-timeout.test.ts`       | queueTimeoutMs visible warning — a parent warned past the cap stays queued                                                                                                  |

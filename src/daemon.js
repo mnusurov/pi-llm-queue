@@ -71,12 +71,32 @@ function sessionView(entry) {
 // reports the same field, so a reader can never see the log and the reply disagree about the tier a
 // session holds. The wall-clock `ts` is stamped here (adapter-side), not in the Scheduler.
 function logEvent(event, queueKey, sessionKey, role, reason) {
-	const path = defaults.logFile;
-	if (!path) return;
 	const line = { event, queueKey, sessionKey, role, ts: new Date().toISOString() };
 	if (reason) line.reason = reason;
-	// Best effort, swallowed: a bad path, a full disk or a log rotation race must never take the
-	// daemon down (it is spawned detached, so a crash is silent) nor reject the request that logged.
+	writeEvent(line);
+}
+
+// A hot-reload can lower a queue's maxStreams below its live holder count (merging two endpoint
+// queues into a narrower group does exactly that). No-preemption means the daemon cannot take a
+// slot from a live Holder, so it reports the transient over-capacity in the log instead of
+// exceeding the new limit silently (#82). The counts show how far over the queue is.
+function logOverCapacity(queue) {
+	writeEvent({
+		event: "config",
+		queueKey: queue.queueKey,
+		reason: "over-capacity",
+		holders: queue.holders.length,
+		maxStreams: queue.maxStreams,
+		ts: new Date().toISOString(),
+	});
+}
+
+// The event-log sink: with `logFile` set, one JSON line is appended per event. Best effort,
+// swallowed: a bad path, a full disk or a log rotation race must never take the daemon down
+// (it is spawned detached, so a crash is silent) nor reject the request that logged.
+function writeEvent(line) {
+	const path = defaults.logFile;
+	if (!path) return;
 	// appendFileSync, not a stream: one short line per event, on disk before the reply goes out, so
 	// a reader reads the file the moment the reply lands and a crash loses no buffered line.
 	try {
@@ -390,6 +410,9 @@ function rebuildQueues() {
 			moved.waiting.push(waiter);
 		}
 	}
+	// No-preemption (#49): the merged queue may start with more holders than its new maxStreams.
+	// Report that transient over-capacity rather than exceed the limit silently (#82).
+	for (const queue of rebuilt.values()) if (queue.holders.length > queue.maxStreams) logOverCapacity(queue);
 	scheduler.queues.clear();
 	for (const [key, queue] of rebuilt) scheduler.queues.set(key, queue);
 	const decisions = [];
