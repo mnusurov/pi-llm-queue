@@ -182,7 +182,14 @@ const connById = new Map();
 // Emit the decisions the Scheduler returned, in order: each maps to a log line and, for a grant, a
 // `granted` reply. The reply echoes the key the client asked with (the `requestedKey` echo is
 // adapter-side; the Scheduler only knows the resolved group key).
+//
+// Two passes, on purpose. A handover is two decisions — the grant and the switch it causes — and
+// the reply belongs to both. One pass would put the `granted` reply out before the `switch` line
+// is written, and the peer process can wake up on another core and read the file in between: the
+// reader would see a grant with no switch. Logging the whole batch first keeps the promise the
+// log sink makes — every event a reply caused is on disk before that reply goes out (#47).
 function emit(decisions) {
+	const replies = [];
 	for (const d of decisions) {
 		switch (d.type) {
 			case "grant": {
@@ -190,7 +197,7 @@ function emit(decisions) {
 				const conn = connById.get(d.connId);
 				// Echo the key the request asked with (the per-request `requestedKey` the Scheduler
 				// carries on the decision), falling back to the resolved queue key for a direct grant.
-				if (conn) send(conn, { op: "granted", queueKey: d.requestedKey ?? d.queueKey, sessionKey: d.sessionKey });
+				replies.push([conn, { op: "granted", queueKey: d.requestedKey ?? d.queueKey, sessionKey: d.sessionKey }]);
 				break;
 			}
 			case "switch":
@@ -206,6 +213,9 @@ function emit(decisions) {
 				logEvent("evict", d.queueKey, d.sessionKey, d.tier, d.reason);
 				break;
 		}
+	}
+	for (const [conn, msg] of replies) {
+		if (conn) send(conn, msg);
 	}
 }
 
