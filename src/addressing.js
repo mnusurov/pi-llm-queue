@@ -56,9 +56,10 @@ function groupKeyFor(queues, providers, model) {
  * @param {string} key
  * @returns {Record<string, any> | undefined}
  */
-function entryOwning(queues, providers, key) {
-	if (queues[key]) return queues[key];
-	return Object.entries(queues).find(([name]) => !name.includes("://") && providers[name]?.baseUrl === key)?.[1];
+function owningEntry(queues, providers, key) {
+	const all = queues ?? {};
+	if (all[key]) return all[key];
+	return Object.entries(all).find(([name]) => !name.includes("://") && providers[name]?.baseUrl === key)?.[1];
 }
 
 /**
@@ -71,7 +72,7 @@ function entryOwning(queues, providers, key) {
  */
 export function addressModel(model, queues, providers) {
 	const queueKey = groupKeyFor(queues, providers, model);
-	return { queueKey, entry: entryOwning(queues, providers, queueKey) };
+	return { queueKey, entry: owningEntry(queues, providers, queueKey) };
 }
 
 /**
@@ -85,7 +86,7 @@ export function addressModel(model, queues, providers) {
  */
 export function addressEndpoint(baseUrl, queues, providers) {
 	const queueKey = groupKeyFor(queues, providers, { baseUrl });
-	return { queueKey, entry: entryOwning(queues, providers, queueKey) };
+	return { queueKey, entry: owningEntry(queues, providers, queueKey) };
 }
 
 /**

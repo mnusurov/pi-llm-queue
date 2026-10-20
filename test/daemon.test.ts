@@ -271,6 +271,28 @@ describe("queue policy resolution", () => {
 		c.close();
 		d.stop();
 	});
+
+	// The daemon's own catalog report (#77): the extension spawns it detached so stderr is discarded,
+	// and the message matters when the daemon is run by hand. A present catalog with nothing to
+	// resolve names the reason; a valid empty catalog is not called unreadable.
+	it("names the reason a provider catalog yields no providers", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-catalog-"));
+		const configPath = join(dir, "config.json");
+		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
+		const run = async (contents: string) => {
+			const modelsJsonPath = join(dir, `models-${contents.length}.json`);
+			writeFileSync(modelsJsonPath, contents);
+			const proc = spawn(process.execPath, [DAEMON, "--socket", join(dir, `s-${contents.length}.sock`), "--config", configPath, "--models-json", modelsJsonPath], { stdio: ["ignore", "ignore", "pipe"] });
+			let stderr = "";
+			proc.stderr.on("data", (chunk) => (stderr += chunk));
+			await sleep(300);
+			proc.kill();
+			return stderr;
+		};
+
+		assert.match(await run('{ "providers": '), /models\.json: .* — provider-name queue keys resolve to nothing/, "a half-written catalog names its parse error");
+		assert.match(await run('{"providers":{}}'), /models\.json: no providers — provider-name/, "an empty catalog is reported as empty, not unreadable");
+	});
 });
 
 describe("per-endpoint queues, groups and hot-reload", () => {
@@ -321,7 +343,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 		d.stop();
 	});
 
-	it("resolves a raw endpoint key through the same group rule the extension uses", async () => {
+	it("addresses a raw endpoint key through the same group rule the extension uses", async () => {
 		// One endpoint, two providers, one group per provider: the daemon's endpoint-level rule and
 		// the extension's provider-level rule are one implementation (src/addressing.js addressEndpoint).
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { g1: { match: ["strata"], maxStreams: 1 }, g2: { match: ["llama"], maxStreams: 1 } } }, modelsJson);

@@ -7,7 +7,7 @@
 // queue addressing through addressing.js, and emitting the decisions the Scheduler returns. All
 // scheduling decisions live in src/scheduler.js.
 import { createConnection, createServer } from "node:net";
-import { appendFileSync, existsSync, unlinkSync, watch } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
 import { loadValidConfig, DEFAULTS } from "./config.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
@@ -35,14 +35,21 @@ for (const e of loaded.errors) console.error(`pi-llm-queue daemon: config: ${e}`
 let config = loaded.config;
 let defaults = config.defaults ?? {};
 // models.json is optional for pi: a missing catalog is an empty one, never a startup crash (the
-// extension spawns the daemon detached, so a crash would be silent). A present-but-unreadable
-// catalog is reported: provider-name queue keys and group members would silently resolve to nothing.
+// extension spawns the daemon detached, so a crash would be silent). A present catalog that yields
+// no providers is reported: provider-name queue keys and group members would silently resolve to
+// nothing. `readProviders` swallows the read failure (its contract), so the reason is read back here.
 let modelsJson = {};
 if (modelsJsonPath && existsSync(modelsJsonPath)) {
 	modelsJson = readProviders(modelsJsonPath);
-	// An empty catalog off a present file is the unreadable case: a valid `{}` models.json behaves
-	// the same way (no provider names to resolve), so one report covers both.
-	if (!Object.keys(modelsJson).length) console.error("pi-llm-queue daemon: models.json unreadable: provider-name queue keys resolve to nothing");
+	if (!Object.keys(modelsJson).length) {
+		let reason = "no providers";
+		try {
+			JSON.parse(readFileSync(modelsJsonPath, "utf8"));
+		} catch (error) {
+			reason = error.message;
+		}
+		console.error(`pi-llm-queue daemon: models.json: ${reason} — provider-name queue keys resolve to nothing`);
+	}
 }
 
 function send(conn, msg) {

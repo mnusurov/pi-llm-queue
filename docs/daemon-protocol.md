@@ -124,7 +124,7 @@ provider-name key to that provider's `baseUrl` by reading `models.json` (passed 
 key wins when both name the same endpoint. The extension wraps
 every provider named by a key plus every provider serving an endpoint named by a key, and
 queues its requests under the model's baseUrl — or under its group's name, when a group names it.
-The group/entry resolution rule is one implementation (`addressModel`, `addressEndpoint` in
+The group/entry addressing rule is one implementation (`addressModel`, `addressEndpoint` in
 `src/addressing.js`, ADR 0005) shared by the extension and the daemon.
 
 Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAfterSlots`,
