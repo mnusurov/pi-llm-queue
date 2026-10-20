@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { LeaseClient, ensureDaemon } from "../src/lease-client.ts";
 import { heartbeatMs } from "../src/config.js";
-import { DAEMON, QUEUE_KEY, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
+import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
@@ -242,7 +242,9 @@ describe("lease client", () => {
 
 		const seen: any[] = [];
 		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent", undefined, undefined, (info) => seen.push(info));
-		await sleep(1500);
+		// The first status poll fires at 300 ms (lease-client.ts): poll for the report, bound = the
+		// 1500 ms the fixed sleep spent. The 2 s poll cadence stays proven by the absence window below.
+		await pollUntil(() => seen.length > 0, 1500, "a waiting acquire reports its queue position");
 		assert.ok(seen.length, "a waiting acquire reports its queue position");
 		assert.equal(seen[0].position, 1);
 		assert.deepEqual(seen[0].holders, ["A"], "the report names the session holding the slot");

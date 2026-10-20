@@ -9,7 +9,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { QUEUE_KEY, closeAllClients, connectClient, sleep, stopAllDaemons } from "./harness.ts";
+import { QUEUE_KEY, closeAllClients, connectClient, pollUntil, sleep, stopAllDaemons } from "./harness.ts";
 import { LeaseClient } from "../src/lease-client.ts";
 
 const STUB_API = "stub-idle-api";
@@ -18,12 +18,16 @@ const QUEUE2 = "http://model2.test/v1";
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-idle-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-// idleYieldMs 1500 + sweep 200 ms: a beat gap shows up in ~1.5-2.5 s. leaseTtlMs 3000 puts the
-// client beat period at 1000 ms, so a run beats 1-2× per idle window. daemonIdleExitMs 1e9: this
-// suite reuses one daemon across tests, and each test's session_shutdown now says bye (#63) —
-// with the production default 0 the last bye would kill the fixture between tests and the
-// autostarted replacement would lose the queue state the next test asserts on.
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 3000, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 } } }));
+// idleYieldMs 1500 + sweep 200 ms: a beat gap shows up in ~1.5-2.5 s. leaseTtlMs 2000 puts the
+// client beat period at heartbeatMs(2000) = 666 ms, so a run beats 2-3× per idle window, and the
+// beat-timer test's windows are multiples of that period. The TTL floor here is the idle window,
+// not config.js's 1000 ms: the TTL must stay ABOVE idleYieldMs 1500, or the sweep evicts the
+// silent Holder before idle-yield fires and the blocking-tool test proves a TTL evict instead of
+// ADR 0003. daemonIdleExitMs 1e9: this suite reuses one daemon across tests, and each test's
+// session_shutdown now says bye (#63) — with the production default 0 the last bye would kill the
+// fixture between tests and the autostarted replacement would lose the queue state the next test
+// asserts on.
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, idleYieldMs: 1500, leaseTtlMs: 2000, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 } } }));
 writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] }, stub2: { baseUrl: QUEUE2, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
@@ -174,7 +178,9 @@ registerApiProvider(
 
 		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // queues behind the run on queue 1
 		const eA2 = firstEvent(a.registered["stub2"].streamSimple(model2, {} as any, { sessionId: "MQ-A" } as any)); // queues behind RAW on queue 2
-		await sleep(300);
+		// The run's queue-2 request must sit in the queue before RAW releases: poll for it, bound =
+		// the 300 ms the fixed sleep spent, so the release below can never overtake the enqueue.
+		await pollUntil(async () => (await queueStatus(QUEUE2)).waiting.some((w: any) => w.sessionKey === "MQ-A"), 300, "the run's queue-2 request queued behind RAW");
 		raw.send({ op: "release", queueKey: QUEUE2, sessionKey: "RAW-Q2" }); // the run's queue-2 request lands
 		assert.equal(await race(eA2, 3000), "done", "the queue-2 request streams and releases its own lease");
 		raw.close();
@@ -206,13 +212,17 @@ registerApiProvider(
 			extension(a as any);
 			const ctx = start(a, "TMR");
 			await a.handlers["agent_start"][0]({}, ctx); // grant → beat starts
-			await sleep(2500); // ≥ 2 beats at the 1000 ms beat period
+			// Poll to 2 beats (period = heartbeatMs(leaseTtlMs 2000) = 666 ms), bound = the 2500 ms the
+			// fixed sleep spent; the assertion below is the one that sleep preceded.
+			await pollUntil(() => beats.filter((s) => s === "TMR").length >= 2, 2500, "the live run beats twice");
 			assert.ok(beats.filter((s) => s === "TMR").length >= 2, "the live run beats");
 			beats.length = 0;
 			await a.handlers["agent_settled"][0]({}, ctx); // grace 3000 ms → release
-			await sleep(3600); // grace expired: the release stopped the beat
+			// Poll for the release itself: the Slot goes free at GRACE_MS, a production constant, so the
+			// wait is a presence condition the daemon can be asked about. Bound = the 3600 ms the sleep spent.
+			await pollUntil(async () => (await queueStatus()).holders.length === 0, 3600, "the grace release freed the Slot");
 			beats.length = 0;
-			await sleep(2500); // 2× the beat period of quiet
+			await sleep(1400); // 2× the 666 ms beat period at leaseTtlMs 2000, of quiet: the absence window
 			assert.equal(beats.filter((s) => s === "TMR").length, 0, "no beat after the grace release: no timer leak");
 			a.handlers["session_shutdown"][0]({}, ctx);
 		} finally {

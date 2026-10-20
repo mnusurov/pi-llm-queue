@@ -7,7 +7,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { QUEUE_KEY, closeAllClients, connectClient, sleep, stopAllDaemons } from "./harness.ts";
+import { QUEUE_KEY, closeAllClients, connectClient, pollUntil, sleep, stopAllDaemons } from "./harness.ts";
 
 const STUB_API = "stub-queue-api";
 
@@ -211,7 +211,9 @@ describe("provider wrapper (queuedStream)", () => {
 		await a.handlers["agent_start"][0]({}, ctxA); // A holds the slot for its run
 
 		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any)); // B queues for itself
-		await sleep(1500);
+		// The client's first status report fires at 300 ms (lease-client.ts): poll for the indicator,
+		// bound = the 1500 ms the fixed sleep spent. The assertions below are the ones that sleep preceded.
+		await pollUntil(() => status.some(([, t]) => t), 1500, "the indicator appears while the session waits");
 		const shown = status.filter(([, t]) => t).pop()?.[1] ?? "";
 		assert.ok(shown, "the indicator appears while the session waits");
 		assert.match(shown, /#1/, "the indicator reports the queue position");
@@ -481,7 +483,9 @@ describe("config hot-reload (provider set)", () => {
 		assert.ok(a.registered["stub"], "wrapped before the edit");
 
 		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { enabled: false }, "free-api": { enabled: false } } }));
-		await sleep(600); // reload debounce
+		// The config watcher debounces 250 ms (extension.ts watchConfig): poll for the unregistration,
+		// bound = the 600 ms the fixed sleep spent.
+		await pollUntil(() => a.registered["stub"] === undefined, 600, "a disabled provider is unregistered");
 		assert.equal(a.registered["stub"], undefined, "a disabled provider is unregistered: passthrough, no pi restart");
 	});
 });
