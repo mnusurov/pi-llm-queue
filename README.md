@@ -154,16 +154,11 @@ was granted with until it releases the Slot.
   daemon while implementing so sessions share the endpoint instead of thrashing it. Tests and
   typecheck (`make test`) need no GPU.
 
-## Design decisions (from grilling session)
+## Design decisions
 
-- Client-side architecture, starter config and config file: [ADR 0001](docs/adr/0001-auto-starter-config.md).
-- No preemption on a live holder: [ADR 0002](docs/adr/0002-no-preemption.md).
-- Idle yield and the run-scoped keyed beat: [ADR 0003](docs/adr/0003-idle-yield.md).
-- Scheduler decides, socket adapter emits: [ADR 0004](docs/adr/0004-scheduler-decides-socket-adapter-emits.md).
-- One module owns queue addressing: [ADR 0005](docs/adr/0005-one-module-owns-queue-addressing.md).
-- The pi seam is tested through a harness, not a factory: [ADR 0006](docs/adr/0006-pi-seam-tested-through-a-harness.md).
-- One client-side module owns the Run lifecycle: [ADR 0007](docs/adr/0007-run-lifecycle-module.md).
-- Domain vocabulary: [GLOSSARY.md](GLOSSARY.md).
+Structural and behavioural choices are recorded as ADRs; the index in
+[docs/adr/README.md](docs/adr/README.md) says which one to read. Domain vocabulary:
+[GLOSSARY.md](GLOSSARY.md).
 
 ## Subagent launches (batch pattern)
 

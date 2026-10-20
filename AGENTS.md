@@ -33,7 +33,7 @@ Canonical five-role defaults. See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-Single-context: `GLOSSARY.md` + `docs/adr/` at root. See `docs/agents/domain.md`.
+Single-context: `GLOSSARY.md` + `docs/adr/` at root (index: `docs/adr/README.md`). See `docs/agents/domain.md`.
 
 ### LLM queue
 
