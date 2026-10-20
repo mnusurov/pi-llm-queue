@@ -183,6 +183,11 @@ _Avoid_: endpoint, target
 Named config members that all address one queue, so several providers share one slot set.
 _Avoid_: alias set, bundle
 
+**Policy**:
+The resolved admission rules of a Queue: slots, TTL, Aging, ordering, and idle-yield. A field's
+fallback is part of the Policy, not a separate concept.
+_Avoid_: config, settings, tuning
+
 **Starter config**:
 The config a fresh install auto-generates from the user's own model catalog, queueing only
 self-hosted endpoints, with a `defaults` block carrying only the Parent queue-wait cap. On a later
