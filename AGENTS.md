@@ -13,7 +13,7 @@ Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge
 
 ## Coding standards
 
-Rules for new code — JS/TS split, test seams, design, comments, errors, and docs: `CODING_STANDARDS.md`.
+Rules for all code — JS/TS split, test seams, design, comments, errors, and docs: `CODING_STANDARDS.md`.
 
 ## Agent skills
 

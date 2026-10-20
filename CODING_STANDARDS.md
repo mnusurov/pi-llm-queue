@@ -1,6 +1,6 @@
 # Coding standards
 
-Rules for new code. Structural decisions live in `docs/adr/`; when this file and an ADR
+Rules for all code in this repository. Structural decisions live in `docs/adr/`; when this file and an ADR
 disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
 
 ## Language and imports
