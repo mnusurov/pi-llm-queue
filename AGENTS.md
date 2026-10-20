@@ -18,8 +18,9 @@ Rules for all code — JS/TS split, test seams, design, comments, errors, and do
 
 ## Checks
 
-`npm run check` (typecheck + the public-export contract check) and `npm test` (the suite) both run
-in CI on node 22 and 24: `.github/workflows/ci.yml`. Both must be green before a commit.
+`npm run check` (typecheck + the public-export contract check + the doc check) and `npm test` (the
+suite) both run in CI on node 22 and 24: `.github/workflows/ci.yml`. Both must be green before a
+commit.
 
 ## Agent skills
 

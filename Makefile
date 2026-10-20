@@ -3,9 +3,10 @@
 typecheck:
 	npx tsc --noEmit
 
-# The guardrail: typecheck plus the public-export contract check.
+# The guardrail: typecheck, the public-export contract check, the doc check.
 check: typecheck
 	node scripts/check-jsdoc.mjs
+	node scripts/check-docs.mjs
 
 test: check
 	node --test test/*.test.ts
