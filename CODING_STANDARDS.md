@@ -39,8 +39,17 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
 - Scrutinize optional parameters: every optional field is a branch. Add one only when absence has
   meaning; centralize defaults in `src/config.js`.
 - A daemon flag and its config field change together.
-- Public exports get a JSDoc comment: purpose, contract, and any non-obvious failure mode.
-- Comments explain why, not what.
+
+## Comments
+
+- A comment earns its place only when the why is not obvious from the code: the constraint that
+  forced this shape, the alternative that failed, or what a later change would break. That is the
+  context an agent in a new session needs so it does not guess and "fix" deliberate behavior.
+- Write code so the what is visible; reserve comments for the why. A comment that narrates the
+  next line rots as soon as the code moves, and a stale comment is worse than none.
+- Update or delete a comment in the same change that invalidates it.
+- Public exports get JSDoc for the contract callers need — purpose, inputs, and failure modes — not
+  a play-by-play of the implementation.
 
 ## Errors and protocol
 
