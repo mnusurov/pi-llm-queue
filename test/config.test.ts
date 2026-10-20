@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { SCHEMA_VERSION, loadValidConfig, validateConfig } from "../src/config.js";
+import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, loadValidConfig, validateConfig } from "../src/config.js";
 
 describe("config schema validation", () => {
 	it("accepts a full valid config", () => {
@@ -145,6 +145,18 @@ describe("config schema validation", () => {
 			"defaults.match is only valid in a queue entry (the whole config is rejected and defaults are used)",
 			"defaults.enabled is only valid in a queue entry (the whole config is rejected and defaults are used)",
 		]);
+	});
+});
+
+// #77: the defaults table and the heartbeat derivation are exports, so the daemon, the extension
+// and the test harnesses stop re-typing them.
+describe("policy defaults table", () => {
+	it("derives the client heartbeat as a third of the lease TTL with a 250 ms floor", () => {
+		assert.equal(heartbeatMs(DEFAULTS.leaseTtlMs), 10000);
+		// At the leaseTtlMs floor (1000 ms) a 1 s beat would equal the TTL, so a sweep landing between
+		// two beats would evict a healthy holder; the floor keeps the period under it.
+		assert.equal(heartbeatMs(1000), 333);
+		assert.equal(heartbeatMs(750), 250);
 	});
 });
 

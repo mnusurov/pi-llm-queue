@@ -1,70 +1,9 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { resolveQueueKey, resolveQueueProviders, resolveRole, isLocalEndpoint, buildStarterConfig } from "../src/extension.ts";
+import { resolveRole, isLocalEndpoint, buildStarterConfig } from "../src/extension.ts";
 
-describe("provider resolution", () => {
-	const providers = {
-		strata: { baseUrl: "http://gpu.test/v1", api: "openai-completions" },
-		zen: { baseUrl: "http://zen.test/v1", api: "openai-completions" },
-	};
-
-	it("wraps a provider named by a queue key and one serving a queued endpoint", () => {
-		const queues = { "http://gpu.test/v1": { maxStreams: 1 }, zen: { maxStreams: 3 } };
-		assert.deepEqual(resolveQueueProviders(queues, providers).sort(), ["strata", "zen"]);
-	});
-
-	it("ignores queue keys naming no provider", () => {
-		assert.deepEqual(resolveQueueProviders({ "http://nowhere.test/v1": {} }, providers), []);
-	});
-
-	it("skips a queue key whose entry is disabled", () => {
-		const queues = { "http://gpu.test/v1": { maxStreams: 1 }, zen: { maxStreams: 3, enabled: false } };
-		assert.deepEqual(resolveQueueProviders(queues, providers), ["strata"]);
-	});
-
-	it("wraps every provider named by a group's match list", () => {
-		const queues = { gpu: { match: ["http://gpu.test/v1", "zen"], maxStreams: 1 } };
-		assert.deepEqual(resolveQueueProviders(queues, providers).sort(), ["strata", "zen"]);
-	});
-
-	it("skips a disabled group", () => {
-		const queues = { gpu: { match: ["strata", "zen"], enabled: false }, "http://gpu.test/v1": { maxStreams: 1 } };
-		assert.deepEqual(resolveQueueProviders(queues, providers), ["strata"]);
-	});
-});
-
-describe("queue key resolution", () => {
-	const strata = { provider: "strata", baseUrl: "http://gpu.test/v1" };
-	const llama = { provider: "llama", baseUrl: "http://gpu.test/v1" };
-	const zen = { provider: "zen", baseUrl: "http://zen.test/v1" };
-
-	it("keys a model by its endpoint when no group names it", () => {
-		assert.equal(resolveQueueKey({ "http://gpu.test/v1": { maxStreams: 1 } }, strata), "http://gpu.test/v1");
-	});
-
-	it("splits one endpoint per provider with groups", () => {
-		const queues = { serial: { match: ["strata"] }, parallel: { match: ["llama"], maxStreams: 4 } };
-		assert.equal(resolveQueueKey(queues, strata), "serial");
-		assert.equal(resolveQueueKey(queues, llama), "parallel", "two providers on one server get two slot sets");
-	});
-
-	it("merges every endpoint a group names into the group queue", () => {
-		const queues = { gpu: { match: ["http://gpu.test/v1", "zen"] } };
-		assert.equal(resolveQueueKey(queues, strata), "gpu");
-		assert.equal(resolveQueueKey(queues, zen), "gpu");
-	});
-
-	it("leaves a disabled group's members on their endpoint", () => {
-		assert.equal(resolveQueueKey({ gpu: { match: ["strata"], enabled: false } }, strata), "http://gpu.test/v1");
-	});
-
-	it("keys a model by a group naming a provider that serves its endpoint", () => {
-		// The daemon's endpoint-level rule, now shared: a group naming strata owns every provider
-		// on strata's endpoint, so an extension session and a raw client land in one slot set.
-		const providers = { strata: { baseUrl: "http://gpu.test/v1" }, extra: { baseUrl: "http://gpu.test/v1" } };
-		assert.equal(resolveQueueKey({ g1: { match: ["strata"] } }, { provider: "extra", baseUrl: "http://gpu.test/v1" }, providers), "g1");
-	});
-});
+// The group rule, the entry-ownership rule and the provider mapping are tested at their own seam
+// in test/addressing.test.ts (#77, ADR 0005).
 
 describe("self-hosted endpoint detection", () => {
 	it("detects loopback", () => {

@@ -323,7 +323,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 
 	it("resolves a raw endpoint key through the same group rule the extension uses", async () => {
 		// One endpoint, two providers, one group per provider: the daemon's endpoint-level rule and
-		// the extension's provider-level rule are one implementation (src/config.js groupKeyFor).
+		// the extension's provider-level rule are one implementation (src/addressing.js addressEndpoint).
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { g1: { match: ["strata"], maxStreams: 1 }, g2: { match: ["llama"], maxStreams: 1 } } }, modelsJson);
 		const a = await connectClient(d.socketPath);
 
@@ -697,6 +697,7 @@ describe("config schema validation at the daemon seam", () => {
 		mkdirSync(srcDir, { recursive: true });
 		copyFileSync(DAEMON, join(srcDir, "daemon.js"));
 		copyFileSync(decodeURIComponent(new URL("../src/config.js", import.meta.url).pathname), join(srcDir, "config.js"));
+		copyFileSync(decodeURIComponent(new URL("../src/addressing.js", import.meta.url).pathname), join(srcDir, "addressing.js"));
 		copyFileSync(decodeURIComponent(new URL("../src/scheduler.js", import.meta.url).pathname), join(srcDir, "scheduler.js"));
 		const configPath = join(dir, "config.json");
 		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));

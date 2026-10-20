@@ -137,6 +137,12 @@ _Avoid_: interactive session, main session
 A subagent session; queues with an unbounded queue wait so it never streams unqueued.
 _Avoid_: sub-agent, worker
 
+**Addressing**:
+The rule deciding which Queue a request addresses. Direct (model → Queue key) and reverse (Queue
+key → providers to wrap) are directions of one concept, owned by one module (ADR 0005). A Queue key
+is its result, not the rule.
+_Avoid_: routing, resolution, keying
+
 **Queue key**:
 The config name addressing a queue — an endpoint URL, a provider name, or a group's member keys.
 _Avoid_: endpoint, target

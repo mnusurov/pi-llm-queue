@@ -7,6 +7,7 @@
 // Policy is passed in as plain resolved values (the production adapter's job through config.js, the
 // driver's job here): the constructor takes a Policy object or a per-queueKey resolver function.
 import { Scheduler } from "../src/scheduler.js";
+import { DEFAULTS as POLICY_DEFAULTS } from "../src/config.js";
 
 export const QUEUE_KEY = "http://model.test/v1";
 export const QUEUE_KEY2 = "http://model.test/v2";
@@ -33,15 +34,16 @@ export interface Decision {
 	reason?: string;
 }
 
-// The daemon's resolved defaults (src/daemon.js resolvePolicy fallbacks), so a driver with no
-// policy overrides behaves like a daemon serving defaults.
+// The daemon's resolved defaults, read from the config.js table (#77) so the constants live in one
+// place; `leaseTtlMs` is the config field name, `ttlMs` the Scheduler's resolved one. A driver with
+// no policy overrides behaves like a daemon serving defaults.
 const DEFAULTS: Required<Policy> = {
-	maxStreams: 1,
-	ttlMs: 30000,
-	agingAfterSlots: 3,
-	agingAfterMs: 60000,
-	policy: "priority-aging",
-	idleYieldMs: 30000,
+	maxStreams: POLICY_DEFAULTS.maxStreams,
+	ttlMs: POLICY_DEFAULTS.leaseTtlMs,
+	agingAfterSlots: POLICY_DEFAULTS.agingAfterSlots,
+	agingAfterMs: POLICY_DEFAULTS.agingAfterMs,
+	policy: POLICY_DEFAULTS.policy,
+	idleYieldMs: POLICY_DEFAULTS.idleYieldMs,
 };
 
 export class SchedulerHarness {

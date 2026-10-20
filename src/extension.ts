@@ -13,7 +13,8 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role, type AcquireReason, type StatusSession } from "./lease-client.ts";
-import { loadValidConfig, readJson, groupKeyFor, queueEntryFor, SCHEMA_VERSION } from "./config.js";
+import { loadValidConfig, DEFAULTS, heartbeatMs, SCHEMA_VERSION } from "./config.js";
+import { addressModel, keyAddressesEndpoint, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -84,22 +85,6 @@ export function buildStarterConfig(providers: Record<string, any>, isNativeOwned
 	return { schemaVersion: SCHEMA_VERSION, defaults: { queueTimeoutMs: STARTER_QUEUE_TIMEOUT_MS }, queues };
 }
 
-/** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
-function matchingProviders(key: string, providers: Record<string, any>): string[] {
-	if (providers[key]) return [key];
-	return Object.keys(providers).filter((name) => providers[name]?.baseUrl === key);
-}
-
-/** A queue entry's members: its own key plus its `match` list — the names that address this queue. */
-function membersOf(key: string, entry?: QueueEntry): string[] {
-	return [key, ...(entry?.match ?? [])];
-}
-
-/** True when a queue key addresses this endpoint: it names the endpoint, a provider serving it, or a provider name on it. */
-function keyAddressesEndpoint(key: string, providers: Record<string, any>, baseUrl: string): boolean {
-	return matchingProviders(key, providers).some((name) => providers[name]?.baseUrl === baseUrl);
-}
-
 /**
  * Queue keys a Starter config would add to an existing file: self-hosted endpoints served by a
  * non-native provider that no existing entry addresses. Add-only — a key that is already present,
@@ -126,37 +111,6 @@ function reconcileStarterKeys(
 }
 
 /**
- * Queue key for a model: the group whose `match` names its provider or endpoint (so one
- * endpoint can be split per provider, and several endpoints merged), else its baseUrl.
- * The daemon resolves the same rule through the shared `groupKeyFor`.
- */
-export function resolveQueueKey(
-	queues: Record<string, QueueEntry>,
-	model: { provider: string; baseUrl: string },
-	providers: Record<string, any> = {},
-): string {
-	return groupKeyFor(queues, providers, model);
-}
-
-/**
- * Providers to wrap: queue keys naming a provider directly, and queue keys naming an
- * endpoint that a provider serves (providers on one endpoint share one queue). A group's
- * `match` list contributes its providers the same way. Keys whose entry is `enabled: false`
- * are skipped.
- */
-export function resolveQueueProviders(
-	queues: Record<string, QueueEntry>,
-	providers: Record<string, any>,
-): string[] {
-	const names = new Set<string>();
-	for (const [key, entry] of Object.entries(queues)) {
-		if (entry?.enabled === false) continue;
-		for (const member of membersOf(key, entry)) for (const provider of matchingProviders(member, providers)) names.add(provider);
-	}
-	return [...names];
-}
-
-/**
  * Role from the neutral env contract, read as plain strings (zero imports, so the queue
  * works with or without pi-subagents): explicit PI_QUEUE_ROLE wins, then a pi-subagents
  * child hint, then default parent.
@@ -169,23 +123,22 @@ export function resolveRole(env: Record<string, string | undefined>): Role {
 }
 
 export default function (pi: ExtensionAPI) {
-	const modelsJson = readJson(MODELS_JSON_PATH).providers ?? {};
+	const modelsJson = readProviders(MODELS_JSON_PATH);
 	// Startup config load: any failure falls back to defaults and surfaces through ui.notify at
 	// session_start (ui does not exist at module load).
 	const loaded = loadValidConfig(CONFIG_PATH);
 	let config = loaded.config;
 	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
-	// Heartbeat at a third of the lease TTL: a live session never loses its slot. The floor must stay
-	// under the leaseTtlMs floor (1000 ms), or a sweep landing between two beats evicts a healthy holder.
-	const heartbeatMs = Math.max(250, Math.floor((config.defaults?.leaseTtlMs ?? 30000) / 3));
+	// Heartbeat at a third of the lease TTL: a live session never loses its slot (config.js heartbeatMs).
+	const beatMs = heartbeatMs(config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs);
 
 	const lease = new LeaseClient({
 		socketPath: SOCKET_PATH,
 		daemonPath: DAEMON_PATH,
 		configPath: CONFIG_PATH,
 		modelsJsonPath: MODELS_JSON_PATH,
-		heartbeatMs,
+		heartbeatMs: beatMs,
 		failOpen: config.defaults?.failOpen,
 		queueTimeoutMs: config.defaults?.queueTimeoutMs,
 	});
@@ -227,7 +180,7 @@ export default function (pi: ExtensionAPI) {
 				lease.beat(queueKey, this.sessionKey).then((granted) => {
 					if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
 				}, () => {});
-			}, heartbeatMs);
+			}, beatMs);
 			timer.unref();
 			this.beatTimers.set(queueKey, timer);
 		}
@@ -356,7 +309,7 @@ export default function (pi: ExtensionAPI) {
 		options?: SimpleStreamOptions,
 	): AssistantMessageEventStream => {
 		const out = createAssistantMessageEventStream();
-		const queueKey = resolveQueueKey(queues, model, modelsJson);
+		const queueKey = addressModel(model, queues, modelsJson).queueKey;
 		// The agent tags every request with its session id, so two sessions in one process keep
 		// separate leases; a request without one (direct call) resolves to the slot's holder.
 		const sessionKey = sessionKeyFor(queueKey, options);
@@ -469,7 +422,7 @@ export default function (pi: ExtensionAPI) {
 	// Registration is deferred to the first session so ctx gives us the model registry
 	// (native-provider detection) and ui.notify (unmatched keys, api mismatches).
 	const registerQueuedProviders = (ctx: ExtensionContext) => {
-		providers = resolveQueueProviders(queues, modelsJson);
+		providers = queuedProviders(queues, modelsJson);
 
 		// Queue keys naming no provider in models.json (directly, or through a group's match) (finding 7).
 		for (const [key, entry] of Object.entries(queues)) {
@@ -619,7 +572,7 @@ export default function (pi: ExtensionAPI) {
 		state.runActive = true; // a stream ending after this must not re-arm the grace; settle will
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
-		const queueKey = resolveQueueKey(queues, model, modelsJson);
+		const queueKey = addressModel(model, queues, modelsJson).queueKey;
 		const reason = await state.acquire(queueKey, ctx.signal);
 		state.clearQueued();
 		// Only a grant claims a lease: an abort/fail-open must not mark the slot held. A stream that
