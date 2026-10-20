@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, exited, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, exited, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -517,6 +517,62 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 
 		a.close();
 		b.close();
+		d.stop();
+	});
+
+	it("logs a group merge that leaves more live holders than the new maxStreams", async () => {
+		// Two endpoint queues, one live holder each, merge into a group with one slot. No-preemption
+		// means the daemon cannot end either holder's lease: it must report the transient
+		// over-capacity (2/1) and write a config event instead of exceeding the new limit silently.
+		const logFile = join(mkdtempSync(join(tmpdir(), "llm-queue-merge-")), "events.jsonl");
+		const d = startDaemon({ defaults: { maxStreams: 1, logFile }, queues: { [GPU]: { maxStreams: 1 }, [ZEN]: { maxStreams: 1 } } }, modelsJson);
+		const a = await connectClient(d.socketPath);
+		const b = await connectClient(d.socketPath);
+		const observer = await connectClient(d.socketPath);
+
+		acquire(a, GPU, "A");
+		assert.deepEqual(await a.next(3000), granted(GPU, "A"));
+		acquire(b, ZEN, "B");
+		assert.deepEqual(await b.next(3000), granted(ZEN, "B"));
+
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1, logFile }, queues: { gpu: { match: [GPU, ZEN], maxStreams: 1 } } }));
+		let status: any;
+		await pollUntil(
+			async () => {
+				observer.send({ op: "status" });
+				status = await observer.next(3000);
+				return status.queues.length === 1 && status.queues[0].queueKey === "gpu";
+			},
+			3000,
+			"the reload merges both endpoint queues into the group",
+		);
+
+		assert.equal(status.queues[0].maxStreams, 1);
+		assert.deepEqual(status.queues[0].holders.map((h: any) => h.sessionKey).sort(), ["A", "B"], "both holders stay: no-preemption cannot end a live lease");
+
+		const events = readFileSync(logFile, "utf8")
+			.split("\n")
+			.filter((line) => line.trim())
+			.map((line) => JSON.parse(line));
+		const configEvents = events.filter((line) => line.event === "config");
+		assert.equal(configEvents.length, 1, "the transient over-capacity is logged, not silent");
+		assert.deepEqual(
+			{ queueKey: configEvents[0].queueKey, reason: configEvents[0].reason, holders: configEvents[0].holders, maxStreams: configEvents[0].maxStreams },
+			{ queueKey: "gpu", reason: "over-capacity", holders: 2, maxStreams: 1 },
+		);
+
+		const c = await connectClient(d.socketPath);
+		acquire(c, GPU, "C");
+		await assert.rejects(c.next(300), /no message from daemon within/, "no new holder is admitted while the queue is over capacity");
+		release(a, GPU, "A");
+		await assert.rejects(c.next(300), /no message from daemon within/, "one release brings the queue to its limit: C still waits");
+		release(b, ZEN, "B");
+		assert.deepEqual(await c.next(3000), granted(GPU, "C"), "C is granted once the over-capacity drains below the limit");
+
+		a.close();
+		b.close();
+		c.close();
+		observer.close();
 		d.stop();
 	});
 });

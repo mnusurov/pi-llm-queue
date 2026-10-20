@@ -336,7 +336,9 @@ export class LeaseClient {
 		this.send({ op: "status" });
 		const msg = await this.read((m) => m.op === "status");
 		this.unrefSocket();
-		return msg;
+		// A close mid-request resolves every pending request with {op:"fail-open"}: never hand that
+		// sentinel to /queue, which expects a StatusReply and would throw on `.queues.map`.
+		return msg.op === "status" ? msg : null;
 	}
 
 	close(): void {
