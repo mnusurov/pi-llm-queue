@@ -90,7 +90,6 @@ describe("lease client", () => {
 		const holder = new LeaseClient({ socketPath: d.socketPath });
 		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the slot
 
-		// Two concurrent acquires from the same client, both queued behind H.
 		const first = c.acquire(QUEUE_KEY, "S1", "parent");
 		const second = c.acquire(QUEUE_KEY, "S2", "parent");
 		assert.equal(await raceWithSleep(first, 300), "pending");

@@ -119,10 +119,10 @@ function countClient(conn) {
 	}
 }
 
-// Queue keys are endpoint baseUrls. A provider-name key applies to that provider's baseUrl; a
-// baseUrl key wins when both name the same endpoint. The rule lives in src/addressing.js (ADR
-// 0005), in its endpoint form: a socket client names an endpoint and no provider, so the
-// provider-name branch is unreachable through it by construction.
+// A queue key is an endpoint URL, a provider name, or a group name. A provider-name key applies to
+// that provider's baseUrl; a baseUrl key wins when both name the same endpoint. The rule lives in
+// src/addressing.js (ADR 0005), in its endpoint form: a socket client names an endpoint and no
+// provider, so the provider-name branch is unreachable through it by construction.
 function policyFor(key) {
 	return addressEndpoint(key, config.queues ?? {}, modelsJson).entry ?? {};
 }
@@ -223,7 +223,6 @@ function handle(msg, conn) {
 			send(conn, { op: "ok" });
 			return;
 		case "cancel":
-			// Drop a queued request the client aborted; if it was already granted, release the slot.
 			emit(scheduler.cancel(conn.connId, msg.sessionKey, msg.queueKey, now));
 			return;
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
@@ -236,7 +235,6 @@ function handle(msg, conn) {
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
-			// Bare renew: heartbeat, keeps every lease of this connection alive; emits no decision.
 			emit(scheduler.heartbeat(conn.connId, now));
 			send(conn, { op: "ok" });
 			return;

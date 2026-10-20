@@ -366,9 +366,8 @@ export default function (pi: ExtensionAPI) {
 				// and release when done. A held request beats its lease: the run keeps the slot
 				// across tool executions. A beat answered ungranted means the daemon no longer grants
 				// the slot (a TTL lapse, a release, a disconnect) — the run re-queues before it streams again.
-				if (wasHeld && (await lease.beat(queueKey, sessionKey))) {
-					// slot retained for the run
-				} else {
+				const retained = wasHeld && (await lease.beat(queueKey, sessionKey));
+				if (!retained) {
 					// Join the run's in-flight acquire for this queue if there is one: pi does not await
 					// agent_start, so the first stream lands before the grant. Queuing again would
 					// enqueue the session twice and release after every stream (#55). If agent_start
@@ -453,17 +452,12 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	// Serialise subagent launches on single-slot queues: force async:false so the parent blocks
-	// and launches queue one-at-a-time (batch = one workflow call → one wake). No-op when the
-	// subagent tool is absent: tool_call never fires for a tool that isn't installed.
-	// REMOVED by #51: idle-yield replaces this. Serialisation of children is the queue's job.
-
 	// Registration is deferred to the first session so ctx gives us the model registry
 	// (native-provider detection) and ui.notify (unmatched keys, api mismatches).
 	const registerQueuedProviders = (ctx: ExtensionContext) => {
 		providers = queuedProviders(queues, modelsJson);
 
-		// Queue keys naming no provider in models.json (directly, or through a group's match) (finding 7).
+		// Queue keys naming no provider in models.json (directly, or through a group's match).
 		for (const [key, entry] of Object.entries(queues)) {
 			if (entry?.enabled === false) continue;
 			if (!membersOf(key, entry).some((k) => matchingProviders(k, modelsJson).length))
@@ -472,13 +466,13 @@ export default function (pi: ExtensionAPI) {
 
 		const wrapped = new Set<string>();
 		for (const provider of providers) {
-			// Provider ids owned by native extensions (e.g. built-in llama) must not be wrapped (finding 8).
+			// Provider ids owned by native extensions (e.g. built-in llama) must not be wrapped.
 			if (ctx.modelRegistry.getRegisteredNativeProvider?.(provider)) {
 				ctx.ui.notify(`pi-llm-queue: "${provider}" is owned by a native extension, left unqueued`, "info");
 				continue;
 			}
 			// Register with the api the wrapped models use; a model whose api differs streams
-			// unqueued (composer matches streamSimple on api equality) (finding 6).
+			// unqueued (composer matches streamSimple on api equality).
 			const models = modelsJson[provider]?.models ?? [];
 			const api = modelsJson[provider]?.api ?? models[0]?.api ?? "openai-completions";
 			const offApi = [...new Set<string>(models.map((m: any) => m.api).filter(Boolean))].filter((a) => a !== api);
@@ -603,8 +597,6 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// Turn-based affinity: acquire at run start, release after the run settles (grace),
-	// release at once on abort.
 	pi.on("agent_start", async (_event, ctx) => {
 		const sessionKey = ctx.sessionManager.getSessionId();
 		const state = ensureState(sessionKey);
@@ -617,7 +609,7 @@ export default function (pi: ExtensionAPI) {
 		if (state.heldQueueKey && state.heldQueueKey !== queueKey) state.release();
 		if (!queueKey) return;
 		state.runActive = true; // a stream ending after this must not re-arm the grace; settle will
-		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
+		// Attach the abort path before awaiting: Esc while queued must cancel.
 		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
 		const reason = await state.acquire(queueKey, ctx.signal);
 		state.clearQueued();

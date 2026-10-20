@@ -18,8 +18,9 @@ const QUEUE2 = "http://model2.test/v1";
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-idle-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
-// idleYieldMs 1000 + sweep 200 ms: a beat gap shows up in ~1.0-1.2 s. leaseTtlMs 2000 puts the
-// client beat period at heartbeatMs(2000) = 666 ms, so a run beats 1.5-2× per idle window. The TTL
+// idleYieldMs 1000 + sweep 200 ms: a beat gap shows up in ~1.0-1.2 s. leaseTtlMs 2000 and
+// idleYieldMs 1000 put the client beat period at keyedBeatMs(2000, 1000) = 500 ms (half the idle
+// window), so a run beats ~2× per idle window. The TTL
 // floor here is the idle window, not config.js's 1000 ms: the TTL must stay ABOVE idleYieldMs with
 // the sweep interval on top of it — at 2000 vs 1000 the idle-yield fires ~1.0-1.2 s into a silent
 // Holder and the sweep evicts at ~2.0-2.2 s, so the blocking-tool test proves ADR 0003 and not a
@@ -212,8 +213,8 @@ registerApiProvider(
 			extension(a as any);
 			const ctx = start(a, "TMR");
 			await a.handlers["agent_start"][0]({}, ctx); // grant → beat starts
-			// Poll to 2 beats: the period is heartbeatMs(leaseTtlMs 2000) = 666 ms, so the second lands
-			// ~1.33 s in. The bound is the 2500 ms the sleep spent; the assert below is the one it preceded.
+			// Poll to 2 beats: the period is keyedBeatMs(leaseTtlMs 2000, idleYieldMs 1000) = 500 ms, so
+			// the second lands ~1.0 s in. The bound is the 2500 ms the sleep spent; the assert below is the one it preceded.
 			await pollUntil(() => beats.filter((s) => s === "TMR").length >= 2, 2500, "waiting for two beats from the live run");
 			assert.ok(beats.filter((s) => s === "TMR").length >= 2, "the live run beats");
 			beats.length = 0;
@@ -222,7 +223,7 @@ registerApiProvider(
 			// GRACE_MS, a production constant. Poll it with the 3600 ms bound the sleep used.
 			await pollUntil(async () => (await queueStatus()).holders.length === 0, 3600, "waiting for the grace release to free the Slot");
 			beats.length = 0;
-			await sleep(2500); // absence window: 3.7 beat periods of quiet, the span this test always used
+			await sleep(2500); // absence window: 5 beat periods of quiet, the span this test always used
 			assert.equal(beats.filter((s) => s === "TMR").length, 0, "no beat after the grace release: no timer leak");
 			a.handlers["session_shutdown"][0]({}, ctx);
 		} finally {

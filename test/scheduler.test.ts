@@ -179,7 +179,6 @@ describe("idle yield (in memory)", () => {
 		h.sweepAt(); // A yields, B is granted
 		assert.deepEqual(h.grantedSessions(b), ["B"]);
 
-		// A re-acquires: B holds the slot, so A parks as a waiter (no grant).
 		const reacquire = h.acquire(a, "A", { role: "parent", activity: true });
 		assert.equal(reacquire.granted, false, "the yielded holder re-queues behind the new holder");
 

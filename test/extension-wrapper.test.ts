@@ -106,7 +106,6 @@ describe("provider wrapper (queuedStream)", () => {
 		const ctxA = start(a, "A");
 		start(b, "B");
 
-		// Session A holds the slot for its whole run.
 		await a.handlers["agent_start"][0]({}, ctxA);
 
 		const streamB = b.registered["stub"].streamSimple;

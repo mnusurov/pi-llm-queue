@@ -13,9 +13,9 @@ and per-endpoint queues.
 
 ## Install (fresh machine)
 
-Requires Node ≥ 22.19 (pi's own floor — the daemon runs TypeScript directly via Node's
-built-in type stripping) on macOS/Linux (unix socket). Zero runtime dependencies; pi supplies
-the `@earendil-works/*` peer packages.
+Requires Node ≥ 22.19 (pi's own floor — pi runs the TypeScript extension via Node's built-in
+type stripping; the daemon is plain JS) on macOS/Linux (unix socket). Zero runtime
+dependencies; pi supplies the `@earendil-works/*` peer packages.
 
 ```bash
 pi install npm:pi-llm-queue
@@ -118,36 +118,8 @@ to upgrade pi-llm-queue instead of failing silently.
 }
 ```
 
-| Field | Default | Meaning |
-| ----- | ------- | ------- |
-| `maxStreams` | `1` | Concurrent slots for the queue. `1` = strict serialisation. |
-| `policy` | `priority-aging` | `priority-aging` (parent > child with aging) or `fifo`. |
-| `agingAfterSlots` | `3` | Boost a waiting child after this many consecutive parent grants. |
-| `agingAfterMs` | `60000` | Boost a waiting child after this long waiting. |
-| `leaseTtlMs` | `30000` | A lease dies without heartbeats (crashed session reclaim — the crash grace). Minimum `1000`. The client beats for that queue at `leaseTtlMs / 3` (floor 250 ms), so a per-queue override is safe. |
-| `enabled` | `true` | `false` = passthrough: provider unwrapped, fully parallel. An endpoint (baseUrl) key wins over a provider-name key naming the same endpoint. |
-| `match` | — | Explicit resource group: baseUrls and/or provider names sharing one queue. |
-| `idleYieldMs` | `30000` | Idle-yield threshold: an activity-flagged holder with no keyed beat this long yields the slot when a waiter is queued. The pi client beats for the whole run except while parked in a blocking tool (ADR 0003), so this is a dead-client/stall guard and the Parent→Child handover latency — never a tool-pause handover. The pi client beats at most every `idleYieldMs / 2` for that queue. Non-beating clients (raw socket, e2e scripts) have no run-scoped beat: use `120000` there to protect long builds/e2e from mid-run yield. `0` disables. |
-| `failOpen` | `true` | Daemon unreachable → pass through. `false` → hard-error. `defaults` only. |
-| `queueTimeoutMs` | unlimited | Parent queue-wait warning threshold → visible warning, stays queued. Child is always unlimited. `defaults` only. The Starter config ships `120000`. |
-| `blockingTools` | `["subagent","subagent_wait","bg_wait","ask_user","contact_supervisor","intercom"]` | Tools that park the run on another agent or the user: the run-scoped keyed beat pauses while one is in flight, so a parked holder yields the slot to the agent it waits on (ADR 0003). Add a custom waiting tool here. `defaults` only. |
-| `daemonIdleExitMs` | `0` | Daemon self-exit after the last **counted** client disconnects: `0` exits at once, so daemon lifetime = the live pi processes' lifetimes and a daemon code change needs no manual kill (the next pi op autostarts a fresh daemon). A connection is counted from its first state-touching op (`acquire`/`renew`/`role`/`cancel`); a `status`-only connection (an Observer — a dashboard, a monitoring script) is invisible to it. `> 0` is an opt-in relaunch grace; set it high to keep the daemon resident (clamped to `setTimeout`'s 2^31-1 cap, ~24.8 days). `defaults` only. |
-| `logFile` | — (no file) | Daemon event log path: one JSON line per queue event — `grant`, `switch`, `queued`, `release` (`reason: "idle"` for an idle yield), `evict` (`reason: "ttl"` for a TTL reclaim) — each carrying `event`, `queueKey`, `sessionKey`, `role`, `ts` (+ `reason`). Best-effort: an unwritable path leaves the daemon serving. `defaults` only. |
-
-**`enabled: false` precedence.** A baseUrl (endpoint) key wins over a provider-name key naming the
-same endpoint, so the endpoint entry's `enabled` governs the whole endpoint: disabling the endpoint
-key disables every provider on it, and no provider-name key can silently re-enable it. The reverse
-does not hold — `enabled: false` on a provider-name key alone does not disable an endpoint that an
-enabled endpoint key names, because that key wraps every provider serving it. Write the disable on
-the key that owns the endpoint: the endpoint key, or the Group that names it.
-
-**Event log.** With `logFile` set, the daemon appends the queue's own events, so a finished run can
-be read back from one file (the extension spawns the daemon detached, so its stderr is gone). The
-`queueKey` on a line is the queue that owns the slot — a Group's name when the client addressed it
-by a member key — and the `role` is the tier off the Lease (or the Waiter, while it is still
-queued), the same field `status` reports. The path is read per event, so a hot-reload can turn the
-log on, off, or move it. Writes are swallowed on failure: observability never becomes an
-availability risk. Full semantics: [docs/daemon-protocol.md](docs/daemon-protocol.md).
+Field-by-field semantics, defaults, `enabled: false` precedence and the event log:
+[docs/daemon-protocol.md](docs/daemon-protocol.md#queues-and-config).
 
 ## Role contract (env vars)
 
@@ -168,15 +140,12 @@ was granted with until it releases the Slot.
 ## Dev notes
 
 - **Tests are stub-only.** `make test` (typecheck + `node --test`) drives the daemon socket seam
-  and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint. The
-  suites: `config.test.ts`, `daemon.test.ts`, `daemon-event-log.test.ts`, `lease-client.test.ts`,
-  `extension.test.ts`, `extension-wrapper.test.ts`, `extension-timeout.test.ts`,
-  `extension-config-watch.test.ts`, `extension-starter.test.ts`, `extension-starter-empty.test.ts`
-  (26 suites, the count `node --test` reports, plus one top-level test in
-  `extension-starter-empty.test.ts`); `test/harness.ts` is the daemon socket seam, not a suite. The
+  and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint.
+  41 suites, the count `node --test` reports, plus one top-level test in
+  `extension-starter-empty.test.ts`; `test/harness.ts` is the daemon socket seam, not a suite. The
   per-suite list is in [docs/daemon-protocol.md](docs/daemon-protocol.md#tests).
   `make e2e` is the human-run tracer bullet (two real pi sessions against a stub endpoint).
-  Real cache-warmth validation against llama.cpp is a separate human ticket (#10).
+  Real cache-warmth validation against llama.cpp is done (#10).
 - **Serial subagents.** This repo's own implementing sessions run on a local model: launch
   subagents sequentially and wait for each to hand back control — never fire parallel model
   requests. Serialisation of children is the queue's job (child tier, unbounded wait); batch a
@@ -188,27 +157,12 @@ was granted with until it releases the Slot.
 
 ## Design decisions (from grilling session)
 
-- Client-side: pi extension + shared local daemon (unix socket), fail-open.
-- Queue key = provider baseUrl; explicit resource groups (`queues.<name>.match`) override;
-  providers can be excluded (`enabled: false`); config hot-reload. An endpoint key wins over a
-  provider-name key naming the same endpoint, so a deliberate passthrough is not silently overridden.
-- Turn-based session affinity: slot held per session across a run
-  (`agent_start` → `agent_settled`), lease with TTL, released on settle.
-- Leases are per session, keyed by `options.sessionId` (#53): a process running a Parent and its
-  Children holds one Lease each, and those sessions queue against each other.
-- Tiers: parent (interactive) above child (subagent), with aging anti-starvation.
-- No preemption (ADR 0002): a live holder keeps the slot until it releases it, aborts,
-  disconnects, its TTL lapses, or it is idle-yielded under contention (ADR 0003); a switch
-  always re-prefills the KV cache.
-- Role detection: `PI_QUEUE_ROLE` contract, `PI_SUBAGENT_CHILD` /
-  `PI_SUBAGENT_PARENT_SESSION` as optional hints, `PI_QUEUE_GROUP` grouping label;
-  zero hard dependency on pi-subagents. `/queue promote|demote` overrides the tier.
-- Batched subagent launches (one workflow call → one parent wake) as the
-  documented pattern; `wakeBatching` is roadmap.
-- Observability: `/queue` command + live TUI indicator.
-- Daemon auto-starts from the extension, exits the moment the last counted client leaves
-  (`status` polls don't count, #60).
-- Config: `~/.pi/agent/llm-queue.json`, hot-reload.
+- Client-side architecture, starter config and config file: [ADR 0001](docs/adr/0001-auto-starter-config.md).
+- No preemption on a live holder: [ADR 0002](docs/adr/0002-no-preemption.md).
+- Idle yield and the run-scoped keyed beat: [ADR 0003](docs/adr/0003-idle-yield.md).
+- Scheduler decides, socket adapter emits: [ADR 0004](docs/adr/0004-scheduler-decides-socket-adapter-emits.md).
+- One module owns queue addressing: [ADR 0005](docs/adr/0005-one-module-owns-queue-addressing.md).
+- Domain vocabulary: [GLOSSARY.md](GLOSSARY.md).
 
 ## Subagent launches (batch pattern)
 
