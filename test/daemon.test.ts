@@ -1,3 +1,7 @@
+// The daemon at the socket seam: protocol framing, lease lifecycle and no preemption (ADR 0002),
+// tier ordering and aging, per-endpoint queues and groups, hot-reload, the status counters, the
+// idle-exit and the connection lifetime. Real daemon, real socket; the Scheduler's own decisions
+// are asserted in memory in test/scheduler.test.ts.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";

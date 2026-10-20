@@ -279,27 +279,8 @@ periods follow the edit and live beats restart under the new period. `failOpen` 
 ## Tests
 
 `make test` (`npx tsc --noEmit`, then the public-export contract check, then `node --test
-test/*.test.ts`) drives these seams and never touches a real model endpoint. Every suite, and what
-it pins — 47 suites, the count `node --test` reports, plus one top-level test in
-`starter-config.test.ts`:
-
-| file                                   | suites                                                                                                                                                                     |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `test/config.test.ts`                  | config schema validation; config file loading                                                                                                                               |
-| `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload (including a merge over capacity); observability: status counters; daemon idle-exit; daemon lifetime: counted clients and status invisibility (#60); config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
-| `test/daemon-event-log.test.ts`        | daemon event log — the `logFile` seam: the JSON-lines sequence of a handover, every event's fields, a TTL reclaim as `evict` + `reason: "ttl"`, an idle yield as `release` + `reason: "idle"`, an unwritable path that leaves the daemon serving, the path followed across a hot-reload (on, moved, off), no file when `logFile` is unset |
-| `test/lease-client.test.ts`            | lease client; daemon autostart; an unreachable status resolves to null                                                                                                      |
-| `test/extension.test.ts`               | role resolution                                                                                                                                                             |
-| `test/extension-wrapper.test.ts`       | provider wrapper (queuedStream); config hot-reload (provider set)                                                                                                           |
-| `test/extension-timeout.test.ts`       | queueTimeoutMs visible warning — a parent warned past the cap stays queued                                                                                                  |
-| `test/extension-config-watch.test.ts`  | config created after startup                                                                                                                                                |
-| `test/extension-starter.test.ts`       | starter config at the `session_start` seam: creation adopted in the same session; reconcile notification and same-session wrapping                                             |
-| `test/starter-config.test.ts`          | missing config; reconcile of an existing config; endpoint classification through the Starter shape; transaction failures — plus the top-level public-surface test          |
-| `test/extension-bye.test.ts`           | `bye` on `session_shutdown`: the daemon exits with the last session's shutdown while the client process is still alive (#63)                                                 |
-| `test/extension-idle-beat.test.ts`     | run-scoped keyed beat (idle-yield, #57)                                                                                                                                     |
-| `test/extension-per-queue-lease.test.ts` | per-queue lease policy (#81): per-queue TTL, short idle window, hot-reloaded TTL and idle window                                                                            |
-| `test/addressing.test.ts`              | the group rule, entry-ownership rule and provider/queue-key resolution at their own seam: addressModel, addressEndpoint, queuedProviders, readProviders                     |
-| `test/scheduler.test.ts`               | lease / TTL (in memory); idle yield (in memory); serialisation (in memory); tier ordering (in memory); aging (in memory); no preemption (in memory); requestedKey echo (in memory); status view (in memory) |
+test/*.test.ts`) drives these seams and never touches a real model endpoint. Every suite states what
+it pins in its own header comment, so the list of suites lives with the code it describes.
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
 `waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,

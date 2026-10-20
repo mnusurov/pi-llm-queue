@@ -1,3 +1,6 @@
+// The lease client against a real daemon: the verdicts (held / passthrough / lost / cancelled),
+// the fail-open policy, daemon autostart, the heartbeat against the TTL, status and the re-tier
+// op. Real daemon, stub endpoint; no pi Extension.
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
