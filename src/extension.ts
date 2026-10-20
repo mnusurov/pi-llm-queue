@@ -12,9 +12,10 @@ import type {
 	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { LeaseClient, type Role, type AcquireReason, type StatusSession } from "./lease-client.ts";
+import { LeaseClient, type Role, type StatusSession } from "./lease-client.ts";
 import { loadValidConfig, DEFAULTS, keyedBeatMs, SCHEMA_VERSION } from "./config.js";
 import { addressEndpoint, addressModel, keyAddressesEndpoint, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
+import { RunLifecycle, SessionRegistry, type Clock, type LeasePort } from "./run-lifecycle.ts";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -22,18 +23,10 @@ const MODELS_JSON_PATH = join(AGENT_DIR, "models.json");
 const SOCKET_PATH = join(AGENT_DIR, "llm-queue.sock");
 // URL.pathname is percent-encoded: decode so paths with spaces/non-ASCII resolve.
 const DAEMON_PATH = decodeURIComponent(new URL("daemon.js", import.meta.url).pathname);
-// Wake chains (parent woken by a child) must not thrash the slot: spec says 2-5 s.
-const GRACE_MS = 3000;
-// Shown when a parent's queue wait exceeds queueTimeoutMs; the request stays queued.
-const TIMEOUT_WARNING = "pi-llm-queue: queue wait exceeded queueTimeoutMs — still waiting";
 // The only defaults field a Starter config writes: a Parent's queue-wait cap, above a long Child
 // generation (the 2026-10-18 run held the Slot 11+ minutes) so a stuck queue warns visibly while
 // the normal case stays silent. Children keep an unbounded wait — this cap is parent-only.
 const STARTER_QUEUE_TIMEOUT_MS = 120000;
-// Tools that park the run on another agent or the user: the run-scoped keyed beat pauses while one
-// is in flight, so a parked Holder idle-yields the Slot to the agent it waits on (#57, ADR 0003).
-// Compute tools (bash, read, edit, …) keep beating: a busy Holder is never idle.
-const DEFAULT_BLOCKING_TOOLS = ["subagent", "subagent_wait", "bg_wait", "ask_user", "contact_supervisor", "intercom"];
 
 interface QueueEntry {
 	maxStreams?: number;
@@ -169,173 +162,47 @@ export default function (pi: ExtensionAPI) {
 	const roleOverride = new Map<string, Role>();
 	const currentRole = (sessionKey: string): Role => roleOverride.get(sessionKey) ?? envRole;
 
-	/** What a waiting session shows in the footer: its queue position and the holders ahead of it. */
-	interface QueueWait {
-		position: number;
-		holders: string[];
-	}
+	const queueKeyFor = (model: ExtensionContext["model"]): string | null =>
+		model && providers.includes(model.provider) ? addressModel(model, queues, modelsJson).queueKey : null;
 
-	// A pi process runs several sessions (a parent and its subagent children); a lease is per
-	// session, so the held key, release timer and footer indicator all live on one SessionState.
-	class SessionState {
-		readonly sessionKey: string;
-		heldQueueKey: string | null = null;
-		releaseTimer: ReturnType<typeof setTimeout> | null = null;
-		ui: ExtensionContext["ui"] | null = null;
-		queuedInfo: (QueueWait & { startedAt: number }) | null = null;
-		indicatorTimer: ReturnType<typeof setInterval> | null = null;
-		// True between agent_start and agent_settled: a run owns the slot, so a stream that ends must
-		// not re-arm the grace release the run will re-arm at settle instead.
-		runActive = false;
-		// Run-scoped keyed beats: one per held lease (keyed by queueKey), started at the grant, stopped
-		// at that lease's release. The daemon's activity clock advances for the whole live run —
-		// streaming and compute tools alike — and pauses only while a blocking tool is in flight, so
-		// idle-yield fires for a Holder parked on another agent, never for one busy in a tool (#57).
-		private readonly beatTimers = new Map<string, ReturnType<typeof setInterval>>();
-		readonly blockingCalls = new Set<string>();
+	// The per-session lease port: the LeaseClient still keys every operation by session, so the
+	// session key, tier, and group are bound here and the lifecycle never resolves any of them.
+	const leasePortFor = (sessionKey: string): LeasePort => ({
+		acquire: (queueKey, signal, handlers) =>
+			lease.acquire(queueKey, sessionKey, currentRole(sessionKey), group, signal, handlers?.onQueued, handlers?.onWaitCap),
+		release: (queueKey) => lease.release(queueKey, sessionKey),
+		beat: (queueKey) => lease.beat(queueKey, sessionKey),
+	});
 
-		private beatNow(queueKey: string) {
-			if (this.blockingCalls.size) return; // parked on an agent/user: silence lets idle-yield fire
-			lease.beat(queueKey, this.sessionKey).then((granted) => {
-				if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
-			}, () => {});
-		}
-
-		startBeat(queueKey: string) {
-			this.stopBeat(queueKey);
-			const timer = setInterval(() => this.beatNow(queueKey), queueBeatMs(queueKey));
+	// Clocks at the edge (CODING_STANDARDS): the lifecycle takes time as a port, so its unit tests
+	// move time exactly. unref keeps a pending Grace/Beat timer from holding pi's process open.
+	const clock: Clock = {
+		now: () => Date.now(),
+		setTimeout: (fn, ms) => {
+			const timer = setTimeout(fn, ms);
 			timer.unref();
-			this.beatTimers.set(queueKey, timer);
-		}
-
-		/**
-		 * Re-arm every live beat at the current config's period (hot-reload, #81). Beat immediately
-		 * first: a shortened idle window applies at the daemon at once, and waiting a full new period
-		 * would let a sweep yield the holder before its first beat under the new policy.
-		 */
-		restartBeats() {
-			for (const queueKey of [...this.beatTimers.keys()]) {
-				this.startBeat(queueKey);
-				this.beatNow(queueKey);
-			}
-		}
-
-		stopBeat(queueKey?: string) {
-			if (queueKey === undefined) {
-				for (const timer of this.beatTimers.values()) clearInterval(timer);
-				this.beatTimers.clear();
-			} else {
-				const timer = this.beatTimers.get(queueKey);
-				if (timer) {
-					clearInterval(timer);
-					this.beatTimers.delete(queueKey);
-				}
-			}
-		}
-		// The run's acquire started at agent_start, still awaiting the grant. pi does not await the
-		// handler, so the first stream can arrive first; it must join this acquire, not queue again.
-		private pendingAcquire: { queueKey: string; promise: Promise<AcquireReason> } | null = null;
-
-		constructor(sessionKey: string) {
-			this.sessionKey = sessionKey;
-		}
-
-		/** Acquire this queue's slot once: a concurrent call for the same queue shares the request. */
-		acquire(queueKey: string, signal?: AbortSignal): Promise<AcquireReason> {
-			if (this.pendingAcquire?.queueKey !== queueKey) {
-				const promise = acquireFor(this, queueKey, signal);
-				this.pendingAcquire = { queueKey, promise };
-				promise
-					.finally(() => {
-						if (this.pendingAcquire?.promise === promise) this.pendingAcquire = null;
-					})
-					.catch(() => {}); // the awaiters see the rejection; this tap only clears state
-			}
-			return this.pendingAcquire.promise;
-		}
-
-		/** Footer indicator while this session waits for a slot: position, elapsed wait, who holds. */
-		render() {
-			this.ui?.setStatus(
-				"llm-queue",
-				this.queuedInfo
-					? `llm-queue #${this.queuedInfo.position} · ${Math.round((Date.now() - this.queuedInfo.startedAt) / 1000)}s · behind ${this.queuedInfo.holders.join(", ") || "?"}`
-					: undefined,
-			);
-		}
-
-		showQueued(info: QueueWait) {
-			this.queuedInfo = { ...info, startedAt: this.queuedInfo?.startedAt ?? Date.now() };
-			this.indicatorTimer ??= setInterval(() => this.render(), 1000);
-			this.indicatorTimer.unref();
-			this.render();
-		}
-
-		clearQueued() {
-			if (this.indicatorTimer) {
-				clearInterval(this.indicatorTimer);
-				this.indicatorTimer = null;
-			}
-			if (this.queuedInfo) {
-				this.queuedInfo = null;
-				this.render();
-			}
-		}
-
-		/** Cancel a pending grace-window release: a run or stream starting inside it keeps the slot. */
-		cancelPendingRelease() {
-			if (this.releaseTimer) {
-				clearTimeout(this.releaseTimer);
-				this.releaseTimer = null;
-			}
-		}
-
-		/** Release the slot unless a run claims it within the grace window. */
-		armGraceRelease() {
-			this.cancelPendingRelease();
-			this.releaseTimer = setTimeout(() => this.release(), GRACE_MS);
-			this.releaseTimer.unref();
-		}
-
-		release() {
-			this.cancelPendingRelease();
-			// Every lease this session still holds: the run's held key plus any lone request's
-			// self-queued lease. Stopping only the held key leaks a lease whose beat outlives it (#81).
-			const keys = new Set(this.beatTimers.keys());
-			if (this.heldQueueKey) keys.add(this.heldQueueKey);
-			for (const key of keys) {
-				this.stopBeat(key);
-				lease.release(key, this.sessionKey);
-			}
-			this.heldQueueKey = null;
-			this.blockingCalls.clear(); // a lost tool_execution_end must not silence the beat of later runs
-		}
-	}
-
-	const sessions = new Map<string, SessionState>();
-	const ensureState = (key: string): SessionState => {
-		let state = sessions.get(key);
-		if (!state) sessions.set(key, (state = new SessionState(key)));
-		return state;
-	};
-	// A request without options.sessionId (direct call, compaction, classifier) has no session to
-	// name. It belongs to whichever session holds this endpoint's slot (only that session is using
-	// the endpoint right now; a parallel agent_start that lost the race cannot misattribute it), and
-	// the most recently started session otherwise.
-	// shortcut: with no slot holder, a sessionless request joins the newest session; upgrade to a
-	// per-session direct-call bucket if a sessionless caller ever needs its own lease state.
-	let newestSessionKey = "";
-
-	const sessionKeyFor = (queueKey: string, options?: SimpleStreamOptions): string => {
-		if (options?.sessionId) return options.sessionId;
-		for (const state of sessions.values()) if (state.heldQueueKey === queueKey) return state.sessionKey;
-		return newestSessionKey;
+			return timer;
+		},
+		clearTimeout: (timer) => clearTimeout(timer as ReturnType<typeof setTimeout>),
 	};
 
-	// Every session acquires the same way: show the footer while waiting, warn once the parent
-	// wait passes queueTimeoutMs (the request stays queued).
-	const acquireFor = (state: SessionState, queueKey: string, signal?: AbortSignal) =>
-		lease.acquire(queueKey, state.sessionKey, currentRole(state.sessionKey), group, signal, (info) => state.showQueued(info), () => state.ui?.notify(TIMEOUT_WARNING, "warning"));
+	const noUi = { status() {}, notify() {} };
+	const uiPort = (ui: ExtensionContext["ui"]) => ({
+		status: (text: string | undefined) => ui.setStatus("llm-queue", text),
+		notify: (message: string, level: "info" | "warning" | "error") => ui.notify(message, level),
+	});
+	const registry = new SessionRegistry(
+		(sessionKey) =>
+			new RunLifecycle({
+				sessionKey,
+				lease: leasePortFor(sessionKey),
+				clock,
+				ui: noUi,
+				beatMs: queueBeatMs,
+				// Read live on each tool start, so a config edit applies without a restart.
+				blockingTools: () => config.defaults?.blockingTools ?? DEFAULTS.blockingTools,
+			}),
+	);
 
 	let providers: string[] = [];
 	// Only what we registered: unregistering a native-owned provider would drop the built-in.
@@ -350,43 +217,17 @@ export default function (pi: ExtensionAPI) {
 		const out = createAssistantMessageEventStream();
 		const queueKey = addressModel(model, queues, modelsJson).queueKey;
 		// The agent tags every request with its session id, so two sessions in one process keep
-		// separate leases; a request without one (direct call) resolves to the slot's holder.
-		const sessionKey = sessionKeyFor(queueKey, options);
-		const state = ensureState(sessionKey);
-		const wasHeld = state.heldQueueKey === queueKey;
-		// A stream landing inside the settle grace window means the session is active again: cancel
-		// the pending release, or the slot frees mid-stream and another session grabs it (#55).
-		// A run re-arms at agent_settled; a lone request (no run) re-arms here when it finishes.
-		const inGrace = state.releaseTimer !== null;
-		state.cancelPendingRelease();
-		(async () => {
-			let selfQueued = false;
-			try {
-				// Requests outside a run (compaction, classifier, nested calls) queue for themselves
-				// and release when done. A held request beats its lease: the run keeps the slot
-				// across tool executions. A beat answered ungranted means the daemon no longer grants
-				// the slot (a TTL lapse, a release, a disconnect) — the run re-queues before it streams again.
-				const retained = wasHeld && (await lease.beat(queueKey, sessionKey));
-				if (!retained) {
-					// Join the run's in-flight acquire for this queue if there is one: pi does not await
-					// agent_start, so the first stream lands before the grant. Queuing again would
-					// enqueue the session twice and release after every stream (#55). If agent_start
-					// claimed this same acquire, it sets heldQueueKey and the finally below leaves the
-					// lease to the run.
-					const reason = await state.acquire(queueKey, options?.signal);
-					state.clearQueued();
-					if (reason === "granted") {
-						if (wasHeld) state.heldQueueKey = queueKey; // the run re-took its slot
-						else selfQueued = true;
-						state.startBeat(queueKey); // the run-scoped beat covers this grant too
-					}
-				}
+		// separate leases; a request without one resolves to the Slot's holder, or the newest session.
+		const sessionKey = options?.sessionId ?? registry.ownerFor(queueKey);
+		registry
+			.for(sessionKey)
+			.withSlot(queueKey, options?.signal, async () => {
 				const impl = model.api === "openai-completions" ? openAICompletionsApi() : getApiProvider(model.api);
 				if (!impl) throw new Error(`pi-llm-queue: no stream implementation for api "${model.api}"`);
-				// The run-scoped beat (started at the grant) covers the stream: no stream-scoped beat here.
 				for await (const event of impl.streamSimple(model, context, options)) out.push(event);
 				out.end();
-			} catch (error) {
+			})
+			.catch((error) => {
 				out.push({
 					type: "error",
 					reason: "error",
@@ -410,16 +251,7 @@ export default function (pi: ExtensionAPI) {
 					},
 				});
 				out.end();
-			} finally {
-				// A run claimed the slot meanwhile (agent_start set heldQueueKey): leave the lease to it.
-				if (selfQueued && state.heldQueueKey !== queueKey) {
-					state.stopBeat(queueKey); // stop at release: the beat must not outlive the lease it beats
-					lease.release(queueKey, sessionKey);
-				}
-				// No run is coming to re-arm: this lone request resumed the session, so restart the grace.
-				else if (inGrace && !state.runActive) state.armGraceRelease();
-			}
-		})();
+			});
 		return out;
 	};
 
@@ -508,7 +340,7 @@ export default function (pi: ExtensionAPI) {
 				config = next.config;
 				queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 				lease.setHeartbeatMs(smallestBeatMs());
-				for (const state of sessions.values()) state.restartBeats(); // a live holder is never evicted by a policy edit
+				registry.restartBeats(); // a live holder is never evicted by a policy edit
 				registerQueuedProviders(ctx);
 				ctx.ui.notify("pi-llm-queue: config reloaded", "info");
 			}, 250);
@@ -586,8 +418,7 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		newestSessionKey = ctx.sessionManager.getSessionId();
-		ensureState(newestSessionKey).ui = ctx.ui;
+		registry.for(ctx.sessionManager.getSessionId()).setUi(uiPort(ctx.ui));
 		if (configErrors.length) ctx.ui.notify(`pi-llm-queue: config rejected, running with defaults:\n${configErrors.join("\n")}`, "error");
 		if (!registered) {
 			registered = true;
@@ -598,53 +429,24 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
-		const sessionKey = ctx.sessionManager.getSessionId();
-		const state = ensureState(sessionKey);
-		state.cancelPendingRelease(); // a run starting inside the grace window keeps the slot
-		const model = ctx.model;
-		const queueKey = model && providers.includes(model.provider) ? addressModel(model, queues, modelsJson).queueKey : null;
-		// A run switching queues inside the grace must release the old lease first: overwriting the
-		// held key leaves the old beat running for the process lifetime and blocks that endpoint
-		// behind a holder that is not running (#81).
-		if (state.heldQueueKey && state.heldQueueKey !== queueKey) state.release();
-		if (!queueKey) return;
-		state.runActive = true; // a stream ending after this must not re-arm the grace; settle will
-		// Attach the abort path before awaiting: Esc while queued must cancel.
-		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
-		const reason = await state.acquire(queueKey, ctx.signal);
-		state.clearQueued();
-		// Only a grant claims a lease: an abort/fail-open must not mark the slot held. A stream that
-		// joined this acquire shares the grant and must not release it per-stream (#55).
-		if (reason === "granted") {
-			state.heldQueueKey = queueKey;
-			state.startBeat(queueKey); // beat for the whole run: the daemon sees activity, not just streams
-		}
+		await registry.for(ctx.sessionManager.getSessionId()).startRun(queueKeyFor(ctx.model), ctx.signal);
 	});
 
 	// Blocking-tool nesting (#57): while a tool that waits on another agent or the user is in
-	// flight, the run-scoped beat pauses, so idle-yield hands the Slot to the very agent the run
+	// flight, the run-scoped Beat pauses, so idle-yield hands the Slot to the very agent the Run
 	// waits on. Compute tools keep beating. The set is config: defaults.blockingTools.
-	pi.on("tool_execution_start", (event, ctx) => {
-		const tools = config.defaults?.blockingTools ?? DEFAULT_BLOCKING_TOOLS;
-		if (tools.includes(event.toolName)) ensureState(ctx.sessionManager.getSessionId()).blockingCalls.add(event.toolCallId);
-	});
-	pi.on("tool_execution_end", (event, ctx) => {
-		ensureState(ctx.sessionManager.getSessionId()).blockingCalls.delete(event.toolCallId);
-	});
+	pi.on("tool_execution_start", (event, ctx) =>
+		registry.for(ctx.sessionManager.getSessionId()).parkOnTool(event.toolCallId, event.toolName),
+	);
+	pi.on("tool_execution_end", (event, ctx) => registry.for(ctx.sessionManager.getSessionId()).leaveTool(event.toolCallId));
 
-	pi.on("agent_settled", (_event, ctx) => {
-		const state = ensureState(ctx.sessionManager.getSessionId());
-		state.runActive = false;
-		state.armGraceRelease();
-	});
+	pi.on("agent_settled", (_event, ctx) => registry.for(ctx.sessionManager.getSessionId()).settleRun());
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		const state = ensureState(ctx.sessionManager.getSessionId());
-		state.release();
-		state.clearQueued(); // a shutdown while queued must not leave the indicator up
-		sessions.delete(state.sessionKey);
+		const sessionKey = ctx.sessionManager.getSessionId();
+		registry.for(sessionKey).shutdown();
 		// The last session of this pi process says bye: the daemon counts this connection, so the
 		// idle-exit arms at the word and a lingering process cannot keep stale daemon code alive.
-		if (sessions.size === 0) lease.bye();
+		if (registry.forget(sessionKey)) lease.bye();
 	});
 }

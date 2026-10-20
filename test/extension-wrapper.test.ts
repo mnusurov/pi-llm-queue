@@ -188,8 +188,8 @@ describe("provider wrapper (queuedStream)", () => {
 
 	it("releases the old queue's lease when a run switches models inside the settle grace (#81)", async () => {
 		// A settle arms the grace on model A's queue. A new run on model B inside that window must
-		// release A's lease first: overwriting heldQueueKey leaves A's beat alive for the process
-		// lifetime, blocking every other session behind a holder that is not running.
+		// release A's lease first: leaving it behind keeps A's beat alive for the process lifetime,
+		// blocking every other session behind a holder that is not running.
 		const a = startExt();
 		const sa = a.startSession("SWITCH-A");
 		await sa.dispatch("agent_start"); // holds QUEUE_KEY
