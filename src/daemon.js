@@ -9,7 +9,7 @@
 import { createConnection, createServer } from "node:net";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
-import { loadValidConfig, DEFAULTS } from "./config.js";
+import { loadValidConfig, resolveQueuePolicy } from "./config.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
@@ -155,21 +155,20 @@ function groupFor(key) {
 }
 
 // The Scheduler resolves no config: the adapter resolves each queue's policy through config.js and
-// addressing.js and hands the Scheduler plain resolved values. Order: queue entry field → defaults
-// field → the config.js DEFAULTS table. `enabled: false` is passthrough: unlimited slots (Infinity),
-// so every session is granted immediately (status reports maxStreams null via JSON). The closure
-// reads the live `config` /
+// addressing.js and hands the Scheduler plain resolved values. The cascade and the Passthrough rule
+// live in resolveQueuePolicy (#98); this adapter only maps config vocabulary to the Scheduler's
+// (`ttlMs`). `enabled: false` is passthrough: maxStreams Infinity, so every session is granted
+// immediately (status reports maxStreams null via JSON). The closure reads the live `config` /
 // `defaults`, so a hot-reload re-resolves through the new values.
 function resolvePolicy(key) {
-	const policy = policyFor(key);
-	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
+	const p = resolveQueuePolicy(policyFor(key), defaults);
 	return {
-		maxStreams: policy.enabled === false ? Infinity : pick("maxStreams", DEFAULTS.maxStreams),
-		ttlMs: pick("leaseTtlMs", DEFAULTS.leaseTtlMs),
-		agingAfterSlots: pick("agingAfterSlots", DEFAULTS.agingAfterSlots),
-		agingAfterMs: pick("agingAfterMs", DEFAULTS.agingAfterMs),
-		policy: pick("policy", DEFAULTS.policy),
-		idleYieldMs: pick("idleYieldMs", DEFAULTS.idleYieldMs),
+		maxStreams: p.maxStreams,
+		ttlMs: p.leaseTtlMs,
+		agingAfterSlots: p.agingAfterSlots,
+		agingAfterMs: p.agingAfterMs,
+		policy: p.policy,
+		idleYieldMs: p.idleYieldMs,
 	};
 }
 

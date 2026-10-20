@@ -7,10 +7,10 @@ import { readFileSync } from "node:fs";
 export const SCHEMA_VERSION = 1;
 
 /**
- * The policy defaults table: the one place these values are written. The daemon's pick-chain
- * (queue entry field → defaults field → this table), the client's heartbeat period and the test
- * harnesses all read it. Not members: the lease client's 10000 ms fallback and the daemon's
- * idle-exit startup floor — fallbacks of other layers, not policy defaults.
+ * The policy defaults table: the one place these values are written. resolveQueuePolicy applies
+ * it as the cascade's last rung, and the test harnesses read it. Not members: the lease client's
+ * 10000 ms fallback and the daemon's idle-exit startup floor — fallbacks of other layers, not
+ * policy defaults.
  * @type {Record<string, any>}
  */
 export const DEFAULTS = {
@@ -44,6 +44,30 @@ export const keyedBeatMs = (ttlMs, idleYieldMs = 0) => {
 	const idle = idleYieldMs > 0 ? Math.max(1, Math.floor(idleYieldMs / 2)) : Infinity;
 	return Math.min(heartbeatMs(ttlMs), idle);
 };
+
+/**
+ * The one policy cascade: queue entry field → defaults field → DEFAULTS. The daemon's adapter and
+ * the client's beat derivation both call this, so they agree on every Policy default by
+ * construction, not by comment (#98; the drift that lost a beating Holder its Slot, #81, was two
+ * hand-written cascades disagreeing). The resolver invents no values: it applies only the
+ * documented fallbacks in DEFAULTS, plus the Passthrough rule (`enabled: false` → maxStreams
+ * Infinity). Returns config vocabulary (`leaseTtlMs`); the daemon adapter maps it to the
+ * Scheduler's `ttlMs` itself.
+ * @param {Record<string, any>} entry A queue entry ({} when none addresses the key)
+ * @param {Record<string, any>} defaults The config's `defaults` block
+ * @returns {{ maxStreams: number, leaseTtlMs: number, agingAfterSlots: number, agingAfterMs: number, policy: string, idleYieldMs: number }}
+ */
+export function resolveQueuePolicy(entry, defaults) {
+	const pick = (field) => entry[field] ?? defaults[field] ?? DEFAULTS[field];
+	return {
+		maxStreams: entry.enabled === false ? Infinity : pick("maxStreams"),
+		leaseTtlMs: pick("leaseTtlMs"),
+		agingAfterSlots: pick("agingAfterSlots"),
+		agingAfterMs: pick("agingAfterMs"),
+		policy: pick("policy"),
+		idleYieldMs: pick("idleYieldMs"),
+	};
+}
 
 /**
  * @typedef {object} FieldSpec

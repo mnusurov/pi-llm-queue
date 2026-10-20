@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, keyedBeatMs, loadValidConfig, validateConfig } from "../src/config.js";
+import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, keyedBeatMs, loadValidConfig, resolveQueuePolicy, validateConfig } from "../src/config.js";
 
 describe("config schema validation", () => {
 	it("accepts a full valid config", () => {
@@ -164,6 +164,61 @@ describe("policy defaults table", () => {
 		assert.equal(keyedBeatMs(30000, 1000), 500, "a short idle window needs a beat at half of it");
 		assert.equal(keyedBeatMs(30000, 0), 10000, "disabled idle-yield imposes no bound");
 		assert.equal(keyedBeatMs(30000, 30000), 10000, "the TTL beat is already tighter than idle/2");
+	});
+
+	// #98: the schema's leaseTtlMs floor (1000) and the beat derivation are one invariant — a beat
+	// must leave at least two refreshes inside every TTL the schema accepts, or a sweep landing
+	// between two beats evicts a healthy Holder. Before this the invariant was a pair of comments.
+	// The test crosses the whole client path: schema-accepted config → resolveQueuePolicy → beat.
+	it("leaves at least two beats inside every TTL the schema accepts", () => {
+		for (const ttl of [1000, 1001, 1500, 30000, 3600000]) {
+			for (const idle of [0, 1, 500, 999, 30000]) {
+				assert.deepEqual(validateConfig({ queues: { zen: { leaseTtlMs: ttl, idleYieldMs: idle } } }), [], `ttl ${ttl} idle ${idle} is schema-accepted`);
+				// The cascade rungs a schema-accepted value can sit on: queue entry, defaults, DEFAULTS.
+				for (const source of [{ leaseTtlMs: ttl, idleYieldMs: idle }, {}]) {
+					const policy = resolveQueuePolicy(source, source);
+					const beat = keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
+					assert.ok(beat * 2 <= policy.leaseTtlMs, `beat ${beat} ms leaves < 2 refreshes inside TTL ${policy.leaseTtlMs} ms (idle ${policy.idleYieldMs})`);
+				}
+			}
+		}
+	});
+});
+
+// #98: one resolver owns the policy cascade (entry field → defaults field → DEFAULTS), so the
+// daemon and the client agree on every Policy default by construction, not by comment.
+describe("policy cascade resolver", () => {
+	it("resolves every field from DEFAULTS when entry and defaults are empty", () => {
+		assert.deepEqual(resolveQueuePolicy({}, {}), {
+			maxStreams: 1,
+			leaseTtlMs: 30000,
+			agingAfterSlots: 3,
+			agingAfterMs: 60000,
+			policy: "priority-aging",
+			idleYieldMs: 30000,
+		});
+	});
+
+	it("entry fields override defaults, defaults override DEFAULTS", () => {
+		const policy = resolveQueuePolicy({ maxStreams: 4, policy: "fifo" }, { maxStreams: 2, leaseTtlMs: 9000, agingAfterSlots: 5 });
+		assert.deepEqual(policy, {
+			maxStreams: 4,
+			leaseTtlMs: 9000,
+			agingAfterSlots: 5,
+			agingAfterMs: 60000,
+			policy: "fifo",
+			idleYieldMs: 30000,
+		});
+	});
+
+	it("enabled: false is Passthrough: maxStreams Infinity, other fields still cascade", () => {
+		const policy = resolveQueuePolicy({ enabled: false, leaseTtlMs: 5000 }, { leaseTtlMs: 9000 });
+		assert.equal(policy.maxStreams, Infinity);
+		assert.equal(policy.leaseTtlMs, 5000);
+	});
+
+	it("idleYieldMs 0 passes through, imposing no idle bound on the beat", () => {
+		assert.equal(resolveQueuePolicy({ idleYieldMs: 0 }, {}).idleYieldMs, 0);
 	});
 });
 

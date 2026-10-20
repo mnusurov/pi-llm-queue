@@ -13,7 +13,7 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role, type StatusSession } from "./lease-client.ts";
-import { loadValidConfig, DEFAULTS, keyedBeatMs } from "./config.js";
+import { loadValidConfig, DEFAULTS, keyedBeatMs, resolveQueuePolicy } from "./config.js";
 import { ensureStarterConfig } from "./starter-config.ts";
 import { addressEndpoint, addressModel, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
 import { RunLifecycle, SessionRegistry, type Clock, type LeasePort } from "./run-lifecycle.ts";
@@ -56,23 +56,24 @@ export default function (pi: ExtensionAPI) {
 	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 
-	// The beat period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved exactly
-	// as the daemon does (entry field → defaults field → DEFAULTS). Deriving it from `defaults` alone
-	// lets a per-queue TTL lapse or a short idle window yield an actively beating Holder (#81).
+	// The beat period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved through
+	// the same resolver the daemon uses, so client and daemon agree by construction (#98).
+	// Deriving it from `defaults` alone lets a per-queue TTL lapse or a short idle window yield an
+	// actively beating Holder (#81).
 	const queueBeatMs = (queueKey: string): number => {
 		const entry = addressEndpoint(queueKey, queues, modelsJson).entry as QueueEntry | undefined;
-		const ttl = entry?.leaseTtlMs ?? config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs;
-		const idleYield = entry?.idleYieldMs ?? config.defaults?.idleYieldMs ?? DEFAULTS.idleYieldMs;
-		return keyedBeatMs(ttl, idleYield);
+		const policy = resolveQueuePolicy(entry ?? {}, config.defaults ?? {});
+		return keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
 	};
 	// The connection-wide bare renew refreshes every lease on the socket: it must run at the
 	// smallest period any live lease could need, so it also covers a queue the defaults under-serve.
 	const smallestBeatMs = (): number => {
 		let min = Infinity;
 		for (const [key, entry] of Object.entries(queues)) if (entry?.enabled !== false) min = Math.min(min, queueBeatMs(key));
-		return Number.isFinite(min)
-			? min
-			: keyedBeatMs(config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs, config.defaults?.idleYieldMs ?? DEFAULTS.idleYieldMs);
+		if (Number.isFinite(min)) return min;
+		// No enabled queue: the defaults block alone.
+		const policy = resolveQueuePolicy({}, config.defaults ?? {});
+		return keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
 	};
 
 	const lease = new LeaseClient({
