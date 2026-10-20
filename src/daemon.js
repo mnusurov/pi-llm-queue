@@ -3,12 +3,14 @@
 // Protocol: newline-delimited JSON. See docs/daemon-protocol.md.
 //
 // This file is the socket adapter (ADR 0004): framing, the Counted-client count + idle-exit, the
-// Sweep timer, the `status` view, the `requestedKey` echo, config resolution through config.js, and
-// emitting the decisions the Scheduler returns. All scheduling decisions live in src/scheduler.js.
+// Sweep timer, the `status` view, the `requestedKey` echo, config resolution through config.js,
+// queue addressing through addressing.js, and emitting the decisions the Scheduler returns. All
+// scheduling decisions live in src/scheduler.js.
 import { createConnection, createServer } from "node:net";
 import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
 import { basename, dirname } from "node:path";
-import { loadValidConfig, groupKeyFor, queueEntryFor } from "./config.js";
+import { loadValidConfig, DEFAULTS } from "./config.js";
+import { addressEndpoint, readProviders } from "./addressing.js";
 import { Scheduler } from "./scheduler.js";
 
 const args = process.argv.slice(2);
@@ -33,14 +35,20 @@ for (const e of loaded.errors) console.error(`pi-llm-queue daemon: config: ${e}`
 let config = loaded.config;
 let defaults = config.defaults ?? {};
 // models.json is optional for pi: a missing catalog is an empty one, never a startup crash (the
-// extension spawns the daemon detached, so a crash would be silent). A present-but-unreadable
-// catalog is reported: provider-name queue keys and group members would silently resolve to nothing.
+// extension spawns the daemon detached, so a crash would be silent). A present catalog that yields
+// no providers is reported: provider-name queue keys and group members would silently resolve to
+// nothing. `readProviders` swallows the read failure (its contract), so the reason is read back here.
 let modelsJson = {};
 if (modelsJsonPath && existsSync(modelsJsonPath)) {
-	try {
-		modelsJson = JSON.parse(readFileSync(modelsJsonPath, "utf8")).providers ?? {};
-	} catch (error) {
-		console.error(`pi-llm-queue daemon: models.json unreadable (${error.message}): provider-name queue keys resolve to nothing`);
+	modelsJson = readProviders(modelsJsonPath);
+	if (!Object.keys(modelsJson).length) {
+		let reason = "no providers";
+		try {
+			JSON.parse(readFileSync(modelsJsonPath, "utf8"));
+		} catch (error) {
+			reason = error.message;
+		}
+		console.error(`pi-llm-queue daemon: models.json: ${reason} — provider-name queue keys resolve to nothing`);
 	}
 }
 
@@ -111,34 +119,36 @@ function countClient(conn) {
 	}
 }
 
-// Queue keys are endpoint baseUrls. A provider-name key applies to that provider's
-// baseUrl; a baseUrl key wins when both name the same endpoint. Resolution lives in
-// src/config.js so the extension and the daemon share one rule.
+// Queue keys are endpoint baseUrls. A provider-name key applies to that provider's baseUrl; a
+// baseUrl key wins when both name the same endpoint. The rule lives in src/addressing.js (ADR
+// 0005), in its endpoint form: a socket client names an endpoint and no provider, so the
+// provider-name branch is unreachable through it by construction.
 function policyFor(key) {
-	return queueEntryFor(config.queues ?? {}, modelsJson, { baseUrl: key }) ?? {};
+	return addressEndpoint(key, config.queues ?? {}, modelsJson).entry ?? {};
 }
 
 // Explicit resource groups: queues.<name>.match lists baseUrls and/or provider names that
 // share one queue, overriding baseUrl keying so endpoints can be merged or re-slotted.
 function groupFor(key) {
-	return groupKeyFor(config.queues ?? {}, modelsJson, { baseUrl: key });
+	return addressEndpoint(key, config.queues ?? {}, modelsJson).queueKey;
 }
 
 // The Scheduler resolves no config: the adapter resolves each queue's policy through config.js and
-// hands the Scheduler plain resolved values. Order: queue entry field → defaults field → hardcoded
-// fallback. `enabled: false` is passthrough: unlimited slots (Infinity), so every session is granted
-// immediately (status reports maxStreams null via JSON). The closure reads the live `config` /
+// addressing.js and hands the Scheduler plain resolved values. Order: queue entry field → defaults
+// field → the config.js DEFAULTS table. `enabled: false` is passthrough: unlimited slots (Infinity),
+// so every session is granted immediately (status reports maxStreams null via JSON). The closure
+// reads the live `config` /
 // `defaults`, so a hot-reload re-resolves through the new values.
 function resolvePolicy(key) {
 	const policy = policyFor(key);
 	const pick = (field, fallback) => policy[field] ?? defaults[field] ?? fallback;
 	return {
-		maxStreams: policy.enabled === false ? Infinity : pick("maxStreams", 1),
-		ttlMs: pick("leaseTtlMs", 30000),
-		agingAfterSlots: pick("agingAfterSlots", 3),
-		agingAfterMs: pick("agingAfterMs", 60000),
-		policy: pick("policy", "priority-aging"),
-		idleYieldMs: pick("idleYieldMs", 30000),
+		maxStreams: policy.enabled === false ? Infinity : pick("maxStreams", DEFAULTS.maxStreams),
+		ttlMs: pick("leaseTtlMs", DEFAULTS.leaseTtlMs),
+		agingAfterSlots: pick("agingAfterSlots", DEFAULTS.agingAfterSlots),
+		agingAfterMs: pick("agingAfterMs", DEFAULTS.agingAfterMs),
+		policy: pick("policy", DEFAULTS.policy),
+		idleYieldMs: pick("idleYieldMs", DEFAULTS.idleYieldMs),
 	};
 }
 
@@ -349,7 +359,7 @@ process.on("SIGTERM", () => {
 // group at runtime must not leave the endpoint's old slot set running beside the group's.
 // shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
 // This stays adapter-side (ADR 0004 consequence): it repairs the queue-key references the
-// connection records carry, which needs the config.js group rule.
+// connection records carry, which asks addressing.js for each live queue's remap target.
 function rebuildQueues() {
 	const rebuilt = new Map();
 	for (const [key, queue] of scheduler.queues) {

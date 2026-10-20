@@ -7,6 +7,29 @@ import { readFileSync } from "node:fs";
 export const SCHEMA_VERSION = 1;
 
 /**
+ * The policy defaults table: the one place these values are written. The daemon's pick-chain
+ * (queue entry field → defaults field → this table), the client's heartbeat period and the test
+ * harnesses all read it. Not members: the lease client's 10000 ms fallback and the daemon's
+ * idle-exit startup floor — fallbacks of other layers, not policy defaults.
+ * @type {Record<string, any>}
+ */
+export const DEFAULTS = {
+	maxStreams: 1,
+	leaseTtlMs: 30000,
+	agingAfterSlots: 3,
+	agingAfterMs: 60000,
+	policy: "priority-aging",
+	idleYieldMs: 30000,
+};
+
+/**
+ * Client heartbeat period: a third of the lease TTL, floored at 250 ms. The floor stays under the
+ * leaseTtlMs floor (1000 ms), or a sweep landing between two beats evicts a healthy holder.
+ * @param {number} ttlMs @returns {number}
+ */
+export const heartbeatMs = (ttlMs) => Math.max(250, Math.floor(ttlMs / 3));
+
+/**
  * @typedef {object} FieldSpec
  * @property {"posInt"|"nonNegInt"|"posNum"|"nonNegNum"|"bool"|"strings"|"enum"|"path"} kind
  * @property {string[]} [values]
@@ -149,38 +172,6 @@ export function readJson(path) {
 	} catch {
 		return {};
 	}
-}
-
-/**
- * Queue key for a model, resolved through the group rule. The daemon and the extension share
- * this one implementation: a group whose `match` names the provider exactly owns it (split),
- * else a group naming the endpoint (directly, or through a member provider serving it), else
- * the endpoint itself. A raw socket client names only the endpoint, so it lands in the
- * endpoint-level group — the documented split limitation.
- * @param {Record<string, any>} queues
- * @param {Record<string, any>} providers models.json provider catalog
- * @param {{ provider?: string, baseUrl?: string }} model
- * @returns {string}
- */
-export function groupKeyFor(queues, providers, model) {
-	const active = Object.entries(queues ?? {}).filter(([, entry]) => entry?.enabled !== false);
-	for (const [name, entry] of active) if (entry?.match?.includes(model.provider)) return name;
-	for (const [name, entry] of active) if (entry?.match?.some((m) => m === model.baseUrl || providers[m]?.baseUrl === model.baseUrl)) return name;
-	return model.baseUrl;
-}
-
-/**
- * Queue entry owning a model: the group's entry, else the endpoint key's entry (a baseUrl key
- * wins over a provider-name key naming the same endpoint), else a provider-name key naming it.
- * @param {Record<string, any>} queues
- * @param {Record<string, any>} providers
- * @param {{ provider?: string, baseUrl?: string }} model
- * @returns {Record<string, any> | undefined}
- */
-export function queueEntryFor(queues, providers, model) {
-	const key = groupKeyFor(queues, providers, model);
-	if (queues[key]) return queues[key];
-	return Object.entries(queues).find(([name]) => !name.includes("://") && providers[name]?.baseUrl === key)?.[1];
 }
 
 /**

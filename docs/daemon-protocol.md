@@ -124,8 +124,8 @@ provider-name key to that provider's `baseUrl` by reading `models.json` (passed 
 key wins when both name the same endpoint. The extension wraps
 every provider named by a key plus every provider serving an endpoint named by a key, and
 queues its requests under the model's baseUrl — or under its group's name, when a group names it.
-The group/entry resolution rule is one implementation (`groupKeyFor`, `queueEntryFor` in
-`src/config.js`) shared by the extension and the daemon.
+The group/entry addressing rule is one implementation (`addressModel`, `addressEndpoint` in
+`src/addressing.js`, ADR 0005) shared by the extension and the daemon.
 
 Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAfterSlots`,
 `agingAfterMs`, `idleYieldMs` (all also valid in
@@ -174,7 +174,7 @@ keeps the last good config.
   reports `maxStreams: null`, printed as `passthrough` by `/queue`), and the extension leaves the provider unwrapped. A disabled
   group does not re-key its members, so their own endpoint entries still apply.
 - **`enabled: false` precedence** — a baseUrl (endpoint) key wins over a provider-name key naming
-  the same endpoint (`queueEntryFor`), so the endpoint entry's `enabled` governs the whole endpoint:
+  the same endpoint (`addressEndpoint`), so the endpoint entry's `enabled` governs the whole endpoint:
   `enabled: false` on the endpoint key disables every provider on it, and no provider-name key can
   silently re-enable it. The reverse is not true — `enabled: false` on a provider-name key alone
   does not disable an endpoint that an enabled endpoint key names, because that key wraps every

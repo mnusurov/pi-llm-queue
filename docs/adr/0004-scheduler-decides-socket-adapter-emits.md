@@ -50,7 +50,9 @@ scope is a protocol fact ("a bare `renew` heartbeats every lease of the connecti
   that fixes `now` and reads the returned decisions.
 - Hot-reload (`rebuildQueues`) deliberately stays adapter-side: it mutates `lease.queueKey` and
   `waiter.queue` in place because the connection records reference the old Queue objects, and with
-  the Scheduler owning those records the reference repair needs its own contract.
+  the Scheduler owning those records the reference repair needs its own contract. Amendment (ADR
+  0005): the addressing rules live in `src/addressing.js` — the adapter asks it for each live
+  queue's remap target, applies the remap and migrates the state itself.
 - The Switch predicate becomes explicit: a Switch **iff** the granted session came from the waiting
   list — the protocol's wording, not an inference from the presence of a prior Holder.
 - The Aging streak is bumped in one Grant path, so the direct-grant fast path cannot drift from the
