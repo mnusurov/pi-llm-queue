@@ -60,7 +60,8 @@ reintroduce exactly the `ctx` construction being removed. `providers()` is read-
 
 - The pi seam has one test surface: a new `pi.on(...)` handler requires no test change.
 - One agent dir per test file. A second Extension instance in the same file remains independent —
-  its state is per `extension(pi)` call, not module-level; only the agent dir is shared.
+  its state is per `extension(pi)` call, not module-level. The agent dir and its daemon socket are
+  shared; the harness refcounts that daemon and closes it with the last Extension.
 - A suite imports one module: the harness re-exports the socket primitives it builds on
   (`startDaemon`, `connectClient`, `stopAllDaemons`, `closeAllClients`, `pollUntil`).
 - `pkill -f <socketPath>` stays for daemons the Extension autostarted, but lives in one `dispose()`

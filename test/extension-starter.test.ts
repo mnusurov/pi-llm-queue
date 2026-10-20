@@ -2,11 +2,7 @@
 // generate a Starter config from models.json and make the queue live in that same session.
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { closeAllClients, connectClient, stopAllDaemons, waitForDaemon } from "./harness.ts";
+import { closeAllClients, disposeAllExtensions, startExtension } from "./extension-harness.ts";
 
 const STUB_API = "stub-starter-api";
 const LOCAL_URL = "http://192.168.1.50:8000/v1";
@@ -22,69 +18,29 @@ const BASE_PROVIDERS = {
 	native: { baseUrl: NATIVE_URL, api: STUB_API },
 };
 
-// Point the extension's module-level paths at a throwaway agent dir with NO config file.
-const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-starter-"));
-process.env.PI_CODING_AGENT_DIR = agentDir;
-const writeModels = (providers: Record<string, any>) => writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers }));
-writeModels(BASE_PROVIDERS);
-const configPath = join(agentDir, "llm-queue.json");
+const LOCAL_MODEL = { api: STUB_API, baseUrl: LOCAL_URL, provider: "strata", id: "m" };
+// The built-in llama-style provider: native-owned endpoints must stay out of the starter.
+const nativeOwned = (name: string) => (name === "native" ? { name } : undefined);
 
-const { default: extension } = await import("../src/extension.ts");
+const startExt = (options: { config?: Record<string, any> | null; configText?: string; models?: Record<string, any>; nativeOwned?: (name: string) => unknown } = {}) =>
+	startExtension({ daemon: false, nativeOwned, models: BASE_PROVIDERS, ...options });
 
-function makePi() {
-	const handlers: Record<string, ((e: any, ctx: any) => void)[]> = {};
-	const registered: Record<string, any> = {};
-	return {
-		handlers,
-		registered,
-		on: (event: string, handler: (e: any, ctx: any) => void) => (handlers[event] ??= []).push(handler),
-		registerProvider: (name: string, config: any) => (registered[name] = config),
-		unregisterProvider: (name: string) => delete registered[name],
-		registerCommand: () => {},
-	};
-}
-
-const makeCtx = (notifies: string[]) => ({
-	sessionManager: { getSessionId: () => "STARTER" },
-	model: { api: STUB_API, baseUrl: LOCAL_URL, provider: "strata", id: "m" },
-	signal: undefined,
-	// The built-in llama-style provider: native-owned endpoints must stay out of the starter.
-	modelRegistry: { getRegisteredNativeProvider: (name: string) => (name === "native" ? { name } : undefined) },
-	ui: { notify: (message: string) => notifies.push(message), setStatus: () => {} },
-});
-
-const startSession = (pi: any, notifies: string[]) => pi.handlers["session_start"].forEach((h: any) => h({}, makeCtx(notifies)));
-
-// The daemon seam for a reconciled key: the daemon creates a queue on the first acquire, so
-// "`/queue` shows the queue" is proved by driving one acquire and reading `status` back.
-const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
-const socketPath = join(agentDir, "llm-queue.sock");
-const daemons: ChildProcess[] = [];
-
-/** A daemon serving the agent dir's config — the very file reconcile just wrote. */
-const serveConfig = async () => {
-	const proc = spawn(process.execPath, [DAEMON, "--socket", socketPath, "--config", configPath, "--models-json", join(agentDir, "models.json")], { stdio: "ignore" });
-	proc.unref();
-	daemons.push(proc);
-	await waitForDaemon(socketPath);
-};
+const messages = (session: ReturnType<ReturnType<typeof startExtension>["startSession"]>) => session.notifications().map((n) => n.message);
 
 after(() => {
-	for (const proc of daemons) proc.kill();
 	closeAllClients();
-	stopAllDaemons();
+	disposeAllExtensions();
 });
 
 describe("starter config on first launch", () => {
 	it("creates the config once, notifies, and queues the self-hosted providers in the same session", () => {
-		const pi = makePi();
-		const notifies: string[] = [];
-		extension(pi as any);
-		assert.equal(existsSync(configPath), false, "importing the extension must not write the config");
+		const ext = startExt({ config: null });
+		assert.equal(ext.readConfig(), null, "importing the extension must not write the config");
 
-		startSession(pi, notifies);
+		const session = ext.startSession("STARTER", { model: LOCAL_MODEL });
+		const notes = messages(session);
 
-		const written = JSON.parse(readFileSync(configPath, "utf8"));
+		const written = JSON.parse(ext.readConfig()!);
 		assert.deepEqual(written, {
 			schemaVersion: 1,
 			// The parent queue-wait cap is the only defaults field a fresh install gets: a stuck queue
@@ -92,58 +48,52 @@ describe("starter config on first launch", () => {
 			defaults: { queueTimeoutMs: 120000 },
 			queues: { [LOCAL_URL]: { enabled: true }, [CLOUD_URL]: { enabled: false } },
 		});
-		assert.equal(notifies.filter((m) => m.includes(configPath)).length, 1, "one notify naming the created file");
-		assert.ok(notifies[0].includes("1 self-hosted"), `notify names the enabled endpoint count: ${notifies[0]}`);
-		assert.deepEqual(Object.keys(pi.registered).sort(), ["extra", "strata"], "providers on the self-hosted endpoint are wrapped");
-		assert.equal(pi.registered["native"], undefined, "native-owned endpoint is excluded");
-		assert.equal(pi.registered["openai"], undefined, "cloud endpoint stays passthrough");
+		assert.equal(notes.filter((message) => message.includes(ext.configPath)).length, 1, "one notify naming the created file");
+		assert.ok(notes[0].includes("1 self-hosted"), `notify names the enabled endpoint count: ${notes[0]}`);
+		assert.deepEqual(Object.keys(ext.providers()).sort(), ["extra", "strata"], "providers on the self-hosted endpoint are wrapped");
+		assert.equal(ext.providers()["native"], undefined, "native-owned endpoint is excluded");
+		assert.equal(ext.providers()["openai"], undefined, "cloud endpoint stays passthrough");
 	});
 
 	it("leaves an existing config untouched and stays quiet", () => {
 		const handWritten = JSON.stringify({ schemaVersion: 1, queues: { strata: { maxStreams: 4 } } });
-		writeFileSync(configPath, handWritten);
-		const pi = makePi();
-		const notifies: string[] = [];
+		const ext = startExt({ configText: handWritten });
 
-		extension(pi as any);
-		startSession(pi, notifies);
+		const session = ext.startSession("STARTER", { model: LOCAL_MODEL });
 
-		assert.equal(readFileSync(configPath, "utf8"), handWritten, "a hand-tuned config is never overwritten");
-		assert.deepEqual(notifies, [], "an established setup gets no starter notify");
+		assert.equal(ext.readConfig(), handWritten, "a hand-tuned config is never overwritten");
+		assert.deepEqual(messages(session), [], "an established setup gets no starter notify");
 	});
 });
 
 describe("reconcile of an existing config on session start", () => {
 	/** One session_start against a hand-written config: the file it left behind and the notifies. */
 	const sessionAgainst = (existing: string, providers: Record<string, any> = BASE_PROVIDERS) => {
-		writeModels(providers);
-		writeFileSync(configPath, existing);
-		const pi = makePi();
-		const notifies: string[] = [];
-		extension(pi as any);
-		startSession(pi, notifies);
-		return { pi, notifies, added: notifies.filter((m) => m.includes("added")), written: readFileSync(configPath, "utf8") };
+		const ext = startExt({ configText: existing, models: providers });
+		const session = ext.startSession("STARTER", { model: LOCAL_MODEL });
+		const notes = messages(session);
+		return { ext, session, notes, added: notes.filter((message) => message.includes("added")), written: ext.readConfig()! };
 	};
 
 	it("adds a self-hosted endpoint that has no Queue key, and wraps it in the same session", () => {
-		const { pi, added, written } = sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [CLOUD_URL]: { enabled: false } } }));
+		const { ext, added, written } = sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [CLOUD_URL]: { enabled: false } } }));
 
 		assert.deepEqual(JSON.parse(written), {
 			schemaVersion: 1,
 			// Add-only: a file the user authored gains the missing Queue key and no `defaults` block.
 			queues: { [CLOUD_URL]: { enabled: false }, [LOCAL_URL]: { enabled: true } },
 		});
-		assert.deepEqual(Object.keys(pi.registered).sort(), ["extra", "strata"], "the reconciled endpoint is wrapped without a pi restart");
+		assert.deepEqual(Object.keys(ext.providers()).sort(), ["extra", "strata"], "the reconciled endpoint is wrapped without a pi restart");
 		assert.equal(added.length, 1, `one notify naming the added endpoint: ${JSON.stringify(added)}`);
-		assert.ok(added[0].includes(LOCAL_URL) && added[0].includes(configPath), `the notify names the endpoint and the file: ${added[0]}`);
+		assert.ok(added[0].includes(LOCAL_URL) && added[0].includes(ext.configPath), `the notify names the endpoint and the file: ${added[0]}`);
 	});
 
 	// #46 box 2: "`/queue` shows the queue". A queue exists at the daemon only after its first
 	// acquire, so the reconciled key has to be driven once before status can name it.
 	it("queues the added key at the daemon: one acquire makes it visible in status", async () => {
-		sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [CLOUD_URL]: { enabled: false } } }));
-		await serveConfig();
-		const client = await connectClient(socketPath);
+		const { ext } = sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: { [CLOUD_URL]: { enabled: false } } }));
+		await ext.serve();
+		const client = await ext.connect();
 
 		client.send({ op: "acquire", queueKey: LOCAL_URL, sessionKey: "S", role: "parent", activity: true });
 		assert.deepEqual(await client.next(3000), { op: "granted", queueKey: LOCAL_URL, sessionKey: "S" }, "the added key is a queue the daemon grants");
@@ -176,7 +126,7 @@ describe("reconcile of an existing config on session start", () => {
 				[LOCAL_URL_3]: { maxStreams: 4, policy: "fifo", leaseTtlMs: 5000, idleYieldMs: 0, match: ["tuned"] },
 			},
 		};
-		const { pi, added, written } = sessionAgainst(JSON.stringify(existing), {
+		const { ext, added, written } = sessionAgainst(JSON.stringify(existing), {
 			...BASE_PROVIDERS,
 			second: { baseUrl: LOCAL_URL_2, api: STUB_API },
 			tuned: { baseUrl: LOCAL_URL_3, api: STUB_API },
@@ -194,7 +144,7 @@ describe("reconcile of an existing config on session start", () => {
 			added[0].includes(LOCAL_URL) && !added[0].includes(LOCAL_URL_2) && !added[0].includes(LOCAL_URL_3),
 			`the notify names the endpoint it added and nothing that already existed: ${added[0]}`,
 		);
-		assert.deepEqual(Object.keys(pi.registered).sort(), ["extra", "strata", "tuned"], "the added endpoint is wrapped; the disabled one is not");
+		assert.deepEqual(Object.keys(ext.providers()).sort(), ["extra", "strata", "tuned"], "the added endpoint is wrapped; the disabled one is not");
 	});
 
 	// #46 box 4: "byte-for-byte unchanged for those keys". The reconcile write is
