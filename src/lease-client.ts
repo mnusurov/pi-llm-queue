@@ -156,14 +156,32 @@ export class LeaseClient {
 				// connection-wide, so it only refreshes the leases still on this socket; a session's
 				// lease leaves the socket the moment it releases (shutdown/abort/settle), so a dead
 				// session can never be kept alive past its TTL as a zombie (#53 defect 4).
-				this.heartbeat ??= setInterval(() => this.send({ op: "renew" }), this.paths.heartbeatMs ?? 10000);
-				this.heartbeat.unref();
+				if (!this.heartbeat) this.armHeartbeat();
 				return true;
 			} catch {
 				await sleep(50);
 			}
 		}
 		return false;
+	}
+
+	private armHeartbeat(): void {
+		this.heartbeat = setInterval(() => this.send({ op: "renew" }), this.paths.heartbeatMs ?? 10000);
+		this.heartbeat.unref();
+	}
+
+	/**
+	 * Re-arm the connection-wide heartbeat at a new period (#81). The extension passes the smallest
+	 * per-queue keyed beat so a bare renew alone keeps every lease alive under that queue's TTL;
+	 * called on config hot-reload, which is why a live timer must be restarted, not left in place.
+	 */
+	setHeartbeatMs(ms: number): void {
+		if (!Number.isFinite(ms) || ms <= 0) return;
+		this.paths.heartbeatMs = ms;
+		if (this.heartbeat) {
+			clearInterval(this.heartbeat);
+			this.armHeartbeat();
+		}
 	}
 
 	private send(msg: unknown): void {

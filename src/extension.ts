@@ -13,8 +13,8 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role, type AcquireReason, type StatusSession } from "./lease-client.ts";
-import { loadValidConfig, DEFAULTS, heartbeatMs, SCHEMA_VERSION } from "./config.js";
-import { addressModel, keyAddressesEndpoint, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
+import { loadValidConfig, DEFAULTS, keyedBeatMs, SCHEMA_VERSION } from "./config.js";
+import { addressEndpoint, addressModel, keyAddressesEndpoint, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "llm-queue.json");
@@ -38,6 +38,10 @@ const DEFAULT_BLOCKING_TOOLS = ["subagent", "subagent_wait", "bg_wait", "ask_use
 interface QueueEntry {
 	maxStreams?: number;
 	enabled?: boolean;
+	/** Per-queue lease TTL: the daemon honours it, so the client's beats must too. */
+	leaseTtlMs?: number;
+	/** Per-queue idle-yield window: the client must beat at most half of it. */
+	idleYieldMs?: number;
 	/** BaseUrls and/or provider names that share this queue (overrides baseUrl keying). */
 	match?: string[];
 }
@@ -130,15 +134,32 @@ export default function (pi: ExtensionAPI) {
 	let config = loaded.config;
 	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
-	// Heartbeat at a third of the lease TTL: a live session never loses its slot (config.js heartbeatMs).
-	const beatMs = heartbeatMs(config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs);
+
+	// The beat period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved exactly
+	// as the daemon does (entry field → defaults field → DEFAULTS). Deriving it from `defaults` alone
+	// lets a per-queue TTL lapse or a short idle window yield an actively beating Holder (#81).
+	const queueBeatMs = (queueKey: string): number => {
+		const entry = addressEndpoint(queueKey, queues, modelsJson).entry as QueueEntry | undefined;
+		const ttl = entry?.leaseTtlMs ?? config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs;
+		const idleYield = entry?.idleYieldMs ?? config.defaults?.idleYieldMs ?? DEFAULTS.idleYieldMs;
+		return keyedBeatMs(ttl, idleYield);
+	};
+	// The connection-wide bare renew refreshes every lease on the socket: it must run at the
+	// smallest period any live lease could need, so it also covers a queue the defaults under-serve.
+	const smallestBeatMs = (): number => {
+		let min = Infinity;
+		for (const [key, entry] of Object.entries(queues)) if (entry?.enabled !== false) min = Math.min(min, queueBeatMs(key));
+		return Number.isFinite(min)
+			? min
+			: keyedBeatMs(config.defaults?.leaseTtlMs ?? DEFAULTS.leaseTtlMs, config.defaults?.idleYieldMs ?? DEFAULTS.idleYieldMs);
+	};
 
 	const lease = new LeaseClient({
 		socketPath: SOCKET_PATH,
 		daemonPath: DAEMON_PATH,
 		configPath: CONFIG_PATH,
 		modelsJsonPath: MODELS_JSON_PATH,
-		heartbeatMs: beatMs,
+		heartbeatMs: smallestBeatMs(),
 		failOpen: config.defaults?.failOpen,
 		queueTimeoutMs: config.defaults?.queueTimeoutMs,
 	});
@@ -173,16 +194,30 @@ export default function (pi: ExtensionAPI) {
 		private readonly beatTimers = new Map<string, ReturnType<typeof setInterval>>();
 		readonly blockingCalls = new Set<string>();
 
+		private beatNow(queueKey: string) {
+			if (this.blockingCalls.size) return; // parked on an agent/user: silence lets idle-yield fire
+			lease.beat(queueKey, this.sessionKey).then((granted) => {
+				if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
+			}, () => {});
+		}
+
 		startBeat(queueKey: string) {
 			this.stopBeat(queueKey);
-			const timer = setInterval(() => {
-				if (this.blockingCalls.size) return; // parked on an agent/user: silence lets idle-yield fire
-				lease.beat(queueKey, this.sessionKey).then((granted) => {
-					if (!granted) this.stopBeat(queueKey); // the Slot is gone: the next stream re-queues
-				}, () => {});
-			}, beatMs);
+			const timer = setInterval(() => this.beatNow(queueKey), queueBeatMs(queueKey));
 			timer.unref();
 			this.beatTimers.set(queueKey, timer);
+		}
+
+		/**
+		 * Re-arm every live beat at the current config's period (hot-reload, #81). Beat immediately
+		 * first: a shortened idle window applies at the daemon at once, and waiting a full new period
+		 * would let a sweep yield the holder before its first beat under the new policy.
+		 */
+		restartBeats() {
+			for (const queueKey of [...this.beatTimers.keys()]) {
+				this.startBeat(queueKey);
+				this.beatNow(queueKey);
+			}
 		}
 
 		stopBeat(queueKey?: string) {
@@ -264,11 +299,15 @@ export default function (pi: ExtensionAPI) {
 
 		release() {
 			this.cancelPendingRelease();
-			if (this.heldQueueKey) {
-				this.stopBeat(this.heldQueueKey);
-				lease.release(this.heldQueueKey, this.sessionKey);
-				this.heldQueueKey = null;
+			// Every lease this session still holds: the run's held key plus any lone request's
+			// self-queued lease. Stopping only the held key leaks a lease whose beat outlives it (#81).
+			const keys = new Set(this.beatTimers.keys());
+			if (this.heldQueueKey) keys.add(this.heldQueueKey);
+			for (const key of keys) {
+				this.stopBeat(key);
+				lease.release(key, this.sessionKey);
 			}
+			this.heldQueueKey = null;
 			this.blockingCalls.clear(); // a lost tool_execution_end must not silence the beat of later runs
 		}
 	}
@@ -453,9 +492,10 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// Hot-reload: a config edit re-resolves the wrapped provider set (pi applies provider
-	// registration immediately); the daemon reloads the same file for queue policy.
-	// shortcut: leaseTtlMs (client heartbeat period), failOpen and queueTimeoutMs are read once at
-	// connect and take effect only on pi restart; the daemon hot-reloads its own leaseTtlMs.
+	// registration immediately); the daemon reloads the same file for queue policy. The client's
+	// beat periods follow the same edit, and live beats restart under the new period (#81).
+	// shortcut: failOpen and queueTimeoutMs are read once at connect and take effect only on pi
+	// restart; the daemon hot-reloads its own policy.
 	const watchConfig = (ctx: ExtensionContext) => {
 		let debounce: ReturnType<typeof setTimeout> | null = null;
 		// Watch the directory, not the file: an atomic-save editor replaces the file and a
@@ -473,6 +513,8 @@ export default function (pi: ExtensionAPI) {
 				}
 				config = next.config;
 				queues = (config.queues ?? {}) as Record<string, QueueEntry>;
+				lease.setHeartbeatMs(smallestBeatMs());
+				for (const state of sessions.values()) state.restartBeats(); // a live holder is never evicted by a policy edit
 				registerQueuedProviders(ctx);
 				ctx.ui.notify("pi-llm-queue: config reloaded", "info");
 			}, 250);
@@ -568,11 +610,15 @@ export default function (pi: ExtensionAPI) {
 		const state = ensureState(sessionKey);
 		state.cancelPendingRelease(); // a run starting inside the grace window keeps the slot
 		const model = ctx.model;
-		if (!model || !providers.includes(model.provider)) return;
+		const queueKey = model && providers.includes(model.provider) ? addressModel(model, queues, modelsJson).queueKey : null;
+		// A run switching queues inside the grace must release the old lease first: overwriting the
+		// held key leaves the old beat running for the process lifetime and blocks that endpoint
+		// behind a holder that is not running (#81).
+		if (state.heldQueueKey && state.heldQueueKey !== queueKey) state.release();
+		if (!queueKey) return;
 		state.runActive = true; // a stream ending after this must not re-arm the grace; settle will
 		// Attach the abort path before awaiting: Esc while queued must cancel (finding 3).
 		ctx.signal?.addEventListener("abort", () => state.release(), { once: true });
-		const queueKey = addressModel(model, queues, modelsJson).queueKey;
 		const reason = await state.acquire(queueKey, ctx.signal);
 		state.clearQueued();
 		// Only a grant claims a lease: an abort/fail-open must not mark the slot held. A stream that

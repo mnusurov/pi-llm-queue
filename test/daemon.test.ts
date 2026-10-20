@@ -38,6 +38,19 @@ describe("daemon socket protocol", () => {
 		c.close();
 	});
 
+	it("rejects a JSON line that is not an object and keeps serving (#81)", async () => {
+		// A `null` line used to reach the op handler, throw on msg.op, and exit the daemon — dropping
+		// every lease and waiter. The reply proves the parse was rejected; the status proves it lives.
+		const c = await connectClient(d.socketPath);
+		c.send(null);
+		assert.deepEqual(await c.next(3000), { op: "error", reason: "message must be a JSON object" });
+
+		c.send({ op: "status" });
+		const status = await c.next(3000);
+		assert.equal(status.op, "status", "the daemon survives the malformed line and answers the next op");
+		c.close();
+	});
+
 });
 
 // Lease lifecycle: TTL reclaim, heartbeat, and no preemption. The scheduling families moved to

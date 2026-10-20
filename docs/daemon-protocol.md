@@ -44,8 +44,12 @@ tier — with aging anti-starvation: the longest-waiting child jumps the queue o
 ## Leases and session switches
 
 A grant is a **lease** with a TTL (`leaseTtlMs`, default 30 s, minimum 1000 ms). A live client
-keeps its leases alive with a bare `renew` heartbeat (the extension sends one every
-`leaseTtlMs / 3`, floor 250 ms, always under the TTL so a sweep never lands between two beats).
+keeps its leases alive with a bare `renew` heartbeat. Each queue resolves its own policy, and the
+client's keyed activity beat follows it: `leaseTtlMs / 3` (floor 250 ms) and at most
+`idleYieldMs / 2`, so a per-queue TTL never lapses and a live holder is never yielded between
+beats. The connection-wide bare heartbeat uses the smallest period across the configured queues.
+A config hot-reload re-resolves both and restarts live beats, so a policy edit never evicts a
+holder.
 **The TTL is the crash grace**: a client that dies mid-stream stops refreshing, and the daemon
 reclaims its slot when the TTL lapses and grants the next waiter. That is the only reclamation of a
 dead client, and it is bounded — never later than `leaseTtlMs` after the last heartbeat.
@@ -201,8 +205,9 @@ groups — holders and waiters move with their queue, so an endpoint never ends 
 slot sets. A widened `maxStreams` grants waiting sessions at once. The extension watches the
 same file and re-resolves its wrapped provider set (registering new providers, unregistering
 removed ones). A half-written file keeps the last good config. No daemon or pi restart is
-needed; `leaseTtlMs` on the client side (heartbeat period), `failOpen` and `queueTimeoutMs` are
-read once at connect and are the fields that need a pi restart.
+needed; the client's per-queue beat periods follow the edit and live beats restart under the new
+period. `failOpen` and `queueTimeoutMs` are read once at connect and are the fields that need a
+pi restart.
 
 ## Client contract
 
@@ -263,7 +268,7 @@ read once at connect and are the fields that need a pi restart.
 ## Tests
 
 `make test` (`npx tsc --noEmit`, then `node --test test/*.test.ts`) drives these seams and never
-touches a real model endpoint. Every suite, and what it pins — 26 suites, the count `node --test`
+touches a real model endpoint. Every suite, and what it pins — 41 suites, the count `node --test`
 reports, plus one top-level test in `extension-starter-empty.test.ts`:
 
 | file                                   | suites                                                                                                                                                                     |
@@ -279,6 +284,10 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-starter.test.ts`       | starter config on first launch; reconcile of an existing config on session start, the tuned entry's exact text, and the reconciled key as a live queue at the daemon socket                                  |
 | `test/extension-starter-empty.test.ts` | (top-level test) creates no config when every endpoint is cloud or native-owned                                                                                             |
 | `test/extension-bye.test.ts`           | `bye` on `session_shutdown`: the daemon exits with the last session's shutdown while the client process is still alive (#63)                                                 |
+| `test/extension-idle-beat.test.ts`     | run-scoped keyed beat (idle-yield, #57)                                                                                                                                     |
+| `test/extension-per-queue-lease.test.ts` | per-queue lease policy (#81): per-queue TTL, short idle window, hot-reloaded TTL and idle window                                                                            |
+| `test/addressing.test.ts`              | addressModel: the extension's form; addressEndpoint: the daemon's form; queuedProviders: the reverse mapping; readProviders                                                 |
+| `test/scheduler.test.ts`               | lease / TTL (in memory); idle yield (in memory); serialisation (in memory); tier ordering (in memory); aging (in memory); no preemption (in memory); requestedKey echo (in memory); status view (in memory) |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
 `waitForDaemon`, `sleep`, `exited`, `QUEUE_KEY`) plus the `after` cleanup every suite calls (`stopAllDaemons`,

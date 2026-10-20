@@ -115,3 +115,21 @@ Consequences of the amendment:
     says activity truth belongs in the client's beats.
 - The daemon is unchanged: keyed renew refreshes `lastActivityAt`, bare heartbeat refreshes
   only the TTL; the sweep and the `activity` capability flag stand as decided above.
+
+## Amendment (2026-10-20, #81): the beat period follows the queue's policy
+
+Date: 2026-10-20
+
+Status: Accepted (amends the Decision's item 1 and the 2026-10-19 amendment's beat cadence; the
+daemon's item 2 is unchanged).
+
+The `defaults`-only beat period broke the one-slot promise when a queue overrode `leaseTtlMs` or
+`idleYieldMs`: a holder beating for a 30 s TTL lost a queue's 1 s lease, and a 1 s idle window
+yielded an actively beating holder between beats. The client's keyed beat now runs at
+`min(heartbeatMs(the queue's leaseTtlMs), the queue's idleYieldMs / 2)` for the queue it holds
+(`idleYieldMs: 0` imposes no bound), and the connection-wide bare heartbeat runs at the smallest
+such period across the configured queues. A config hot-reload re-resolves both, fires one immediate
+keyed beat, and restarts the timer; the daemon refreshes every carried holder's `lastActivityAt`
+when it rebuilds after a reload, so a shortened idle window cannot yield a holder before its client
+has had a chance to beat under the new policy. At the defaults (30 s / 30 s) the period is still
+10 s — three missed beats.

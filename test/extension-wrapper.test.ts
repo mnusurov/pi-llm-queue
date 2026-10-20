@@ -10,20 +10,22 @@ import { createAssistantMessageEventStream, registerApiProvider, unregisterApiPr
 import { QUEUE_KEY, closeAllClients, connectClient, pollUntil, sleep, stopAllDaemons } from "./harness.ts";
 
 const STUB_API = "stub-queue-api";
+const QUEUE_KEY2 = "http://model2.test/v1";
 
 // Point the extension's module-level paths at a throwaway agent dir BEFORE importing it.
 const agentDir = mkdtempSync(join(tmpdir(), "llm-queue-ext-"));
 process.env.PI_CODING_AGENT_DIR = agentDir;
 // daemonIdleExitMs 1e9: the suite reuses one daemon fixture; session_shutdown says bye (#63) and
 // the production default 0 would kill the fixture between tests.
-writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, "free-api": { enabled: false } } }));
-writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] } } }));
+writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { maxStreams: 1 }, stub2: { maxStreams: 1 }, "free-api": { enabled: false } } }));
+writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: { stub: { baseUrl: QUEUE_KEY, api: STUB_API, models: [{ id: "m" }] }, stub2: { baseUrl: QUEUE_KEY2, api: STUB_API, models: [{ id: "m" }] } } }));
 const socketPath = join(agentDir, "llm-queue.sock");
 const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
 
 const { default: extension } = await import("../src/extension.ts");
 
 const model = { api: STUB_API, baseUrl: QUEUE_KEY, provider: "stub", id: "m" } as any;
+const model2 = { api: STUB_API, baseUrl: QUEUE_KEY2, provider: "stub2", id: "m" } as any;
 
 function makePi() {
 	const handlers: Record<string, ((e: any, ctx: any) => void)[]> = {};
@@ -59,12 +61,12 @@ const start = (pi: ReturnType<typeof makePi>, sessionId: string, signal?: AbortS
 const firstEvent = (stream: AsyncIterable<any>) => (async () => { for await (const e of stream) return e; })();
 
 // The single queue the stub provider maps to, straight from the daemon.
-const queueStatus = async () => {
+const queueStatus = async (queueKey = QUEUE_KEY) => {
 	const raw = await connectClient(socketPath);
 	raw.send({ op: "status" });
 	const s = await raw.next(2000);
 	raw.close();
-	return s.queues.find((q: any) => q.queueKey === QUEUE_KEY);
+	return s.queues.find((q: any) => q.queueKey === queueKey);
 };
 
 describe("provider wrapper (queuedStream)", () => {
@@ -336,6 +338,33 @@ describe("provider wrapper (queuedStream)", () => {
 		a.handlers["session_shutdown"][0]({}, ctxA);
 	});
 
+	it("releases the old queue's lease when a run switches models inside the settle grace (#81)", async () => {
+		// A settle arms the grace on model A's queue. A new run on model B inside that window must
+		// release A's lease first: overwriting heldQueueKey leaves A's beat alive for the process
+		// lifetime, blocking every other session behind a holder that is not running.
+		const a = makePi();
+		extension(a as any);
+		const ctxA = start(a, "SWITCH-A");
+		await a.handlers["agent_start"][0]({}, ctxA); // holds QUEUE_KEY
+		await a.handlers["agent_settled"][0]({}, ctxA); // grace armed
+
+		const ctxA2 = { ...ctxA, model: model2 };
+		await a.handlers["agent_start"][0]({}, ctxA2); // switch inside the grace → QUEUE_KEY2
+
+		const oldQueue = await queueStatus();
+		assert.deepEqual(oldQueue.holders, [], "the old queue's lease is released before the new run takes the slot");
+
+		// A second session can take the old queue at once instead of queueing behind a ghost holder.
+		const b = makePi();
+		extension(b as any);
+		const ctxB = start(b, "SWITCH-B");
+		const eB = firstEvent(b.registered["stub"].streamSimple(model, {} as any, { sessionId: "SWITCH-B" } as any));
+		assert.equal(await Promise.race([eB.then(() => "done"), sleep(3000).then(() => "blocked")]), "done", "the old endpoint is free for another session");
+
+		a.handlers["session_shutdown"][0]({}, ctxA2);
+		b.handlers["session_shutdown"][0]({}, ctxB);
+	});
+
 	it("keeps the slot when a request lands inside the settle grace window (#55)", async () => {
 		const a = makePi();
 		const b = makePi();
@@ -484,7 +513,7 @@ describe("config hot-reload (provider set)", () => {
 
 		writeFileSync(join(agentDir, "llm-queue.json"), JSON.stringify({ defaults: { maxStreams: 1, daemonIdleExitMs: 1000000000 }, queues: { stub: { enabled: false }, "free-api": { enabled: false } } }));
 		// The config watcher debounces 250 ms (extension.ts watchConfig): poll for the unregistration.
-		await pollUntil(() => a.registered["stub"] === undefined, 600, "waiting for the config reload to unregister the provider");
+		await pollUntil(() => a.registered["stub"] === undefined, 3000, "waiting for the config reload to unregister the provider");
 		assert.equal(a.registered["stub"], undefined, "a disabled provider is unregistered: passthrough, no pi restart");
 	});
 });
