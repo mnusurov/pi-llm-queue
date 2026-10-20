@@ -56,12 +56,6 @@ export class Scheduler {
 		);
 	}
 
-	// Re-resolve policy for every live queue (hot-reload). Capacity changes take effect on the next
-	// grant; the adapter calls grantNext after this to hand out any newly-free Slot.
-	applyPolicy() {
-		for (const queue of this.queues.values()) this.applyPolicyTo(queue, this.resolvePolicy(queue.queueKey));
-	}
-
 	queueFor(queueKey) {
 		if (!this.queues.has(queueKey)) this.queues.set(queueKey, this.newQueue(queueKey));
 		return this.queues.get(queueKey);

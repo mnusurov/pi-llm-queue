@@ -2,6 +2,7 @@
 // is unreachable, requests pass through unqueued.
 import { connect, type Socket } from "node:net";
 import { spawn } from "node:child_process";
+import { readJsonLines } from "./socket-lines.js";
 
 export type Role = "parent" | "child";
 
@@ -117,32 +118,13 @@ export class LeaseClient {
 					sock.once("connect", resolve);
 					sock.once("error", reject);
 				});
-				let buffer = "";
-				const decoder = new TextDecoder("utf8");
-				sock.on("data", (chunk) => {
-					// Socket reads are not line-aligned: accumulate partial lines, never parse a fragment.
-					buffer += decoder.decode(chunk as BufferSource, { stream: true });
-					if (buffer.length > 1e5) {
-						sock.destroy(); // a peer that never sends a newline must not grow memory without bound
-						return;
-					}
-					const lines = buffer.split("\n");
-					buffer = lines.pop() ?? "";
-					for (const line of lines) {
-						if (!line.trim()) continue;
-						let msg;
-						try {
-							msg = JSON.parse(line);
-						} catch {
-							continue;
-						}
-						// Deliver by match; a reply with no matching request (e.g. a release "ok")
-						// is dropped, never buffered for a later acquire to consume.
-						const at = this.pending.findIndex((p) => p.match(msg));
-						if (at < 0) continue;
-						const [p] = this.pending.splice(at, 1);
-						p.resolve(msg);
-					}
+				readJsonLines(sock, (msg) => {
+					// Deliver by match; a reply with no matching request (e.g. a release "ok")
+					// is dropped, never buffered for a later acquire to consume.
+					const at = this.pending.findIndex((p) => p.match(msg));
+					if (at < 0) return;
+					const [p] = this.pending.splice(at, 1);
+					p.resolve(msg);
 				});
 				// Daemon died while queued: release every caller to its request (fail-open).
 				sock.on("close", () => {

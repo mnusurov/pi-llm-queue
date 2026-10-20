@@ -159,6 +159,14 @@ describe("reconcile of an existing config on session start", () => {
 		client.close();
 	});
 
+	it("names a self-hosted endpoint once when several providers serve it", () => {
+		const { added, written } = sessionAgainst(JSON.stringify({ schemaVersion: 1, queues: {} }));
+
+		assert.equal(added.length, 1, `one notify for the shared endpoint: ${JSON.stringify(added)}`);
+		assert.equal(added[0].split(LOCAL_URL).length - 1, 1, `the notify names the endpoint exactly once: ${added[0]}`);
+		assert.deepEqual(JSON.parse(written).queues, { [LOCAL_URL]: { enabled: true } }, "the shared endpoint is one queue key");
+	});
+
 	it("adds only the missing self-hosted key, leaving tuned entries, an explicit false, defaults, cloud and native alone", () => {
 		const existing = {
 			schemaVersion: 1,
