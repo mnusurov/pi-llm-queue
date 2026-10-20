@@ -127,6 +127,20 @@ waiting, so `/queue` never reports a ghost Holder, and — when Waiters are pres
 from a Holder whose Beat has gone silent past `idleYieldMs` (ADR 0003).
 _Avoid_: GC, reaper
 
+### Extension and daemon
+
+**Extension**:
+The pi-facing half of the system: it registers the queued providers and the `/queue` command, and
+turns pi events into Lease operations. One pi process loads one Extension and may hold several
+sessions; the Extension holds no slot itself.
+_Avoid_: adapter, plugin, addon
+
+**Adapter**:
+The daemon's edge: it turns Scheduler decisions into socket replies and event-log lines, and
+protocol messages into Scheduler calls (ADR 0004). The in-memory test driver is the Adapter's
+second implementation.
+_Avoid_: extension, handler
+
 ### Roles and config
 
 **Parent**:
