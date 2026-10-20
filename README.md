@@ -141,8 +141,8 @@ was granted with until it releases the Slot.
 
 - **Tests are stub-only.** `make test` (typecheck + `node --test`) drives the daemon socket seam
   and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint.
-  41 suites, the count `node --test` reports, plus one top-level test in
-  `extension-starter-empty.test.ts`; `test/harness.ts` is the daemon socket seam, not a suite. The
+  47 suites, the count `node --test` reports, plus one top-level test in
+  `starter-config.test.ts`; `test/harness.ts` is the daemon socket seam, not a suite. The
   per-suite list is in [docs/daemon-protocol.md](docs/daemon-protocol.md#tests).
   `make e2e` is the human-run tracer bullet (two real pi sessions against a stub endpoint).
   Real cache-warmth validation against llama.cpp is done (#10).
