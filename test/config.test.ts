@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, loadValidConfig, validateConfig } from "../src/config.js";
+import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, keyedBeatMs, loadValidConfig, validateConfig } from "../src/config.js";
 
 describe("config schema validation", () => {
 	it("accepts a full valid config", () => {
@@ -157,6 +157,13 @@ describe("policy defaults table", () => {
 		// two beats would evict a healthy holder; the floor keeps the period under it.
 		assert.equal(heartbeatMs(1000), 333);
 		assert.equal(heartbeatMs(750), 250);
+	});
+
+	it("bounds a queue's keyed beat by its own TTL and idle-yield window (#81)", () => {
+		assert.equal(keyedBeatMs(1000, 30000), 333, "a short per-queue TTL governs the beat");
+		assert.equal(keyedBeatMs(30000, 1000), 500, "a short idle window needs a beat at half of it");
+		assert.equal(keyedBeatMs(30000, 0), 10000, "disabled idle-yield imposes no bound");
+		assert.equal(keyedBeatMs(30000, 30000), 10000, "the TTL beat is already tighter than idle/2");
 	});
 });
 

@@ -296,6 +296,12 @@ const server = createServer((conn) => {
 				send(conn, { op: "error", reason: "invalid json" });
 				continue;
 			}
+			// Any JSON value parses: only an object can be a message. A `null` line reaching the op
+			// handler used to throw on msg.op and exit the daemon, dropping every lease and waiter.
+			if (typeof msg !== "object" || msg === null || Array.isArray(msg)) {
+				send(conn, { op: "error", reason: "message must be a JSON object" });
+				continue;
+			}
 			handle(msg, conn);
 		}
 	});
@@ -361,6 +367,9 @@ process.on("SIGTERM", () => {
 // This stays adapter-side (ADR 0004 consequence): it repairs the queue-key references the
 // connection records carry, which asks addressing.js for each live queue's remap target.
 function rebuildQueues() {
+	// One clock stamp per reload: every grant this rebuild makes, and every carried holder's
+	// activity refresh, uses this single value.
+	const now = Date.now();
 	const rebuilt = new Map();
 	for (const [key, queue] of scheduler.queues) {
 		const target = groupFor(key);
@@ -372,6 +381,10 @@ function rebuildQueues() {
 		moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
 		for (const lease of queue.holders) {
 			lease.queueKey = target;
+			// A policy edit starts every carried holder's activity clock afresh: a shortened
+			// idleYieldMs must not yield a live holder before its client has had a chance to beat
+			// under the new window (#81).
+			lease.lastActivityAt = now;
 			moved.holders.push(lease);
 		}
 		for (const waiter of queue.waiting) {
@@ -381,8 +394,6 @@ function rebuildQueues() {
 	}
 	scheduler.queues.clear();
 	for (const [key, queue] of rebuilt) scheduler.queues.set(key, queue);
-	// One clock stamp per reload: every grant this rebuild makes uses this single value.
-	const now = Date.now();
 	const decisions = [];
 	for (const queue of scheduler.queues.values()) scheduler.grantNext(queue, now, decisions);
 	emit(decisions);
