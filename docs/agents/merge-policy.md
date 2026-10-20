@@ -1,0 +1,22 @@
+# Merge policy: branch recipes
+
+The repo settings are the source of truth for the policy itself — read them, don't restate them:
+
+    gh api repos/mnusurov/pi-llm-queue \
+      --jq '{allow_squash_merge,allow_merge_commit,allow_rebase_merge,delete_branch_on_merge}'
+
+The head branch is auto-deleted on merge, so `gh pr merge --delete-branch` is redundant.
+
+## Work committed on local `main` moves to a branch
+
+    git switch -c <branch> && git push -u origin <branch>
+    git branch -f main origin/main
+
+## Deleting the merged branch
+
+    git checkout main && git pull --prune
+    git branch -D <branch>
+
+Squash rewrites history, so the merged branch is never an ancestor of `main`: `git branch -d`
+refuses, `-D` is the delete that works. Done when `git branch --list <branch>` and
+`git branch --list -r <branch>` are both empty.
