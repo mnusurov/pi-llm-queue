@@ -278,9 +278,10 @@ periods follow the edit and live beats restart under the new period. `failOpen` 
 
 ## Tests
 
-`make test` (`npx tsc --noEmit`, then `node --test test/*.test.ts`) drives these seams and never
-touches a real model endpoint. Every suite, and what it pins — 47 suites, the count `node --test`
-reports, plus one top-level test in `starter-config.test.ts`:
+`make test` (`npx tsc --noEmit`, then the public-export contract check, then `node --test
+test/*.test.ts`) drives these seams and never touches a real model endpoint. Every suite, and what
+it pins — 47 suites, the count `node --test` reports, plus one top-level test in
+`starter-config.test.ts`:
 
 | file                                   | suites                                                                                                                                                                     |
 | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

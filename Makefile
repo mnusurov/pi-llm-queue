@@ -1,9 +1,13 @@
-.PHONY: test typecheck e2e
+.PHONY: test typecheck check e2e
 
 typecheck:
 	npx tsc --noEmit
 
-test: typecheck
+# The guardrail: typecheck plus the public-export contract check.
+check: typecheck
+	node scripts/check-jsdoc.mjs
+
+test: check
 	node --test test/*.test.ts
 
 # Human-run tracer bullet: spawns real pi sessions against a stub endpoint.

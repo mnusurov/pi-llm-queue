@@ -4,6 +4,11 @@
 // is refused for files under node_modules, so a .ts import would kill an installed daemon.
 import { readFileSync } from "node:fs";
 
+/**
+ * The config schema version this build writes. A file declaring a higher version is refused:
+ * validateConfig names it and loadValidConfig falls back to DEFAULTS. A lower or absent version
+ * is read as it stands.
+ */
 export const SCHEMA_VERSION = 1;
 
 /**

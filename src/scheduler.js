@@ -17,6 +17,15 @@
 //   evict   — a TTL reclaim: log "evict" with reason "ttl".
 // A direct grant into a free Slot is a Grant, not a Switch (protocol-facts), so it emits no switch.
 
+/**
+ * The daemon's deciding part (ADR 0004): it owns the Queues, the Lease records and the waiting
+ * list, and it answers who holds, who waits and when a Switch happens. It performs no side
+ * effect — every entry that decides takes `now` and returns the decisions the adapter must emit,
+ * in order.
+ *
+ * A Queue's Policy arrives through the resolver the adapter supplies; a queue key the resolver
+ * cannot resolve is the adapter's error, not a state the Scheduler recovers from.
+ */
 export class Scheduler {
 	// resolvePolicy(queueKey) -> { maxStreams, ttlMs, agingAfterSlots, agingAfterMs, policy, idleYieldMs }
 	// (plain resolved values; the adapter gets them from config.js resolveQueuePolicy, the one

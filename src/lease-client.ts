@@ -5,10 +5,22 @@ import { spawn } from "node:child_process";
 import { readJsonLines } from "./socket-lines.js";
 import type { AcquireVerdict, BeatVerdict } from "./lease-verdict.ts";
 
+/**
+ * The client-side name of a session's Tier: `parent` (an interactive session) or `child` (a
+ * subagent). It travels as the `role` wire field — on an acquire and on a re-tier — and the
+ * Scheduler orders the waiting list by it.
+ */
 export type Role = "parent" | "child";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Where the daemon lives and how the client behaves: the socket path, the daemon entry to
+ * autostart, the config and models files it reads, plus the client's own periods and policies.
+ *
+ * A path that does not exist is the caller's error: ensureDaemon reports a failed spawn rather
+ * than swallowing it, and a client that cannot reach the socket answers per failOpen.
+ */
 export interface DaemonPaths {
 	socketPath: string;
 	daemonPath?: string;
@@ -44,6 +56,11 @@ export interface StatusSession {
 	group?: string;
 }
 
+/**
+ * One Queue in the status view: its key, its slot limit, how many times the Slot switched hands,
+ * and the Holders and Waiters in it. The Slot limit is null for a passthrough Queue (unlimited
+ * slots, JSON's form of Infinity).
+ */
 export interface StatusQueue {
 	queueKey: string;
 	/** null is JSON's form of Infinity: a passthrough queue has unlimited slots. */
@@ -53,6 +70,7 @@ export interface StatusQueue {
 	waiting: StatusSession[];
 }
 
+/** The daemon's answer to a status request: the view of every Queue it knows. */
 export interface StatusReply {
 	op: "status";
 	queues: StatusQueue[];
@@ -89,6 +107,12 @@ interface Pending {
 	resolve: (msg: DaemonReply) => void;
 }
 
+/**
+ * The per-session Lease client: one socket to the daemon and the verbs the Extension uses to take,
+ * keep and give up a Slot. It decides nothing itself — every verb answers with a Lease verdict
+ * (see src/lease-verdict.ts) or throws DaemonUnreachableError when the daemon is unreachable and
+ * failOpen is false. status() is the exception: it observes, so an unreachable daemon is null.
+ */
 export class LeaseClient {
 	private sock: Socket | null = null;
 	private pending: Pending[] = [];

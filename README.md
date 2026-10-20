@@ -139,8 +139,9 @@ was granted with until it releases the Slot.
 
 ## Dev notes
 
-- **Tests are stub-only.** `make test` (typecheck + `node --test`) drives the daemon socket seam
-  and the thin pi-glue seam with stub endpoints only — it never touches a real model endpoint.
+- **Tests are stub-only.** `make test` (typecheck + the public-export contract check + `node --test`)
+  drives the daemon socket seam and the thin pi-glue seam with stub endpoints only — it never
+  touches a real model endpoint.
   47 suites, the count `node --test` reports, plus one top-level test in
   `starter-config.test.ts`; `test/harness.ts` is the daemon socket seam, not a suite. The
   per-suite list is in [docs/daemon-protocol.md](docs/daemon-protocol.md#tests).

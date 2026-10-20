@@ -35,6 +35,11 @@ export interface UiPort {
 	notify(message: string, level: "info" | "warning" | "error"): void;
 }
 
+/**
+ * What one Run lifecycle needs: the session it belongs to, the injected Lease port, the clock and
+ * the user-visible surface, plus the two per-Queue readings it cannot own — the keyed Beat period
+ * and the live Blocking Tool list, both read on every use so a config hot-reload applies at once.
+ */
 export interface RunLifecycleOptions {
 	sessionKey: string;
 	lease: LeasePort;

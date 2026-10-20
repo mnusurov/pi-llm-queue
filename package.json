@@ -40,6 +40,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "check:jsdoc": "node scripts/check-jsdoc.mjs",
+    "check": "npm run typecheck && npm run check:jsdoc",
     "test": "node --test test/*.test.ts"
   },
   "devDependencies": {

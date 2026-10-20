@@ -15,6 +15,11 @@ Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge
 
 Rules for all code — JS/TS split, test seams, design, comments, errors, and docs: `CODING_STANDARDS.md`.
 
+## Checks
+
+`npm run check` (typecheck + the public-export contract check) and `npm test` (the suite) both run
+in CI on node 22 and 24: `.github/workflows/ci.yml`. Both must be green before a commit.
+
 ## Agent skills
 
 ### Issue tracker

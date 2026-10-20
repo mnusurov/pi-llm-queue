@@ -49,7 +49,8 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
   next line rots as soon as the code moves, and a stale comment is worse than none.
 - Update or delete a comment in the same change that invalidates it.
 - Public exports get JSDoc for the contract callers need — purpose, inputs, and failure modes — not
-  a play-by-play of the implementation.
+  a play-by-play of the implementation. The check (`npm run check:jsdoc`) enforces that the block
+  exists; whether the contract says the right thing is the reviewer's call.
 
 ## Errors and protocol
 
