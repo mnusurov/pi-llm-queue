@@ -6,7 +6,8 @@ warmth on constrained local model servers.
 ## Merge policy
 
 Integration is a PR merged with `gh pr merge --squash`: squash only, and pushing straight to
-`main` is not a path. `gh pr merge` is silent on a pipe: done when
+`main` is not a path — `main` is protected, so a direct push is refused, admins included.
+`gh pr merge` is silent on a pipe: done when
 `gh pr view <n> --json state -q .state` returns `MERGED`.
 
 Branch-off from local `main`, and deleting the merged branch: `docs/agents/merge-policy.md`.
