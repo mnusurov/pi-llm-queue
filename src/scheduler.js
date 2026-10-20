@@ -119,7 +119,7 @@ export class Scheduler {
 		queue.parentGrantStreak = lease.tier === "parent" ? queue.parentGrantStreak + 1 : 0;
 		// The grant carries the requester's `requestedKey` (the key it asked with, opaque to the
 		// Scheduler) so the adapter echoes it per-request: a session queued on two group members gets
-		// each grant keyed by the key that request used, never the other's (protocol:228-232).
+		// each grant keyed by the key that request used, never the other's (protocol: reply matching).
 		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, tier: lease.tier, requestedKey: requester.requestedKey });
 		if (fromWaiting) {
 			// Handing the Slot to a new session is the Switch that re-prefills the KV cache.
@@ -147,7 +147,7 @@ export class Scheduler {
 		tier = tier ?? "parent";
 		const held = this.leaseOf(queue, sessionKey);
 		if (held) {
-			held.expires = now + queue.ttlMs; // re-acquiring a held slot refreshes its TTL
+			held.expires = now + queue.ttlMs;
 			return { granted: true, refreshed: true, decisions: [] };
 		}
 		const decisions = [];
@@ -187,7 +187,6 @@ export class Scheduler {
 		return [];
 	}
 
-	// release: a voluntary return. Removes the Lease and hands the Slot on (grantNext).
 	release(connId, sessionKey, queueKey, now) {
 		const decisions = [];
 		const queue = this.queues.get(queueKey);
@@ -195,7 +194,6 @@ export class Scheduler {
 		return decisions;
 	}
 
-	// cancel: drop a queued request the client aborted; if it was already granted, release the Slot.
 	cancel(connId, sessionKey, queueKey, now) {
 		const decisions = [];
 		const queue = this.queues.get(queueKey);

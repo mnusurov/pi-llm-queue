@@ -131,7 +131,6 @@ describe("daemon event log", () => {
 		acquire(b, "B", "child");
 		await assert.rejects(b.next(200), /no message from daemon within/);
 
-		// A beats no more: the TTL lapses, the sweep evicts it, B is granted.
 		assert.deepEqual(await b.next(3000), granted("B"), "a dead client's slot is reclaimed and handed on");
 		a.send({ op: "status" });
 		// A is gone from the holder list: the evict leaves no ghost holder for /queue to report.
@@ -222,7 +221,6 @@ describe("daemon event log", () => {
 		await assert.rejects(b.next(200), /no message from daemon within/, "B queues behind A");
 		assert.deepEqual(eventLines(first).map((line) => line.event), ["grant", "queued"], "the configured path receives the events of the running queue");
 
-		// move: the same daemon, a new path, no restart
 		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1, logFile: second }, queues: {} }));
 		await sleep(600); // reload debounce
 		release(a, "A");
@@ -230,7 +228,6 @@ describe("daemon event log", () => {
 		assert.deepEqual(eventLines(second).map((line) => line.event), ["release", "grant", "switch"], "after the reload the events land in the moved file");
 		assert.deepEqual(eventLines(first).map((line) => line.event), ["grant", "queued"], "the old file stops receiving events: a move, not a copy");
 
-		// off: unset logFile and the same daemon writes no file at all
 		const c = await open(d);
 		const written = readdirSync(dir).filter((name) => name.endsWith(".jsonl")).sort();
 		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));

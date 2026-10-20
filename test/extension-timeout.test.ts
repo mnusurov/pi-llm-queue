@@ -108,7 +108,6 @@ describe("queueTimeoutMs visible warning", () => {
 			const warning = notices.find(([text, level]) => level === "warning" && text.includes("queueTimeoutMs"));
 			assert.ok(warning, "a visible warning is shown when the queue wait exceeds queueTimeoutMs");
 
-			// Release A: B is granted and streams.
 			a.handlers["session_shutdown"][0]({}, ctxA);
 			const granted = await Promise.race([eB.then((ev) => ev.type), sleep(3000).then(() => "blocked")]);
 			assert.equal(granted, "start", "B is granted and streams once the slot frees");

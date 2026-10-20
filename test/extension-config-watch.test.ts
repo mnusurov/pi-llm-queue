@@ -1,4 +1,4 @@
-// The README install path: "llm-queue.json is optional ... Create it to activate the queue".
+// The README install path: the config file is created for you on first launch.
 // A config created after pi starts must be picked up by the running session (audit finding 4).
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";

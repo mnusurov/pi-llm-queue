@@ -52,7 +52,8 @@ A config hot-reload re-resolves both and restarts live beats, so a policy edit n
 holder.
 **The TTL is the crash grace**: a client that dies mid-stream stops refreshing, and the daemon
 reclaims its slot when the TTL lapses and grants the next waiter. That is the only reclamation of a
-dead client, and it is bounded — never later than `leaseTtlMs` after the last heartbeat.
+dead client, and it is bounded — the sweep evicts it within one sweep interval of `leaseTtlMs`
+after the last heartbeat (`leaseTtlMs + sweepMs`).
 
 The slot is held per session across a whole run, and **a live holder is never preempted**
 (ADR 0002): the queue never switches a streaming holder away. A session switch happens only on:
@@ -106,8 +107,8 @@ because only `status` reports group keys. The position it shows is enqueue order
 
 ## Queues and config
 
-`queueKey` is a provider `baseUrl`. Queues are created on first use from
-`<agent dir>/llm-queue.json`:
+A `queueKey` is an endpoint URL, a provider name, or a group name. Queues are created on first
+use from `<agent dir>/llm-queue.json`:
 
 ```json
 {
@@ -134,9 +135,9 @@ The group/entry addressing rule is one implementation (`addressModel`, `addressE
 Per-queue fields: `maxStreams`, `policy`, `leaseTtlMs` (minimum 1000), `agingAfterSlots`,
 `agingAfterMs`, `idleYieldMs` (all also valid in
 `defaults`), plus `enabled` and `match` (queue entries only — `defaults` never reads them).
-`failOpen` (default `true`) and `queueTimeoutMs`
-are client-side (`defaults` only); `daemonIdleExitMs` (default `0`, exit at once — see
-Idle-exit) and `logFile` (no file
+`failOpen` (default `true`), `queueTimeoutMs` and `blockingTools`
+(the tools that pause the run-scoped beat) are client-side (`defaults` only); `daemonIdleExitMs`
+(default `0`, exit at once — see Idle-exit) and `logFile` (no file
 until you set a path) are daemon-side (`defaults` only). An optional top-level `schemaVersion` (current: 1) must be a positive
 integer; a newer version is rejected with an "upgrade pi-llm-queue" error. Validation
 (`src/config.js`) reports every violation as a path-named error (`queues.zen.maxStreams must
@@ -225,11 +226,13 @@ pi restart.
 - Turn-based affinity: the extension acquires at `agent_start` and releases after the run
   settles, 3 s later (grace, so a parent woken by its child keeps the slot); an abort releases
   a held slot at once and cancels a still-queued request. Requests outside a run (compaction,
-  classifier, nested calls) queue for themselves. Every request the run makes beats its lease, so
-  the slot survives tool executions **while nobody is waiting**: with a waiter queued, a tool pause
-  past `idleYieldMs` is exactly the idle yield (ADR 0003). A beat answered `granted: false`
-  re-queues the run before it streams; the client heartbeats `renew` on a timer so a live session
-  never loses the slot to the TTL.
+  classifier, nested calls) queue for themselves. Every request the run makes beats its lease
+  run-scoped, so a compute-busy holder never goes idle; the beat pauses only while the run is parked
+  in a blocking tool (`subagent`, `subagent_wait`, `bg_wait`, `ask_user`, `contact_supervisor`,
+  `intercom`, configurable via `defaults.blockingTools`), so a parked holder yields the slot to the
+  agent it waits on (ADR 0003). A beat answered `granted: false` re-queues the run before it
+  streams; the client heartbeats `renew` on a timer so a live session never loses the slot to the
+  TTL.
 - Reply matching: a client resolves `acquire` only on a `granted` reply naming its own
   `queueKey`/`sessionKey`; replies with no matching request (e.g. a `release` `ok`) are dropped,
   never buffered for a later request to consume. A request addressed at a group member gets its
@@ -277,7 +280,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/daemon.test.ts`                  | daemon socket protocol; lease lifecycle and no preemption; tier ordering (parent > child) and aging; queue policy resolution; per-endpoint queues, groups and hot-reload; observability: status counters; daemon idle-exit; daemon lifetime: counted clients and status invisibility (#60); config schema validation at the daemon seam; connection framing and buffer bounds; idle-yield under contention |
 | `test/daemon-event-log.test.ts`        | daemon event log — the `logFile` seam: the JSON-lines sequence of a handover, every event's fields, a TTL reclaim as `evict` + `reason: "ttl"`, an idle yield as `release` + `reason: "idle"`, an unwritable path that leaves the daemon serving, the path followed across a hot-reload (on, moved, off), no file when `logFile` is unset |
 | `test/lease-client.test.ts`            | lease client; daemon autostart                                                                                                                                              |
-| `test/extension.test.ts`               | provider resolution; queue key resolution; self-hosted endpoint detection; starter config generation; role resolution                                                       |
+| `test/extension.test.ts`               | self-hosted endpoint detection; starter config generation; role resolution                                                                                                  |
 | `test/extension-wrapper.test.ts`       | provider wrapper (queuedStream); config hot-reload (provider set)                                                                                                           |
 | `test/extension-timeout.test.ts`       | queueTimeoutMs visible warning — a parent warned past the cap stays queued                                                                                                  |
 | `test/extension-config-watch.test.ts`  | config created after startup                                                                                                                                                |
@@ -286,7 +289,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 | `test/extension-bye.test.ts`           | `bye` on `session_shutdown`: the daemon exits with the last session's shutdown while the client process is still alive (#63)                                                 |
 | `test/extension-idle-beat.test.ts`     | run-scoped keyed beat (idle-yield, #57)                                                                                                                                     |
 | `test/extension-per-queue-lease.test.ts` | per-queue lease policy (#81): per-queue TTL, short idle window, hot-reloaded TTL and idle window                                                                            |
-| `test/addressing.test.ts`              | addressModel: the extension's form; addressEndpoint: the daemon's form; queuedProviders: the reverse mapping; readProviders                                                 |
+| `test/addressing.test.ts`              | the group rule, entry-ownership rule and provider/queue-key resolution at their own seam: addressModel, addressEndpoint, queuedProviders, readProviders                     |
 | `test/scheduler.test.ts`               | lease / TTL (in memory); idle yield (in memory); serialisation (in memory); tier ordering (in memory); aging (in memory); no preemption (in memory); requestedKey echo (in memory); status view (in memory) |
 
 `test/harness.ts` is not a suite: it is the daemon socket seam (`startDaemon`, `connectClient`,
@@ -295,6 +298,7 @@ reports, plus one top-level test in `extension-starter-empty.test.ts`:
 `daemonIdleExitMs: 1e9` into a config that omits it, so suites that reuse one daemon across
 connection gaps are not exited by the production default of 0 (#60); the lifetime and idle-exit
 suites set the field explicitly. Assertions go through the JSON-line
-protocol and the extension's public seams only, never daemon module internals. `make e2e`
+protocol and the extension's public seams; the Scheduler's decisions are asserted in memory
+(`scheduler.test.ts`). `make e2e`
 (`node scripts/e2e-two-sessions.mjs`) is the human-run tracer bullet: two real pi sessions against
 a stub endpoint, asserting zero request overlap.
