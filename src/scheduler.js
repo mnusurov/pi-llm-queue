@@ -19,7 +19,8 @@
 
 export class Scheduler {
 	// resolvePolicy(queueKey) -> { maxStreams, ttlMs, agingAfterSlots, agingAfterMs, policy, idleYieldMs }
-	// (plain resolved values; the adapter owns the config.js resolution and the defaults fallback).
+	// (plain resolved values; the adapter gets them from config.js resolveQueuePolicy, the one
+	// cascade that owns the defaults fallback).
 	constructor(resolvePolicy) {
 		this.resolvePolicy = resolvePolicy;
 		this.queues = new Map();
