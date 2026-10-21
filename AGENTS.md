@@ -36,6 +36,10 @@ Canonical five-role defaults. See `docs/agents/triage-labels.md`.
 
 Single-context: `GLOSSARY.md` + `docs/adr/` at root (index: `docs/adr/README.md`). See `docs/agents/domain.md`.
 
+### Release
+
+A `v*` tag publishes to npm from CI — no token in the repo. See `docs/agents/release.md`.
+
 ### LLM queue
 
 All LLM access goes through pi-llm-queue: one model slot, serialized. When delegating, run implementers one at a time and set child `timeoutMs` to include queue wait — a long queue wait is normal, not a hang.
