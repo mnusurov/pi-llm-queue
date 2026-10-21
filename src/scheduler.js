@@ -46,6 +46,8 @@ export class Scheduler {
 		queue.maxStreams = policy.maxStreams;
 		// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49 / ADR
 		// 0002), so the slot moves on voluntary release, abort, disconnect, or a TTL lapse alone.
+		// The Queue's TTL may be shorter than a held Lease's: the Lease keeps the TTL it was granted
+		// under — see refreshExpiry (#104).
 		queue.ttlMs = policy.ttlMs;
 		// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after this
 		// many consecutive parent grants, or after waiting this long.
@@ -112,6 +114,10 @@ export class Scheduler {
 			connId: requester.connId,
 			tier: requester.tier,
 			group: requester.group,
+			// The TTL this Lease is held under. It only ever grows: a policy edit never shortens a Lease
+			// that is already held (ADR 0002), so a shortened TTL applies at the next Grant and a
+			// lengthened one applies at once (#104).
+			ttlMs: queue.ttlMs,
 			expires: now + queue.ttlMs,
 			activity: !!requester.activity,
 			lastActivityAt: now,
@@ -151,7 +157,7 @@ export class Scheduler {
 		tier = tier ?? "parent";
 		const held = this.leaseOf(queue, sessionKey);
 		if (held) {
-			held.expires = now + queue.ttlMs;
+			refreshExpiry(held, queue, now);
 			return { granted: true, refreshed: true, decisions: [] };
 		}
 		const decisions = [];
@@ -177,7 +183,7 @@ export class Scheduler {
 		const lease = (this.connLeases.get(connId) ?? []).find((l) => l.sessionKey === sessionKey && l.queueKey === queue.queueKey);
 		const granted = !!lease && this.leaseOf(queue, sessionKey) === lease;
 		if (granted) {
-			lease.expires = now + queue.ttlMs;
+			refreshExpiry(lease, queue, now);
 			lease.lastActivityAt = now;
 		}
 		return { granted, refreshed: granted, decisions: [] };
@@ -187,7 +193,9 @@ export class Scheduler {
 	// lastActivityAt, so a bare heartbeat does not prevent an idle-yield (ADR 0003). Like every Scheduler
 	// entry it returns the decisions to emit; a heartbeat emits none (no log, no reply), so this is empty.
 	heartbeat(connId, now) {
-		for (const lease of this.connLeases.get(connId) ?? []) lease.expires = now + this.queueFor(lease.queueKey).ttlMs;
+		for (const lease of this.connLeases.get(connId) ?? []) {
+			refreshExpiry(lease, this.queueFor(lease.queueKey), now);
+		}
 		return [];
 	}
 
@@ -271,6 +279,13 @@ export class Scheduler {
 		return decisions;
 	}
 
+	// redateLease: a rebuild re-dates a carried Holder's Lease under the Queue's terms. A shortened
+	// TTL leaves the Lease untouched — the Holder keeps the terms it was granted under (ADR 0002) —
+	// and a lengthened one applies at once: the term grows and the expiry follows it (#104).
+	redateLease(queue, lease, now) {
+		if (queue.ttlMs > lease.ttlMs) refreshExpiry(lease, queue, now);
+	}
+
 	// snapshot: the raw queue state for the adapter's `status` view. It returns the live Holder (Lease)
 	// and Waiter records plus the counters the status op needs (maxStreams, switches); it does NOT
 	// build the wire shape. The adapter maps each record to the wire shape (sessionView, maxStreams
@@ -289,4 +304,23 @@ export class Scheduler {
 function remove(list, item) {
 	const at = list.indexOf(item);
 	if (at >= 0) list.splice(at, 1);
+}
+
+// The TTL a Lease is held under, after the Queue's current TTL is taken into account: the longer of
+// the two. A policy edit never shortens a Lease that is already held (ADR 0002) — a shortened TTL
+// applies at the next Grant, a lengthened one applies at once. Without this rule a config edit that
+// shortens the TTL re-dates a live Holder's Lease under the new, shorter TTL, and the Holder — still
+// streaming — loses its Slot to a Waiter (#104).
+//
+// The term only ever grows: a Lease keeps the longest TTL it was ever held under, so a lengthening
+// a later shortening cannot take back.
+function effectiveTtlMs(lease, queue) {
+	return Math.max(lease.ttlMs, queue.ttlMs);
+}
+
+// Refresh a Lease's expiry under the rule: the term grows to the effective TTL and the expiry
+// follows it.
+function refreshExpiry(lease, queue, now) {
+	lease.ttlMs = effectiveTtlMs(lease, queue);
+	lease.expires = now + lease.ttlMs;
 }

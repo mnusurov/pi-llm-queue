@@ -120,6 +120,40 @@ describe("lease lifecycle and no preemption", () => {
 		assert.deepEqual(await b.next(1500), granted("B"), "the waiter is granted on voluntary release");
 	});
 
+	// A config edit that shortens a queue's TTL (#104): the daemon applies the new TTL at once, but
+	// the Extension may still be beating at the old period (its own reload can land late, or never).
+	// The rebuild carries the Lease with the terms it was granted under, so the live Holder keeps its
+	// Slot. The scheduling half of this rule runs in memory in test/scheduler.test.ts; this one pins
+	// the daemon's own path — the config watch, the rebuild and the sweep timer.
+	it("a config edit that shortens the TTL does not take the Slot from a live Holder", async () => {
+		const d = start(6000, 50);
+		const a = await open(d);
+		const b = await open(d);
+
+		acquire(a, "A");
+		assert.deepEqual(await a.next(3000), granted("A"));
+		acquire(b, "B");
+		await assert.rejects(b.next(200), /no message from daemon within/);
+
+		// The edit shortens the TTL and frees a second slot: B's grant is the daemon's own proof that
+		// it reloaded the file.
+		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 2, leaseTtlMs: 1000, daemonIdleExitMs: 1e9 }, queues: {} }));
+		assert.deepEqual(await b.next(5000), granted("B"), "the daemon reloaded the config");
+
+		// The client beats 1.5 s apart — wider than the shortened TTL (1 s), so a client whose own
+		// reload has not landed would lapse here.
+		beat(a, "A");
+		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true });
+
+		await sleep(1500); // past the shortened TTL (1000 ms) and a sweep tick
+		beat(a, "A");
+		assert.deepEqual(
+			await a.next(3000),
+			{ op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: true },
+			"the Holder keeps its Slot: a policy edit never shortens a held Lease",
+		);
+	});
+
 	// The quanta are gone from the schema, so a pre-#49 config carrying them is rejected outright
 	// and the daemon serves defaults: preemption cannot be re-enabled from config. The scheduling half
 	// of this assertion (many beats, no preemption) is a Scheduler property and runs in memory in

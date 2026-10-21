@@ -54,11 +54,45 @@ export class SchedulerHarness {
 	// connId -> decisions routed to that connection (grants/queued carry the connId; release/evict/
 	// switch carry none and are routed to the actor that triggered the entry, or to SYSTEM on a sweep).
 	private byConn = new Map<string, Decision[]>();
+	// The live policy. A config edit swaps it, and the live Queues re-resolve it (the hot-reload).
+	private policy: Policy | ((queueKey: string) => Policy);
 
 	constructor(policy: Policy | ((queueKey: string) => Policy) = {}) {
-		const resolve = typeof policy === "function" ? policy : () => policy;
+		this.policy = policy;
 		this.now = 0;
-		this.scheduler = new Scheduler((queueKey: string) => ({ ...DEFAULTS, ...resolve(queueKey) }));
+		this.scheduler = new Scheduler((queueKey: string) => ({ ...DEFAULTS, ...this.resolve(queueKey) }));
+	}
+
+	// A config edit, in memory: the daemon's hot-reload rebuild, in miniature. Every live Queue is
+	// rebuilt through the new policy and its holders and waiters are carried over, so a Holder keeps
+	// the terms it was granted under and only the Queue's own terms change (#104). The group remap
+	// and the over-capacity log are the daemon's alone — the driver has no groups (#103 moves the
+	// rebuild into the Scheduler).
+	editPolicy(policy: Policy | ((queueKey: string) => Policy)): void {
+		this.policy = policy;
+		const rebuilt = new Map<string, ReturnType<Scheduler["newQueue"]>>();
+		for (const [key, queue] of this.scheduler.queues) {
+			let moved = rebuilt.get(key);
+			if (!moved) rebuilt.set(key, (moved = this.scheduler.newQueue(key)));
+			moved.switches += queue.switches;
+			for (const lease of queue.holders) {
+				lease.queueKey = key;
+				this.scheduler.redateLease(moved, lease, this.now);
+				lease.lastActivityAt = this.now;
+				moved.holders.push(lease);
+			}
+			for (const waiter of queue.waiting) moved.waiting.push(waiter);
+		}
+		this.scheduler.queues.clear();
+		for (const [key, queue] of rebuilt) this.scheduler.queues.set(key, queue);
+		// The rebuild grants whoever the new capacity frees, as the daemon does after its own rebuild.
+		const decisions: Decision[] = [];
+		for (const queue of this.scheduler.queues.values()) this.scheduler.grantNext(queue, this.now, decisions);
+		this.capture(SYSTEM, decisions);
+	}
+
+	private resolve(queueKey: string): Policy {
+		return typeof this.policy === "function" ? this.policy(queueKey) : this.policy;
 	}
 
 	// Register a fake connection; returns its plain id ("c1", "c2", ...).

@@ -87,7 +87,9 @@ _Avoid_: busy, active
 
 **TTL**:
 The lease's expiry horizon: a client that dies mid-stream stops refreshing and the slot is
-reclaimed when the TTL lapses.
+reclaimed when the TTL lapses. A Lease is held under a term that only ever grows — the longer of
+the TTL it was granted under and the Queue's current TTL — so a policy edit that shortens the TTL
+never shortens a Lease that is already held, and a lengthened TTL applies at once (#104).
 _Avoid_: timeout, expiry (as an event)
 
 **Counted client**:

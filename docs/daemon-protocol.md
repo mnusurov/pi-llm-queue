@@ -48,8 +48,11 @@ keeps its leases alive with a bare `renew` heartbeat. Each queue resolves its ow
 client's keyed activity beat follows it: `leaseTtlMs / 3` (floor 250 ms) and at most
 `idleYieldMs / 2`, so a per-queue TTL never lapses and a live holder is never yielded between
 beats. The connection-wide bare heartbeat uses the smallest period across the configured queues.
-A config hot-reload re-resolves both and restarts live beats, so a policy edit never evicts a
-holder.
+A config hot-reload re-resolves both and restarts live beats.
+**A policy edit never shortens a lease that is already held**: the lease keeps the TTL it was granted
+under — the term only ever grows — and every refresh of its expiry uses the longer of that term and
+the queue's current TTL. A shortened TTL therefore applies at the next grant (the holder keeps its
+slot until it releases it), and a lengthened one applies at once (#104).
 **The TTL is the crash grace**: a client that dies mid-stream stops refreshing, and the daemon
 reclaims its slot when the TTL lapses and grants the next waiter. That is the only reclamation of a
 dead client, and it is bounded — the sweep evicts it within one sweep interval of `leaseTtlMs`

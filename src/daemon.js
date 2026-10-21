@@ -392,6 +392,9 @@ function rebuildQueues() {
 		moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
 		for (const lease of queue.holders) {
 			lease.queueKey = target;
+			// The terms are the Scheduler's: a policy edit never shortens a held Lease, and a
+			// lengthened TTL applies at once (#104).
+			scheduler.redateLease(moved, lease, now);
 			// A policy edit starts every carried holder's activity clock afresh: a shortened
 			// idleYieldMs must not yield a live holder before its client has had a chance to beat
 			// under the new window (#81).
