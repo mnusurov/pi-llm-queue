@@ -348,7 +348,8 @@ function rebuildQueues() {
 	// endpoint queues into a narrower group does exactly that). No-preemption means the daemon
 	// cannot take a slot from a live Holder, so it reports the transient over-capacity in the log
 	// instead of exceeding the new limit silently (#82). The counts show how far over the queue is.
-	for (const report of overCapacity) writeEvent(overCapacityLine(report, now));
+	// Each report is stamped when it is written, like every other log line.
+	for (const report of overCapacity) writeEvent(overCapacityLine(report, Date.now()));
 	emitDecisions(decisions);
 }
 

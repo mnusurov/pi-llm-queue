@@ -55,6 +55,49 @@ describe("the event-log line", () => {
 		assert.equal(decisionLogLine({ type: "evict", queueKey: "q", sessionKey: "A", tier: "parent", reason: "ttl" }, 0).reason, "ttl");
 	});
 
+	// One full line per decision kind: the log's vocabulary, asserted once, at its owner.
+	it("writes the full line of a switch", () => {
+		assert.deepEqual(decisionLogLine({ type: "switch", queueKey: "q", sessionKey: "A", tier: "child" }, 0), {
+			event: "switch",
+			queueKey: "q",
+			sessionKey: "A",
+			role: "child",
+			ts: "1970-01-01T00:00:00.000Z",
+		});
+	});
+
+	it("writes the full line of a queued request", () => {
+		assert.deepEqual(decisionLogLine({ type: "queued", connId: "c2", queueKey: "q", sessionKey: "B", tier: "parent" }, 0), {
+			event: "queued",
+			queueKey: "q",
+			sessionKey: "B",
+			role: "parent",
+			ts: "1970-01-01T00:00:00.000Z",
+		});
+	});
+
+	it("writes the full line of a release", () => {
+		assert.deepEqual(decisionLogLine({ type: "release", queueKey: "q", sessionKey: "A", tier: "parent", reason: "idle" }, 0), {
+			event: "release",
+			queueKey: "q",
+			sessionKey: "A",
+			role: "parent",
+			ts: "1970-01-01T00:00:00.000Z",
+			reason: "idle",
+		});
+	});
+
+	it("writes the full line of an evict", () => {
+		assert.deepEqual(decisionLogLine({ type: "evict", queueKey: "q", sessionKey: "A", tier: "parent", reason: "ttl" }, 0), {
+			event: "evict",
+			queueKey: "q",
+			sessionKey: "A",
+			role: "parent",
+			ts: "1970-01-01T00:00:00.000Z",
+			reason: "ttl",
+		});
+	});
+
 	it("carries no reason when the event has none", () => {
 		const line = decisionLogLine({ type: "queued", queueKey: "q", sessionKey: "A", tier: "parent" }, 0);
 		assert.equal("reason" in line, false, "a queued event has no cause to name");

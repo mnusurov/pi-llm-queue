@@ -189,8 +189,7 @@ keeps the last good config.
   detached). Set: the daemon appends one JSON line per queue event, so a finished run can be read
   back from a single file. Every line carries `event`, `queueKey` and `ts` (ISO timestamp); scheduler
   events also carry `sessionKey` and `role`, and an event may carry `reason`. The vocabulary is the
-  scheduler's own, plus one adapter event, and one module owns it and the effects the events
-  become (ADR 0010):
+  scheduler's own, plus one adapter event:
 
   | event     | when                                                                                          |
   | --------- | --------------------------------------------------------------------------------------------- |
