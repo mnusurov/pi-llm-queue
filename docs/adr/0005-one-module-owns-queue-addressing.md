@@ -6,6 +6,8 @@ Date: 2026-10-20
 
 Accepted (spec #77). Structural, not behavioural: the wire protocol, the daemon's replies and every
 queue behaviour are byte-for-byte unchanged. This ADR records where the addressing rule lives.
+Amended 2026-10-21 (#103): the hot-reload Queue rebuild moves into the Scheduler, which asks the
+resolver this module's rule is supplied through; the rule itself stays here.
 
 ## Context
 
@@ -27,9 +29,9 @@ daemon imports it and Node refuses type-stripping under `node_modules`). It owns
 rules in both directions and nothing else. Four structural decisions:
 
 - **Rule, not state.** The module owns the rules — queue key, owning entry, remap target, provider
-  mapping. It never sees Scheduler state: `rebuildQueues` stays in the socket adapter (ADR 0004),
-  asks the module for each live queue's remap target, and migrates holders, waiters and switch
-  counts itself.
+  mapping. It never sees Scheduler state: the hot-reload Queue rebuild lives in the Scheduler
+  (ADR 0004), which asks the resolver the adapter supplies — the module's remap rule — for each
+  live queue's target key, and migrates the holders, waiters and switch counts itself.
 - **Entry, not policy.** `address*()` returns `{ queueKey, entry }` — the raw config entry. The
   daemon's pick-chain (entry field → defaults field → fallback) stays daemon-side; the module only
   feeds it the exported `DEFAULTS`.
@@ -66,6 +68,9 @@ defaults table) and `heartbeatMs(ttlMs)`.
 - The group rule, the entry-ownership rule and the provider mapping exist once. The extension's
   `resolveQueueKey` / `resolveQueueProviders` wrappers are gone; the daemon's `policyFor` /
   `groupFor` closures are calls into the module.
+- The remap rule is the module's, and the migration is the Scheduler's: the daemon's hot-reload path
+  asks the module for the rule, hands it to the Scheduler as a resolver, and the Scheduler applies
+  it to its own Queues (ADR 0004, amendment 2026-10-21 / #103).
 - The defaults table has one spelling. The lease client's `10000` fallback and the daemon's
   idle-exit startup floor stay out of it: they are fallbacks of other layers, not policy defaults.
 - Tests stop baking constants: the rule tests live in `test/addressing.test.ts`, the heartbeat case

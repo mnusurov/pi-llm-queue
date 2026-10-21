@@ -6,6 +6,8 @@
 //
 // Policy is passed in as plain resolved values (the production adapter's job through config.js, the
 // driver's job here): the constructor takes a Policy object or a per-queueKey resolver function.
+// The Queue key a Queue lives under after a config reload is the second resolver the Scheduler
+// takes (#103): the driver answers it too, so the Queue rebuild is reachable in memory.
 import { Scheduler } from "../src/scheduler.js";
 import { DEFAULTS as POLICY_DEFAULTS } from "../src/config.js";
 
@@ -22,6 +24,14 @@ export interface Policy {
 	agingAfterMs?: number;
 	policy?: "priority-aging" | "fifo";
 	idleYieldMs?: number;
+}
+
+// The over-capacity report the Scheduler's Queue rebuild returns: a Queue left with more holders
+// than its new maxStreams allows (no-preemption, #49/#82).
+export interface OverCapacity {
+	queueKey: string;
+	holders: number;
+	maxStreams: number;
 }
 
 export interface Decision {
@@ -59,38 +69,26 @@ export class SchedulerHarness {
 	// The live policy. A config edit swaps it, and the live Queues re-resolve it (the hot-reload).
 	private policy: Policy | ((queueKey: string) => Policy);
 
-	constructor(policy: Policy | ((queueKey: string) => Policy) = {}) {
+	// `resolveQueueKey` is the Addressing rule, in memory: the Queue key a Queue lives under after
+	// a config reload (a group merge, in the daemon's terms). The driver has no groups by default —
+	// a Queue stays under its own key — and a test that exercises a merge passes its own rule.
+	constructor(policy: Policy | ((queueKey: string) => Policy) = {}, resolveQueueKey: (queueKey: string) => string = (queueKey) => queueKey) {
 		this.policy = policy;
 		this.now = 0;
-		this.scheduler = new Scheduler((queueKey: string) => ({ ...DEFAULTS, ...this.resolve(queueKey) }));
+		this.scheduler = new Scheduler(
+			(queueKey: string) => ({ ...DEFAULTS, ...this.resolve(queueKey) }),
+			resolveQueueKey,
+		);
 	}
 
-	// A config edit, in memory: the daemon's hot-reload rebuild, in miniature. Every live Queue is
-	// rebuilt through the new policy and its holders and waiters are carried over, so a Holder keeps
-	// the terms it was granted under and only the Queue's own terms change (#104). The group remap
-	// and the over-capacity log are the daemon's alone — the driver has no groups (#103 moves the
-	// rebuild into the Scheduler).
-	editPolicy(policy: Policy | ((queueKey: string) => Policy)): void {
+	// A config edit, in memory: the daemon's hot-reload, in miniature. The Scheduler owns the Queue
+	// rebuild (#103) — the driver only swaps the policy and hands the Scheduler the clock, and reads
+	// the decisions and the over-capacity report back.
+	editPolicy(policy: Policy | ((queueKey: string) => Policy)): { overCapacity: OverCapacity[] } {
 		this.policy = policy;
-		const rebuilt = new Map<string, ReturnType<Scheduler["newQueue"]>>();
-		for (const [key, queue] of this.scheduler.queues) {
-			let moved = rebuilt.get(key);
-			if (!moved) rebuilt.set(key, (moved = this.scheduler.newQueue(key)));
-			moved.switches += queue.switches;
-			for (const lease of queue.holders) {
-				lease.queueKey = key;
-				this.scheduler.redateLease(moved, lease, this.now);
-				lease.lastActivityAt = this.now;
-				moved.holders.push(lease);
-			}
-			for (const waiter of queue.waiting) moved.waiting.push(waiter);
-		}
-		this.scheduler.queues.clear();
-		for (const [key, queue] of rebuilt) this.scheduler.queues.set(key, queue);
-		// The rebuild grants whoever the new capacity frees, as the daemon does after its own rebuild.
-		const decisions: Decision[] = [];
-		for (const queue of this.scheduler.queues.values()) this.scheduler.grantNext(queue, this.now, decisions);
+		const { decisions, overCapacity } = this.scheduler.rebuildQueues(this.now);
 		this.capture(SYSTEM, decisions);
+		return { overCapacity };
 	}
 
 	private resolve(queueKey: string): Policy {
@@ -181,6 +179,12 @@ export class SchedulerHarness {
 	}
 	holders(queueKey = QUEUE_KEY): string[] {
 		return (this.snapshot().find((q) => q.queueKey === queueKey)?.holders ?? []).map((h: { sessionKey: string }) => h.sessionKey);
+	}
+	waiters(queueKey = QUEUE_KEY): string[] {
+		return (this.snapshot().find((q) => q.queueKey === queueKey)?.waiting ?? []).map((w: { sessionKey: string }) => w.sessionKey);
+	}
+	queueKeys(): string[] {
+		return this.snapshot().map((q) => q.queueKey);
 	}
 	evicts(): Decision[] {
 		return this.decisionsFor(SYSTEM).filter((d) => d.type === "evict");

@@ -81,13 +81,13 @@ function logEvent(event, queueKey, sessionKey, role, reason) {
 // queues into a narrower group does exactly that). No-preemption means the daemon cannot take a
 // slot from a live Holder, so it reports the transient over-capacity in the log instead of
 // exceeding the new limit silently (#82). The counts show how far over the queue is.
-function logOverCapacity(queue) {
+function logOverCapacity(report) {
 	writeEvent({
 		event: "config",
-		queueKey: queue.queueKey,
+		queueKey: report.queueKey,
 		reason: "over-capacity",
-		holders: queue.holders.length,
-		maxStreams: queue.maxStreams,
+		holders: report.holders,
+		maxStreams: report.maxStreams,
 		ts: new Date().toISOString(),
 	});
 }
@@ -150,6 +150,10 @@ function policyFor(key) {
 
 // Explicit resource groups: queues.<name>.match lists baseUrls and/or provider names that
 // share one queue, overriding baseUrl keying so endpoints can be merged or re-slotted.
+//
+// This is also the rule the Scheduler asks where a Queue lives after a config reload: it reads the
+// live `config`, so a hot-reload re-resolves through the new values, and it never sees Scheduler
+// state (ADR 0005, #103).
 function groupFor(key) {
 	return addressEndpoint(key, config.queues ?? {}, modelsJson).queueKey;
 }
@@ -172,7 +176,7 @@ function resolvePolicy(key) {
 	};
 }
 
-const scheduler = new Scheduler(resolvePolicy);
+const scheduler = new Scheduler(resolvePolicy, groupFor);
 
 // The adapter maps a connId (the Scheduler's connection identity) back to the live socket so a
 // `grant` decision can send its reply. The Scheduler never sees a socket object.
@@ -378,47 +382,18 @@ process.on("SIGTERM", () => {
 	process.exit(0);
 });
 
-// Rebuild queues from the reloaded config, carrying holders and waiters with them: adding a
+// Rebuild the Queues from the reloaded config, carrying Holders and Waiters with them: adding a
 // group at runtime must not leave the endpoint's old slot set running beside the group's.
 // shortcut: deleting a group leaves its live queue keyed by the old group name until restart.
-// This stays adapter-side (ADR 0004 consequence): it repairs the queue-key references the
-// connection records carry, which asks addressing.js for each live queue's remap target.
+// The rebuild is the Scheduler's (ADR 0004, #103): the daemon asks Addressing where each Queue
+// lives after the reload, the Scheduler carries the Holders, Waiters and switch counts there, and
+// the adapter emits the decisions and logs the over-capacity report.
 function rebuildQueues() {
 	// One clock stamp per reload: every grant this rebuild makes, and every carried holder's
 	// activity refresh, uses this single value.
 	const now = Date.now();
-	const rebuilt = new Map();
-	for (const [key, queue] of scheduler.queues) {
-		const target = groupFor(key);
-		let moved = rebuilt.get(target);
-		if (!moved) {
-			moved = scheduler.newQueue(target);
-			rebuilt.set(target, moved);
-		}
-		moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
-		for (const lease of queue.holders) {
-			lease.queueKey = target;
-			// The terms are the Scheduler's: a policy edit never shortens a held Lease, and a
-			// lengthened TTL applies at once (#104).
-			scheduler.redateLease(moved, lease, now);
-			// A policy edit starts every carried holder's activity clock afresh: the idle-yield
-			// window a Lease is held under does not change (#105), so the fresh clock is the grace
-			// that keeps a rebuild from yielding a holder on the spot (#81).
-			lease.lastActivityAt = now;
-			moved.holders.push(lease);
-		}
-		for (const waiter of queue.waiting) {
-			waiter.queueKey = target;
-			moved.waiting.push(waiter);
-		}
-	}
-	// No-preemption (#49): the merged queue may start with more holders than its new maxStreams.
-	// Report that transient over-capacity rather than exceed the limit silently (#82).
-	for (const queue of rebuilt.values()) if (queue.holders.length > queue.maxStreams) logOverCapacity(queue);
-	scheduler.queues.clear();
-	for (const [key, queue] of rebuilt) scheduler.queues.set(key, queue);
-	const decisions = [];
-	for (const queue of scheduler.queues.values()) scheduler.grantNext(queue, now, decisions);
+	const { decisions, overCapacity } = scheduler.rebuildQueues(now);
+	for (const report of overCapacity) logOverCapacity(report);
 	emit(decisions);
 }
 
@@ -442,8 +417,8 @@ if (configPath) {
 			}
 			config = next.config;
 			defaults = config.defaults ?? {};
-			// rebuildQueues rebuilds every live queue through scheduler.newQueue (which re-resolves the
-			// new policy); one rebuild, one policy resolution.
+			// The Scheduler's move re-resolves every live Queue's rules (which read the new config through
+			// the resolvePolicy closure); one reload, one move, one policy resolution.
 			rebuildQueues();
 		},
 		onError: (error) => console.error(`pi-llm-queue daemon: config watch failed: ${error.message} — re-arming`),

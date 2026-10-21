@@ -28,7 +28,9 @@ Amended records — read the amendment, not only the original decision:
   2026-10-20 (#81) — the beat period follows the queue's own policy; 2026-10-21 (#105) — the
   idle-yield window is a Lease term, and the beat period follows the terms the Grant carried.
 - **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that
-  batch goes out.
+  batch goes out; amended 2026-10-21 (#103) — the Scheduler owns the hot-reload Queue rebuild.
+- **0005** amended 2026-10-21 (#103) — the remap rule stays with Addressing, the rebuild moves into
+  the Scheduler.
 - **0006** amended 2026-10-21 (#105) — the harness gained `daemonConfig`, so a suite can give the
   daemon a config copy of its own.
 - **0007** amended 2026-10-21 (#105) — the per-Queue Beat period now follows the Lease's terms;
