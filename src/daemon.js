@@ -4,14 +4,15 @@
 //
 // This file is the socket adapter (ADR 0004): framing, the Counted-client count + idle-exit, the
 // Sweep timer, the `status` view, the `requestedKey` echo, config resolution through config.js,
-// queue addressing through addressing.js, and emitting the decisions the Scheduler returns. All
-// scheduling decisions live in src/scheduler.js.
+// queue addressing through addressing.js, and emitting the decisions the Scheduler returns — the
+// mapping itself is the decisions module's (ADR 0010). All scheduling decisions live in
+// src/scheduler.js.
 import { createConnection, createServer } from "node:net";
 import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { loadValidConfig, resolveQueuePolicy } from "./config.js";
 import { watchConfigFile } from "./config-watch.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
-import { termsToWire } from "./lease-terms.js";
+import { emit as emitDecisions, grantedReply, overCapacityLine } from "./decisions.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
 
@@ -68,30 +69,10 @@ function sessionView(entry) {
 // Event log (#47): with `logFile` set, the daemon appends one JSON line per queue event, so a
 // finished run can be read back from one file — the extension spawns the daemon detached and its
 // stderr is discarded. The path is read per event, so a hot-reload can turn the log on, off, or
-// move it. The queue key logged is the queue that owns the slot: a group's name when the client
-// addressed it by a member key. The role comes off the decision, never off the request: `status`
-// reports the same field, so a reader can never see the log and the reply disagree about the tier a
-// session holds. The wall-clock `ts` is stamped here (adapter-side), not in the Scheduler.
-function logEvent(event, queueKey, sessionKey, role, reason) {
-	const line = { event, queueKey, sessionKey, role, ts: new Date().toISOString() };
-	if (reason) line.reason = reason;
-	writeEvent(line);
-}
-
-// A hot-reload can lower a queue's maxStreams below its live holder count (merging two endpoint
-// queues into a narrower group does exactly that). No-preemption means the daemon cannot take a
-// slot from a live Holder, so it reports the transient over-capacity in the log instead of
-// exceeding the new limit silently (#82). The counts show how far over the queue is.
-function logOverCapacity(report) {
-	writeEvent({
-		event: "config",
-		queueKey: report.queueKey,
-		reason: "over-capacity",
-		holders: report.holders,
-		maxStreams: report.maxStreams,
-		ts: new Date().toISOString(),
-	});
-}
+// move it. The line itself is the decisions module's (ADR 0010): the queue key logged is the queue
+// that owns the slot — a group's name when the client addressed it by a member key — and the role
+// comes off the decision, never off the request, so `status` and the log can never disagree about
+// the tier a session holds.
 
 // The event-log sink: with `logFile` set, one JSON line is appended per event. Best effort,
 // swallowed: a bad path, a full disk or a log rotation race must never take the daemon down
@@ -185,8 +166,8 @@ let connSeq = 0;
 const connById = new Map();
 
 // Emit the decisions the Scheduler returned, in order: each maps to a log line and, for a grant, a
-// `granted` reply. The reply echoes the key the client asked with (the `requestedKey` echo is
-// adapter-side; the Scheduler only knows the resolved group key).
+// `granted` reply. The mapping is the decisions module's (ADR 0010) — this adapter supplies the
+// edges: the log sink, the socket and the clock.
 //
 // Two passes, on purpose. A handover is two decisions — the grant and the switch it causes — and
 // the reply belongs to both. One pass would put the `granted` reply out before the `switch` line
@@ -194,41 +175,14 @@ const connById = new Map();
 // reader would see a grant with no switch. Logging the whole batch first keeps the promise the
 // log sink makes — every event a reply caused is on disk before that reply goes out (#47).
 function emit(decisions) {
-	const replies = [];
-	for (const d of decisions) {
-		switch (d.type) {
-			case "grant": {
-				logEvent("grant", d.queueKey, d.sessionKey, d.tier);
-				const conn = connById.get(d.connId);
-				// Echo the key the request asked with (the per-request `requestedKey` the Scheduler
-				// carries on the decision), falling back to the resolved queue key for a direct grant.
-				replies.push([conn, grantedReply(d.requestedKey ?? d.queueKey, d.sessionKey, d.terms)]);
-				break;
-			}
-			case "switch":
-				logEvent("switch", d.queueKey, d.sessionKey, d.tier);
-				break;
-			case "queued":
-				logEvent("queued", d.queueKey, d.sessionKey, d.tier);
-				break;
-			case "release":
-				logEvent("release", d.queueKey, d.sessionKey, d.tier, d.reason);
-				break;
-			case "evict":
-				logEvent("evict", d.queueKey, d.sessionKey, d.tier, d.reason);
-				break;
-		}
-	}
-	for (const [conn, msg] of replies) {
-		if (conn) send(conn, msg);
-	}
-}
-
-// The granted reply: the grant itself, plus the Lease's terms (#105). The client refreshes the
-// Lease on the terms the daemon granted it under, never on its own copy of the config. The wire
-// fields are the terms module's encoding (ADR 0009): the names and their meaning do not change.
-function grantedReply(queueKey, sessionKey, terms) {
-	return { op: "granted", queueKey, sessionKey, ...termsToWire(terms) };
+	emitDecisions(decisions, {
+		write: writeEvent,
+		send: (connId, msg) => {
+			const conn = connById.get(connId);
+			if (conn) send(conn, msg);
+		},
+		now: () => Date.now(),
+	});
 }
 
 function handle(msg, conn) {
@@ -395,7 +349,11 @@ function rebuildQueues() {
 	// activity refresh, uses this single value.
 	const now = Date.now();
 	const { decisions, overCapacity } = scheduler.rebuildQueues(now);
-	for (const report of overCapacity) logOverCapacity(report);
+	// A hot-reload can lower a queue's maxStreams below its live holder count (merging two
+	// endpoint queues into a narrower group does exactly that). No-preemption means the daemon
+	// cannot take a slot from a live Holder, so it reports the transient over-capacity in the log
+	// instead of exceeding the new limit silently (#82). The counts show how far over the queue is.
+	for (const report of overCapacity) writeEvent(overCapacityLine(report, now));
 	emit(decisions);
 }
 

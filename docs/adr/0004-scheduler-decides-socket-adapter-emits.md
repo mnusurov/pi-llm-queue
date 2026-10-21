@@ -122,3 +122,35 @@ references a Queue record any more, so the reference repair the clause protects 
 Structural, not behavioural: the wire protocol, the daemon's replies and every queue behaviour are
 byte-for-byte unchanged. The rebuild becomes reachable in memory, so it is asserted through the
 Scheduler's interface; the socket-level hot-reload suites stay the integration oracle.
+
+## Amendment (2026-10-21, #111): the mapping from a Decision to the wire moves into one module
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's "the socket adapter emits: it maps each decision to a
+reply and a log line" clause; the Scheduler, the decision list and the wire protocol are unchanged).
+
+The Decision gave the mapping to the socket adapter, and the adapter built it inline: a switch on
+the decision's type, a log line built by a second closure, a reply built by a third, and the batch
+order written out in the same file. The in-memory driver — the Adapter's second implementation —
+re-declared the decision's shape by hand and re-implemented the routing rule, so the vocabulary
+lived in two files and the effect mapping had no seam a test could cross: the socket adapter's
+file cannot be imported (it parses `process.argv` at the top level and exits when the socket path
+is missing).
+
+**Amended rule**: one module owns the Decision vocabulary and its effects (ADR 0010). The socket
+adapter supplies the edges — the log file, the socket and the clock — and the module returns the
+lines and the replies.
+
+- The Decision's shape is a typedef in that module. The Scheduler imports it and writes decisions
+  of it; the in-memory driver imports it as a type and drops its hand-written declaration.
+- The `tier` → `role` rename, the `granted` reply, the over-capacity line and the batch order are
+  the module's rules. The adapter no longer builds any of them.
+- The batch-order amendment above stands, and it is now the module's rule: it is asserted
+  deterministically, without a socket and without a filesystem, so the 50-iteration race in the
+  socket suite retires.
+
+Structural, not behavioural: the wire protocol, the daemon's replies and the event log are
+byte-for-byte unchanged. The record's core stands — the Scheduler decides, the Adapter emits — and
+so does the adapter's own surface: the file, the socket, the clock, the `status` view, the
+`requestedKey` echo and the config resolution.
