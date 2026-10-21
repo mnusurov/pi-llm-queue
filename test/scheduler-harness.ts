@@ -1,8 +1,10 @@
 // The second adapter (ADR 0004, spec #65 phase C): a synchronous in-memory driver for the
 // Scheduler. It is a test driver, not a production adapter — it registers fake connections as plain
 // ids, calls Scheduler entries directly with an explicit `now` the test controls, and captures every
-// decision an entry returns into a per-connection list the test reads. No socket, no sleep, no
-// sweep timer, no `--sweep-ms`: the clock is a number and the sweep is a call.
+// decision an entry returns into a per-connection list the test reads. It consumes the decisions
+// module (ADR 0010) for the lines and the replies, so it records the same ones the socket adapter
+// would have written and sent. No socket, no sleep, no sweep timer, no `--sweep-ms`: the clock is a
+// number and the sweep is a call.
 //
 // Policy is passed in as plain resolved values (the production adapter's job through config.js, the
 // driver's job here): the constructor takes a Policy object or a per-queueKey resolver function.
@@ -10,11 +12,14 @@
 // takes (#103): the driver answers it too, so the Queue rebuild is reachable in memory.
 import { Scheduler } from "../src/scheduler.js";
 import { DEFAULTS as POLICY_DEFAULTS } from "../src/config.js";
+import { decisionOwner, emit, grantedReply, overCapacityLine } from "../src/decisions.js";
+import type { Decision, EventLine, OverCapacityReport } from "../src/decisions.js";
 
 export const QUEUE_KEY = "http://model.test/v1";
 export const QUEUE_KEY2 = "http://model.test/v2";
 // The pseudo-connection a sweep's connId-less decisions (a TTL evict, an idle release) route to, so
-// capture() has one routing rule for every entry (the sweep has no triggering actor connection).
+// the module's ownership rule has one destination for every entry (the sweep has no triggering
+// actor connection).
 const SYSTEM = "__system__";
 
 export interface Policy {
@@ -26,25 +31,9 @@ export interface Policy {
 	idleYieldMs?: number;
 }
 
-// The over-capacity report the Scheduler's Queue rebuild returns: a Queue left with more holders
-// than its new maxStreams allows (no-preemption, #49/#82).
-export interface OverCapacity {
-	queueKey: string;
-	holders: number;
-	maxStreams: number;
-}
-
-export interface Decision {
-	type: "grant" | "switch" | "queued" | "release" | "evict";
-	connId?: string;
-	queueKey: string;
-	sessionKey: string;
-	tier: string;
-	requestedKey?: string;
-	reason?: string;
-	/** The Lease's terms (a grant decision carries them). */
-	terms?: { leaseTtlMs: number; idleYieldMs: number };
-}
+// The Decision vocabulary and the over-capacity report are the decisions module's (ADR 0010): this
+// driver consumes them, it does not declare them.
+export type { Decision, OverCapacityReport };
 
 // The daemon's resolved defaults, read from the config.js table (#77) so the constants live in one
 // place; `leaseTtlMs` is the config field name, `ttlMs` the Scheduler's resolved one. A driver with
@@ -66,6 +55,10 @@ export class SchedulerHarness {
 	// connId -> decisions routed to that connection (grants/queued carry the connId; release/evict/
 	// switch carry none and are routed to the actor that triggered the entry, or to SYSTEM on a sweep).
 	private byConn = new Map<string, Decision[]>();
+	// The event-log lines and the replies the module produced for the decisions below — the same
+	// ones the socket adapter would have written and sent (ADR 0010).
+	private eventLines: EventLine[] = [];
+	private sentReplies: { connId: number | string; msg: Record<string, unknown> }[] = [];
 	// The live policy. A config edit swaps it, and the live Queues re-resolve it (the hot-reload).
 	private policy: Policy | ((queueKey: string) => Policy);
 
@@ -84,10 +77,12 @@ export class SchedulerHarness {
 	// A config edit, in memory: the daemon's hot-reload, in miniature. The Scheduler owns the Queue
 	// rebuild (#103) — the driver only swaps the policy and hands the Scheduler the clock, and reads
 	// the decisions and the over-capacity report back.
-	editPolicy(policy: Policy | ((queueKey: string) => Policy)): { overCapacity: OverCapacity[] } {
+	editPolicy(policy: Policy | ((queueKey: string) => Policy)): { overCapacity: OverCapacityReport[] } {
 		this.policy = policy;
 		const { decisions, overCapacity } = this.scheduler.rebuildQueues(this.now);
-		this.capture(SYSTEM, decisions);
+		// The socket adapter reports the over-capacity before it emits the rebuild's decisions.
+		for (const report of overCapacity) this.eventLines.push(overCapacityLine(report, this.now));
+		this.record(decisions, SYSTEM);
 		return { overCapacity };
 	}
 
@@ -114,7 +109,12 @@ export class SchedulerHarness {
 		const queueKey = opts.queueKey ?? QUEUE_KEY;
 		const requestedKey = opts.requestedKey ?? queueKey;
 		const result = this.scheduler.acquire(connId, sessionKey, opts.role, opts.group, opts.activity, queueKey, requestedKey, this.now);
-		this.capture(connId, result.decisions);
+		this.record(result.decisions, connId);
+		// A re-acquire of a held Slot is a TTL refresh: a `granted` reply and no Decision, exactly as
+		// the socket adapter answers it.
+		if (result.refreshed && result.terms) {
+			this.sentReplies.push({ connId, msg: grantedReply(requestedKey, sessionKey, result.terms) });
+		}
 		return result;
 	}
 
@@ -124,19 +124,19 @@ export class SchedulerHarness {
 
 	heartbeat(connId: string): Decision[] {
 		const decisions = this.scheduler.heartbeat(connId, this.now);
-		this.capture(connId, decisions);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
 	release(connId: string, sessionKey: string, queueKey = QUEUE_KEY): Decision[] {
 		const decisions = this.scheduler.release(connId, sessionKey, queueKey, this.now);
-		this.capture(connId, decisions);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
 	cancel(connId: string, sessionKey: string, queueKey = QUEUE_KEY): Decision[] {
 		const decisions = this.scheduler.cancel(connId, sessionKey, queueKey, this.now);
-		this.capture(connId, decisions);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
@@ -146,16 +146,16 @@ export class SchedulerHarness {
 
 	disconnect(connId: string): Decision[] {
 		const decisions = this.scheduler.disconnect(connId, this.now);
-		this.capture(connId, decisions);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
 	// The sweep, run at an explicit instant. Returns every decision it produced; grants/queued are
-	// routed to their connId, evict/release (no connId) land in the SYSTEM bucket via capture.
+	// routed to their connId, evict/release (no connId) land in the SYSTEM bucket via emit.
 	sweepAt(now = this.now): Decision[] {
 		this.now = now;
 		const decisions = this.scheduler.sweepAt(now);
-		this.capture(SYSTEM, decisions);
+		this.record(decisions, SYSTEM);
 		return decisions;
 	}
 
@@ -189,12 +189,28 @@ export class SchedulerHarness {
 	evicts(): Decision[] {
 		return this.decisionsFor(SYSTEM).filter((d) => d.type === "evict");
 	}
+	// The event-log lines the module produced, in the order they were written.
+	lines(): EventLine[] {
+		return [...this.eventLines];
+	}
+	// The replies the module produced, in the order they were sent.
+	replies(): { connId: number | string; msg: Record<string, unknown> }[] {
+		return [...this.sentReplies];
+	}
 
-	private capture(actor: string, decisions: Decision[]): void {
+	// File the decisions by the module's ownership rule (a decision names its connection, or names
+	// none and belongs to the actor that triggered it), and let the module produce the lines and
+	// the replies — the same ones the socket adapter would have written and sent.
+	private record(decisions: Decision[], actor: string): void {
 		for (const d of decisions) {
-			if (d.connId) this.push(d.connId, d);
-			else this.push(actor, d);
+			const owner = decisionOwner(d);
+			this.push(owner === null ? actor : String(owner), d);
 		}
+		emit(decisions, {
+			write: (line) => this.eventLines.push(line),
+			send: (connId, msg) => this.sentReplies.push({ connId, msg: msg as Record<string, unknown> }),
+			now: () => this.now,
+		});
 	}
 
 	private push(connId: string, d: Decision): void {

@@ -92,45 +92,10 @@ describe("daemon event log", () => {
 
 	// The log must not be behind the reply. The sink promises that every event a reply caused is on
 	// disk before that reply goes out, so a reader that opens the file the moment the reply lands
-	// sees the whole story. The window is a race — the peer process can wake on another core while
-	// the daemon is still writing the batch — so the handover repeats: with the promise broken the
-	// reader sees a grant with no switch, with it the file is always complete.
+	// sees the whole story. The promise is the decisions module's now (ADR 0010): the batch order —
+	// every line before any reply — is asserted there, deterministically and without a socket. What
+	// the socket adds is that the lines are on disk at all, so one handover is enough here.
 	it("the whole handover is on disk when the reply lands", async () => {
-		const file = logPath();
-		const d = start({ logFile: file });
-		for (let handover = 1; handover <= 50; handover++) {
-			const a = await open(d);
-			const b = await open(d);
-			const before = eventCount(file);
-
-			acquire(a, "A");
-			assert.deepEqual(await a.next(3000), granted("A"));
-			acquire(b, "B", "child");
-			await waiting(b, "B");
-			release(a, "A");
-			assert.deepEqual(await b.next(3000), granted("B"));
-
-			// The file is read the moment the reply lands — no round trip in between, because the
-			// window between the daemon's reply and its log write is what this pins.
-			// grant A, queued B, release A, grant B, switch B: five events, all of them on disk
-			// before the reply that caused them went out.
-			assert.equal(
-				eventCount(file),
-				before + 5,
-				`handover ${handover}: the log must hold every event of the batch when the reply lands`,
-			);
-
-			// Release B before closing, so the teardown is settled and writes no event of its own:
-			// a connection that closes while holding the Slot releases it, and that release is an
-			// event the next handover would otherwise have to account for.
-			release(b, "B");
-			assert.deepEqual(await b.next(3000), { op: "ok" });
-			a.close();
-			b.close();
-		}
-	});
-
-	it("every event carries the queue key, session key, role and a timestamp", async () => {
 		const file = logPath();
 		const d = start({ logFile: file });
 		const a = await open(d);
@@ -139,19 +104,21 @@ describe("daemon event log", () => {
 		acquire(a, "A");
 		assert.deepEqual(await a.next(3000), granted("A"));
 		acquire(b, "B", "child");
-		await assert.rejects(b.next(200), /no message from daemon within/);
+		await waiting(b, "B");
 		release(a, "A");
 		assert.deepEqual(await b.next(3000), granted("B"));
 
-		const lines = readEvents(file);
-		assert.equal(lines.length, 5, "the handover writes five events");
-		for (const line of lines) {
-			assert.equal(line.queueKey, QUEUE_KEY, "a reader must see which queue the event is about");
-			assert.ok(["A", "B"].includes(line.sessionKey), "a reader must see which session the event is about");
-			assert.ok(["parent", "child"].includes(line.role), "a reader must see the tier the session asked with");
-			assert.ok(!Number.isNaN(Date.parse(line.ts)), `ts must be a parseable timestamp, got ${JSON.stringify(line.ts)}`);
-		}
+		// The file is read the moment the reply lands — no round trip in between, because the
+		// window between the daemon's reply and its log write is what this pins.
+		// grant A, queued B, release A, grant B, switch B: five events, all of them on disk
+		// before the reply that caused them went out.
+		assert.equal(eventCount(file), 5, "the log must hold every event of the batch when the reply lands");
 	});
+
+	// The event log's vocabulary — the field names, the `role` the wire calls the tier, the
+	// timestamp — is the decisions module's, and it is asserted in that module's suite
+	// (test/decisions.test.ts). What is left here is the log's own behaviour: the file, the
+	// events, and the readers that come back for them.
 
 	it("a reader can compute a session's wait time from the file alone", async () => {
 		const file = logPath();

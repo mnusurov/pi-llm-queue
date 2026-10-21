@@ -10,7 +10,7 @@
 // values in via the resolvePolicy callback. The Lease's terms are the terms module's (ADR 0009):
 // this one holds them and asks it for the growth rule, but never writes their shape.
 
-// Decisions the adapter emits, in order:
+// Decisions the adapter emits, in order (the shape is the decisions module's, ADR 0010):
 //   grant   — a session takes the Slot: the adapter logs "grant" and sends the `granted` reply.
 //   switch  — the grant that hands the Slot to a NEW session (came from `waiting`): log + counter.
 //   queued  — an acquire parked as a Waiter: log "queued".
@@ -19,6 +19,14 @@
 // A direct grant into a free Slot is a Grant, not a Switch (protocol-facts), so it emits no switch.
 
 import { growTerms, termsFor } from "./lease-terms.js";
+
+/**
+ * The Decision the Scheduler answers with, and the over-capacity report its Queue rebuild returns:
+ * the shapes are owned by the decisions module (ADR 0010), this one writes them.
+ *
+ * @typedef {import("./decisions.js").Decision} Decision
+ * @typedef {import("./decisions.js").OverCapacityReport} OverCapacityReport
+ */
 
 /**
  * The daemon's deciding part (ADR 0004): it owns the Queues, the Lease records and the waiting
@@ -123,6 +131,9 @@ export class Scheduler {
 	// The single Grant path: the Aging streak is bumped here once, so the direct-grant fast path and
 	// the queued path cannot drift (ADR 0004 consequence). `fromWaiting` is the Switch predicate: a
 	// Switch fires iff the granted session came from `waiting` (a direct grant is not a Switch).
+	/**
+	 * @param {Decision[]} decisions The decisions to append the grant to.
+	 */
 	grantLease(queue, requester, now, fromWaiting, decisions) {
 		const lease = {
 			queueKey: queue.queueKey,
@@ -167,6 +178,10 @@ export class Scheduler {
 		return lease;
 	}
 
+	/**
+	 * @param {Decision[]} [decisions] The decisions to append the grants to.
+	 * @returns {Decision[]} The decisions.
+	 */
 	#grantNext(queue, now, decisions = []) {
 		while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
 			const waiter = this.pickNext(queue, now);
@@ -180,6 +195,9 @@ export class Scheduler {
 	// acquire: re-acquiring a held Slot is a TTL refresh (Grace window: a Parent woken by its Child
 	// keeps the Slot, so the handback costs no Switch and logs nothing). A free Slot is a direct Grant.
 	// Otherwise the request parks as a Waiter. Returns { granted, decisions }.
+	/**
+	 * @returns {{ granted: boolean, refreshed: boolean, decisions: Decision[], terms?: import("./lease-terms.js").LeaseTerms }} The answer and the decisions to emit.
+	 */
 	acquire(connId, sessionKey, tier, group, activity, queueKey, requestedKey, now) {
 		const queue = this.queueFor(queueKey);
 		tier = tier ?? "parent";
@@ -208,6 +226,9 @@ export class Scheduler {
 	// prevents idle-yield), so `refreshed` is true exactly when a live lease's TTL was refreshed here.
 	// granted:false tells the client the Slot is gone and it must re-queue. A beat is a pure query: it
 	// emits no decision (no log line, no reply beyond the granted answer), so `decisions` is always empty.
+	/**
+	 * @returns {{ granted: boolean, refreshed: boolean, decisions: Decision[] }} The answer and the decisions to emit.
+	 */
 	beat(connId, sessionKey, queueKey, now) {
 		const queue = this.queueFor(queueKey);
 		const lease = (this.connLeases.get(connId) ?? []).find((l) => l.sessionKey === sessionKey && l.queueKey === queue.queueKey);
@@ -222,6 +243,9 @@ export class Scheduler {
 	// heartbeat (bare renew): keeps every lease of this connection alive. Refreshes TTL only, NOT
 	// lastActivityAt, so a bare heartbeat does not prevent an idle-yield (ADR 0003). Like every Scheduler
 	// entry it returns the decisions to emit; a heartbeat emits none (no log, no reply), so this is empty.
+	/**
+	 * @returns {Decision[]} The decisions to emit.
+	 */
 	heartbeat(connId, now) {
 		for (const lease of this.connLeases.get(connId) ?? []) {
 			refreshExpiry(lease, this.queueFor(lease.queueKey), now);
@@ -229,6 +253,9 @@ export class Scheduler {
 		return [];
 	}
 
+	/**
+	 * @returns {Decision[]} The decisions to emit.
+	 */
 	release(connId, sessionKey, queueKey, now) {
 		const decisions = [];
 		const queue = this.#queues.get(queueKey);
@@ -236,6 +263,9 @@ export class Scheduler {
 		return decisions;
 	}
 
+	/**
+	 * @returns {Decision[]} The decisions to emit.
+	 */
 	cancel(connId, sessionKey, queueKey, now) {
 		const decisions = [];
 		const queue = this.#queues.get(queueKey);
@@ -266,6 +296,9 @@ export class Scheduler {
 	// request. Replaces the daemon's cleanup/bye. The adapter decrements the Counted-client count AFTER
 	// this returns. Iterate copies: releaseLease splices the conn lease list, and a client can hold
 	// several leases.
+	/**
+	 * @returns {Decision[]} The decisions to emit.
+	 */
 	disconnect(connId, now) {
 		const decisions = [];
 		for (const lease of [...(this.connLeases.get(connId) ?? [])]) this.releaseLease(this.queueFor(lease.queueKey), lease.sessionKey, undefined, now, decisions);
@@ -281,6 +314,9 @@ export class Scheduler {
 	// The single release primitive. The log names the cause: a TTL reclaim is an evict — the only
 	// eviction reason after ADR 0002 — a yield is a release with reason "idle", a voluntary return a
 	// bare release. Then hand the Slot on.
+	/**
+	 * @param {Decision[]} decisions The decisions to append the release to.
+	 */
 	releaseLease(queue, sessionKey, reason, now, decisions) {
 		const lease = this.leaseOf(queue, sessionKey);
 		if (lease) {
@@ -295,6 +331,9 @@ export class Scheduler {
 	// sweepAt: TTL evict (unconditional, so `status` never reports a ghost holder) then idle-yield
 	// (gated on the lease's own window being above zero, Waiters present, and the activity flag —
 	// ADR 0003).
+	/**
+	 * @returns {Decision[]} The decisions to emit.
+	 */
 	sweepAt(now) {
 		const decisions = [];
 		for (const queue of this.#queues.values()) {
@@ -326,6 +365,9 @@ export class Scheduler {
 	//
 	// The Adapter supplies the Addressing rule as the second resolver and never sees the Queues
 	// themselves: the rule stays in src/addressing.js, which never sees Scheduler state (ADR 0005).
+	/**
+	 * @returns {{ decisions: Decision[], overCapacity: OverCapacityReport[] }} The decisions to emit and the over-capacity reports.
+	 */
 	rebuildQueues(now) {
 		const rebuilt = new Map();
 		for (const [key, queue] of this.#queues) {

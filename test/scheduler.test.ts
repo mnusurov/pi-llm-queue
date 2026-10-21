@@ -736,3 +736,51 @@ describe("status view (in memory)", () => {
 		);
 	});
 });
+
+// The in-memory adapter consumes the decisions module (ADR 0010): it records the same event-log
+// lines and the same replies the socket adapter would have written and sent, next to the raw
+// decisions it files per connection.
+describe("the in-memory adapter's effects (in memory)", () => {
+	it("records the event-log line of a grant and the reply it caused", () => {
+		const h = new SchedulerHarness();
+		const a = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+
+		assert.deepEqual(h.lines().map((line) => line.event), ["grant"], "the grant writes one line");
+		assert.equal(h.lines()[0].role, "parent", "the line carries the wire's name for the tier");
+		assert.equal(h.replies().length, 1, "the grant causes one reply");
+		assert.deepEqual(h.replies()[0].msg, { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", leaseTtlMs: 30000, idleYieldMs: 30000 });
+	});
+
+	it("records the lines of a handover and sends the reply after them", () => {
+		const h = new SchedulerHarness({ maxStreams: 1 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "child" });
+		h.release(a, "A");
+
+		assert.deepEqual(h.lines().map((line) => line.event), ["grant", "queued", "release", "grant", "switch"]);
+		assert.equal(h.replies().length, 2, "one reply per grant");
+		assert.equal(h.replies()[1].connId, b, "the second reply goes to the connection the grant names");
+	});
+
+	it("records the over-capacity report as the config event the socket adapter writes", () => {
+		const h = new SchedulerHarness({ maxStreams: 2 });
+		const a = h.connect();
+		const b = h.connect();
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+
+		// A narrowing policy leaves the merged queue with more holders than it may carry
+		// (no-preemption, #49/#82): the report is logged, not silently exceeded.
+		const { overCapacity } = h.editPolicy({ maxStreams: 1 });
+		assert.deepEqual(overCapacity, [{ queueKey: QUEUE_KEY, holders: 2, maxStreams: 1 }]);
+		const last = h.lines().at(-1);
+		assert.equal(last?.event, "config", "the over-capacity is the config event");
+		assert.equal(last?.reason, "over-capacity");
+		assert.equal((last as { holders?: number }).holders, 2, "the report says how far over the queue is");
+	});
+});

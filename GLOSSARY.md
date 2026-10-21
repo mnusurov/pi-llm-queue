@@ -44,6 +44,11 @@ sent no keyed beat for `idleYieldMs`. The yielded client learns via its next bea
 false`) and re-queues. ADR 0003.
 _Avoid_: preemption, eviction
 
+**Evict**:
+The TTL reclaim: a Lease whose TTL lapsed, and the Slot it held returns to the queue. The only
+cause of eviction since no-preemption (ADR 0002); the log names it `evict`.
+_Avoid_: reap, expiration, timeout
+
 ### Lease and beat
 
 **Lease**:
@@ -134,6 +139,12 @@ a config reload it carries each Queue's Holders, Waiters and switch count to the
 Queue lives under.
 _Avoid_: daemon, dispatcher, scheduler pass, engine
 
+**Decision**:
+The Scheduler's answer about one Queue event: what happened, to which session, in which Queue. Five
+kinds — a grant, a switch, a queued request, a release, an evict. One module owns their shape and
+the effects they become: the event-log line and the `granted` reply (ADR 0010).
+_Avoid_: disposition, outcome, result
+
 **Queue rebuild**:
 The carrying of a Queue's Holders, Waiters and switch count to the Queue key that Queue lives
 under after a config reload: a group added at runtime takes the endpoint's Queue with it, and the
@@ -182,9 +193,9 @@ sessions; the Extension holds no slot itself.
 _Avoid_: adapter, plugin, addon
 
 **Adapter**:
-The daemon's edge: it turns Scheduler decisions into socket replies and event-log lines, and
-protocol messages into Scheduler calls (ADR 0004). The in-memory test driver is the Adapter's
-second implementation.
+The daemon's edge: it turns Scheduler decisions into socket replies and event-log lines through the
+decisions module (ADR 0010), and protocol messages into Scheduler calls (ADR 0004). The in-memory
+test driver is the Adapter's second implementation.
 _Avoid_: extension, handler
 
 ### Roles and config

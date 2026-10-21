@@ -17,6 +17,7 @@ record. Never rewrite the old decision.
 | [0007 One client-side module owns the Run lifecycle](0007-run-lifecycle-module.md) | the Run's state, its lease ownership, the Grace and Beat timers, the parked Blocking Tool set | the Run lifecycle, Grace, the session registry, Extension-side state |
 | [0008 One module owns the config watch](0008-one-module-owns-the-config-watch.md) | the config watch both processes arm: the directory watch, the debounce, and the keep-alive rule | hot-reload, a stale config, a config watch that failed |
 | [0009 One module owns the Lease's terms](0009-one-module-owns-the-lease-terms.md) | the Lease's terms: their shape, the refresh period they imply, their wire encoding and the growth rule | lease terms, the refresh period, the terms' wire fields, the TTL growth rule |
+| [0010 One module owns the Decision vocabulary and its effects](0010-one-module-owns-the-decision-vocabulary.md) | the Decision's shape, the event-log line and the reply it becomes, and the batch order | decisions, the event log's vocabulary, the `tier` → `role` rename, the batch order |
 
 Amended records — read the amendment, not only the original decision:
 
@@ -31,7 +32,8 @@ Amended records — read the amendment, not only the original decision:
   2026-10-21 (#109) — the period's derivation moved into the Lease's terms module; the rule is
   unchanged.
 - **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that
-  batch goes out; amended 2026-10-21 (#103) — the Scheduler owns the hot-reload Queue rebuild.
+  batch goes out; amended 2026-10-21 (#103) — the Scheduler owns the hot-reload Queue rebuild;
+  amended 2026-10-21 (#111) — the mapping from a Decision to the wire moves into one module.
 - **0005** amended 2026-10-21 (#103) — the remap rule stays with Addressing, the rebuild moves into
   the Scheduler; amended 2026-10-21 (#109) — the refresh-period derivation leaves the config module
   for the Lease's terms module.
@@ -40,6 +42,9 @@ Amended records — read the amendment, not only the original decision:
 - **0007** amended 2026-10-21 (#105) — the per-Queue Beat period now follows the Lease's terms;
   the injected period is the fallback for a daemon that sends no terms; amended 2026-10-21 (#109) —
   the Beat period crosses the `LeasePort`, and the separate beat-period injection is gone.
+- **0009** amended 2026-10-21 (#111) — the decisions module writes the `granted` reply, so it calls
+  the terms' wire encoding; the terms' shape and the growth rule are unchanged.
+- **0010** is new: one module owns the Decision vocabulary and its effects.
 
 The next record takes the next number. Where a fact belongs: [`docs/agents/domain.md`](../agents/domain.md).
 The vocabulary the records use: [`GLOSSARY.md`](../../GLOSSARY.md).
