@@ -129,6 +129,10 @@ import { growTerms, termsFor } from "./lease-terms.js";
  *
  * The Queue key a Queue lives under after a config reload arrives through the second resolver
  * (ADR 0005): the Scheduler owns the Queue rebuild, so it asks for the target key itself.
+ *
+ * The entries are the whole public surface: the Queue state, the grants, the pick, the release and
+ * the connection scope are private (#115), so the class's own rules cannot be driven from outside —
+ * a caller asks, the Scheduler decides.
  */
 export class Scheduler {
 	// The live Queues, by Queue key. Private: the Adapter never enumerates them — the Scheduler
@@ -139,8 +143,19 @@ export class Scheduler {
 	// (the TTL and the idle-yield window are the two values the terms are built from)
 	// (plain resolved values; the adapter gets them from config.js resolveQueuePolicy, the one
 	// cascade that owns the defaults fallback).
+	/** @type {(queueKey: string) => QueuePolicy} */
+	#resolvePolicy;
 	// resolveQueueKey(queueKey) -> the Queue key that Queue lives under after a reload (the
 	// Addressing rule; the adapter supplies the call, the Scheduler applies it).
+	/** @type {(queueKey: string) => string} */
+	#resolveQueueKey;
+	// The connection scope of a Lease (protocol fact: a bare renew heartbeats every lease of the
+	// connection). Each Lease lives in queue.holders AND here; the granted answer is an identity
+	// comparison across both, so both live here (ADR 0004, "Considered options").
+	/** @type {Map<number | string, Lease[]>} */
+	#connLeases; // connId -> Lease[]
+	/** @type {Map<number | string, Waiter[]>} */
+	#connQueued; // connId -> Waiter[]
 	/**
 	 * @param {(queueKey: string) => QueuePolicy} resolvePolicy The config cascade, resolved by the adapter.
 	 * @param {(queueKey: string) => string} resolveQueueKey The addressing rule: where a Queue lives after a reload.
@@ -150,16 +165,11 @@ export class Scheduler {
 		// lives after a reload, and a default would silently drop the remap. Fail at construction, not
 		// at the first reload.
 		if (typeof resolveQueueKey !== "function") throw new Error("Scheduler: resolveQueueKey(queueKey) is required");
-		this.resolvePolicy = resolvePolicy;
-		this.resolveQueueKey = resolveQueueKey;
+		this.#resolvePolicy = resolvePolicy;
+		this.#resolveQueueKey = resolveQueueKey;
 		this.#queues = new Map();
-		// The connection scope of a Lease (protocol fact: a bare renew heartbeats every lease of the
-		// connection). Each Lease lives in queue.holders AND here; the granted answer is an identity
-		// comparison across both, so both live here (ADR 0004, "Considered options").
-		/** @type {Map<number | string, Lease[]>} */
-		this.connLeases = new Map(); // connId -> Lease[]
-		/** @type {Map<number | string, Waiter[]>} */
-		this.connQueued = new Map(); // connId -> Waiter[]
+		this.#connLeases = new Map();
+		this.#connQueued = new Map();
 	}
 
 	// Queue policy, re-applied on hot-reload. `enabled: false` is passthrough: the adapter resolves
@@ -170,7 +180,7 @@ export class Scheduler {
 	 * @param {QueuePolicy} policy The queue's resolved policy.
 	 * @returns {Queue} The queue, with the policy applied.
 	 */
-	applyPolicyTo(queue, policy) {
+	#applyPolicyTo(queue, policy) {
 		// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49 / ADR
 		// 0002), so the slot moves on voluntary release, abort, disconnect, or a TTL lapse alone.
 		// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after this
@@ -194,14 +204,14 @@ export class Scheduler {
 	 * @returns {Queue} The new Queue.
 	 */
 	#newQueue(queueKey) {
-		return this.applyPolicyTo({ queueKey, parentGrantStreak: 0, switches: 0, holders: [], waiting: [] }, this.resolvePolicy(queueKey));
+		return this.#applyPolicyTo({ queueKey, parentGrantStreak: 0, switches: 0, holders: [], waiting: [] }, this.#resolvePolicy(queueKey));
 	}
 
 	/**
 	 * @param {string} queueKey The Queue's key.
 	 * @returns {Queue} The Queue, created if it is not there yet.
 	 */
-	queueFor(queueKey) {
+	#queueFor(queueKey) {
 		const existing = this.#queues.get(queueKey);
 		if (existing) return existing;
 		const queue = this.#newQueue(queueKey);
@@ -214,16 +224,16 @@ export class Scheduler {
 	 * @param {string} sessionKey The session.
 	 * @returns {Lease | undefined} The session's Lease, if it holds one.
 	 */
-	leaseOf(queue, sessionKey) {
+	#leaseOf(queue, sessionKey) {
 		return queue.holders.find((l) => l.sessionKey === sessionKey);
 	}
 
 	/**
 	 * @param {Lease} lease The lease to record.
 	 */
-	pushLease(lease) {
-		let list = this.connLeases.get(lease.connId);
-		if (!list) this.connLeases.set(lease.connId, (list = []));
+	#pushLease(lease) {
+		let list = this.#connLeases.get(lease.connId);
+		if (!list) this.#connLeases.set(lease.connId, (list = []));
 		list.push(lease);
 	}
 
@@ -231,9 +241,9 @@ export class Scheduler {
 	 * @param {number | string} connId The connection the waiter came from.
 	 * @param {Waiter} waiter The waiter to record.
 	 */
-	pushQueued(connId, waiter) {
-		let list = this.connQueued.get(connId);
-		if (!list) this.connQueued.set(connId, (list = []));
+	#pushQueued(connId, waiter) {
+		let list = this.#connQueued.get(connId);
+		if (!list) this.#connQueued.set(connId, (list = []));
 		list.push(waiter);
 	}
 
@@ -244,7 +254,7 @@ export class Scheduler {
 	 * @param {number} now The wall-clock instant, in ms since the epoch.
 	 * @returns {Waiter | undefined} The waiter to grant next, if any.
 	 */
-	pickNext(queue, now) {
+	#pickNext(queue, now) {
 		if (queue.policy === "fifo") return queue.waiting[0];
 		let aged = null;
 		for (const w of queue.waiting) {
@@ -268,7 +278,7 @@ export class Scheduler {
 	 * @param {Decision[]} decisions The decisions to append the grant to.
 	 * @returns {Lease} The granted Lease.
 	 */
-	grantLease(queue, requester, now, fromWaiting, decisions) {
+	#grantLease(queue, requester, now, fromWaiting, decisions) {
 		const lease = {
 			queueKey: queue.queueKey,
 			sessionKey: requester.sessionKey,
@@ -286,7 +296,7 @@ export class Scheduler {
 			lastActivityAt: now,
 		};
 		queue.holders.push(lease);
-		this.pushLease(lease);
+		this.#pushLease(lease);
 		// A direct grant counts toward the parent-grant streak too: a parent that never queues must
 		// not starve a queued child past agingAfterSlots.
 		queue.parentGrantStreak = lease.tier === "parent" ? queue.parentGrantStreak + 1 : 0;
@@ -320,11 +330,11 @@ export class Scheduler {
 	 */
 	#grantNext(queue, now, decisions = []) {
 		while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
-			const waiter = this.pickNext(queue, now);
+			const waiter = this.#pickNext(queue, now);
 			if (!waiter) break;
 			remove(queue.waiting, waiter);
-			this.grantLease(queue, waiter, now, true, decisions);
-			remove(this.connQueued.get(waiter.connId) ?? [], waiter);
+			this.#grantLease(queue, waiter, now, true, decisions);
+			remove(this.#connQueued.get(waiter.connId) ?? [], waiter);
 		}
 		return decisions;
 	}
@@ -344,9 +354,9 @@ export class Scheduler {
 	 * @returns {{ granted: true, refreshed: true, decisions: Decision[], terms: LeaseTerms } | { granted: boolean, refreshed: false, decisions: Decision[] }} The answer and the decisions to emit. A refresh carries the Lease's terms: the term may have grown since the Grant.
 	 */
 	acquire(connId, sessionKey, tier, group, activity, queueKey, requestedKey, now) {
-		const queue = this.queueFor(queueKey);
+		const queue = this.#queueFor(queueKey);
 		tier = tier ?? "parent";
-		const held = this.leaseOf(queue, sessionKey);
+		const held = this.#leaseOf(queue, sessionKey);
 		if (held) {
 			refreshExpiry(held, queue, now);
 			// The refresh reply repeats the Lease's terms: the term may have grown since the Grant.
@@ -355,13 +365,13 @@ export class Scheduler {
 		/** @type {Decision[]} */
 		const decisions = [];
 		if (queue.holders.length < queue.maxStreams) {
-			this.grantLease(queue, { sessionKey, connId, activity, tier, group, requestedKey }, now, false, decisions);
+			this.#grantLease(queue, { sessionKey, connId, activity, tier, group, requestedKey }, now, false, decisions);
 			// The terms ride on the grant decision: the adapter puts them in the reply.
 			return { granted: true, refreshed: false, decisions };
 		}
 		const waiter = { sessionKey, tier, group, connId, queueKey, requestedKey, enqueuedAt: now, activity: !!activity };
 		queue.waiting.push(waiter);
-		this.pushQueued(connId, waiter);
+		this.#pushQueued(connId, waiter);
 		decisions.push({ type: "queued", connId, queueKey: queue.queueKey, sessionKey, tier });
 		return { granted: false, refreshed: false, decisions };
 	}
@@ -380,10 +390,10 @@ export class Scheduler {
 	 * @returns {{ granted: boolean, refreshed: boolean, decisions: Decision[] }} The answer and the decisions to emit.
 	 */
 	beat(connId, sessionKey, queueKey, now) {
-		const queue = this.queueFor(queueKey);
-		const lease = (this.connLeases.get(connId) ?? []).find((l) => l.sessionKey === sessionKey && l.queueKey === queue.queueKey);
+		const queue = this.#queueFor(queueKey);
+		const lease = (this.#connLeases.get(connId) ?? []).find((l) => l.sessionKey === sessionKey && l.queueKey === queue.queueKey);
 		if (!lease) return { granted: false, refreshed: false, decisions: [] };
-		const granted = this.leaseOf(queue, sessionKey) === lease;
+		const granted = this.#leaseOf(queue, sessionKey) === lease;
 		if (granted) {
 			refreshExpiry(lease, queue, now);
 			lease.lastActivityAt = now;
@@ -400,8 +410,8 @@ export class Scheduler {
 	 * @returns {Decision[]} The decisions to emit.
 	 */
 	heartbeat(connId, now) {
-		for (const lease of this.connLeases.get(connId) ?? []) {
-			refreshExpiry(lease, this.queueFor(lease.queueKey), now);
+		for (const lease of this.#connLeases.get(connId) ?? []) {
+			refreshExpiry(lease, this.#queueFor(lease.queueKey), now);
 		}
 		return [];
 	}
@@ -417,7 +427,7 @@ export class Scheduler {
 		/** @type {Decision[]} */
 		const decisions = [];
 		const queue = this.#queues.get(queueKey);
-		if (queue) this.releaseLease(queue, sessionKey, undefined, now, decisions);
+		if (queue) this.#releaseLease(queue, sessionKey, undefined, now, decisions);
 		return decisions;
 	}
 
@@ -436,9 +446,9 @@ export class Scheduler {
 			const w = queue.waiting.find((x) => x.sessionKey === sessionKey && x.connId === connId);
 			if (w) {
 				remove(queue.waiting, w);
-				remove(this.connQueued.get(connId) ?? [], w);
+				remove(this.#connQueued.get(connId) ?? [], w);
 			}
-			if (this.leaseOf(queue, sessionKey)) this.releaseLease(queue, sessionKey, undefined, now, decisions);
+			if (this.#leaseOf(queue, sessionKey)) this.#releaseLease(queue, sessionKey, undefined, now, decisions);
 		}
 		return decisions;
 	}
@@ -462,7 +472,7 @@ export class Scheduler {
 
 	// disconnect: a close (or a `bye`) is an abort — release every lease it held, drop every queued
 	// request. Replaces the daemon's cleanup/bye. The adapter decrements the Counted-client count AFTER
-	// this returns. Iterate copies: releaseLease splices the conn lease list, and a client can hold
+	// this returns. Iterate copies: the release splices the conn lease list, and a client can hold
 	// several leases.
 	/**
 	 * @param {number | string} connId The connection that went away.
@@ -472,13 +482,13 @@ export class Scheduler {
 	disconnect(connId, now) {
 		/** @type {Decision[]} */
 		const decisions = [];
-		for (const lease of [...(this.connLeases.get(connId) ?? [])]) this.releaseLease(this.queueFor(lease.queueKey), lease.sessionKey, undefined, now, decisions);
-		for (const w of [...(this.connQueued.get(connId) ?? [])]) {
-			remove(this.queueFor(w.queueKey).waiting, w);
-			remove(this.connQueued.get(connId) ?? [], w);
+		for (const lease of [...(this.#connLeases.get(connId) ?? [])]) this.#releaseLease(this.#queueFor(lease.queueKey), lease.sessionKey, undefined, now, decisions);
+		for (const w of [...(this.#connQueued.get(connId) ?? [])]) {
+			remove(this.#queueFor(w.queueKey).waiting, w);
+			remove(this.#connQueued.get(connId) ?? [], w);
 		}
-		this.connLeases.delete(connId);
-		this.connQueued.delete(connId);
+		this.#connLeases.delete(connId);
+		this.#connQueued.delete(connId);
 		return decisions;
 	}
 
@@ -492,11 +502,11 @@ export class Scheduler {
 	 * @param {number} now The wall-clock instant, in ms since the epoch.
 	 * @param {Decision[]} decisions The decisions to append the release to.
 	 */
-	releaseLease(queue, sessionKey, reason, now, decisions) {
-		const lease = this.leaseOf(queue, sessionKey);
+	#releaseLease(queue, sessionKey, reason, now, decisions) {
+		const lease = this.#leaseOf(queue, sessionKey);
 		if (lease) {
 			remove(queue.holders, lease);
-			remove(this.connLeases.get(lease.connId) ?? [], lease);
+			remove(this.#connLeases.get(lease.connId) ?? [], lease);
 			if (reason === "ttl") decisions.push({ type: "evict", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason: "ttl" });
 			else decisions.push({ type: "release", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason });
 		}
@@ -514,13 +524,13 @@ export class Scheduler {
 		/** @type {Decision[]} */
 		const decisions = [];
 		for (const queue of this.#queues.values()) {
-			for (const lease of [...queue.holders]) if (now > lease.expires) this.releaseLease(queue, lease.sessionKey, "ttl", now, decisions);
+			for (const lease of [...queue.holders]) if (now > lease.expires) this.#releaseLease(queue, lease.sessionKey, "ttl", now, decisions);
 			// Idle-yield: an activity-flagged holder silent past its window with waiters present yields
 			// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
 			if (queue.waiting.length > 0) {
 				for (const lease of [...queue.holders]) {
 					if (lease.terms.idleYieldMs > 0 && lease.activity && now - lease.lastActivityAt > lease.terms.idleYieldMs)
-						this.releaseLease(queue, lease.sessionKey, "idle", now, decisions);
+						this.#releaseLease(queue, lease.sessionKey, "idle", now, decisions);
 				}
 			}
 		}
@@ -555,7 +565,7 @@ export class Scheduler {
 		/** @type {Map<string, Queue>} */
 		const rebuilt = new Map();
 		for (const [key, queue] of this.#queues) {
-			const target = this.resolveQueueKey(key);
+			const target = this.#resolveQueueKey(key);
 			let moved = rebuilt.get(target);
 			if (!moved) rebuilt.set(target, (moved = this.#newQueue(target)));
 			moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
