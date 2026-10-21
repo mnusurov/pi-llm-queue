@@ -32,27 +32,6 @@ export const DEFAULTS = {
 };
 
 /**
- * Client heartbeat period: a third of the lease TTL, floored at 250 ms. The floor stays under the
- * leaseTtlMs floor (1000 ms), or a sweep landing between two beats evicts a healthy holder.
- * @param {number} ttlMs @returns {number}
- */
-export const heartbeatMs = (ttlMs) => Math.max(250, Math.floor(ttlMs / 3));
-
-/**
- * Keyed beat period for one queue: a third of that queue's lease TTL (heartbeatMs) and at most half
- * its idle-yield window when the feature is enabled, so a live Holder is never yielded between
- * beats. The daemon resolves the same two fields per queue, so the client must derive its period
- * from the queue it holds, never from `defaults` alone (#81). Since #105 the two fields are the
- * Lease's terms — the daemon grants the Lease under them and the client refreshes on them.
- * idleYieldMs 0 disables the feature.
- * @param {number} ttlMs @param {number} idleYieldMs @returns {number}
- */
-export const keyedBeatMs = (ttlMs, idleYieldMs = 0) => {
-	const idle = idleYieldMs > 0 ? Math.max(1, Math.floor(idleYieldMs / 2)) : Infinity;
-	return Math.min(heartbeatMs(ttlMs), idle);
-};
-
-/**
  * The one policy cascade: queue entry field → defaults field → DEFAULTS. The daemon's adapter and
  * the client's beat derivation both call this, so they agree on every Policy default by
  * construction, not by comment (#98; the drift that lost a beating Holder its Slot, #81, was two

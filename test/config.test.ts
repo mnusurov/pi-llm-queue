@@ -6,7 +6,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
-import { DEFAULTS, SCHEMA_VERSION, heartbeatMs, keyedBeatMs, loadValidConfig, resolveQueuePolicy, validateConfig } from "../src/config.js";
+import { SCHEMA_VERSION, loadValidConfig, resolveQueuePolicy, validateConfig } from "../src/config.js";
+import { periodForTerms, termsFor } from "../src/lease-terms.js";
 
 describe("config schema validation", () => {
 	it("accepts a full valid config", () => {
@@ -151,24 +152,9 @@ describe("config schema validation", () => {
 	});
 });
 
-// #77: the defaults table and the heartbeat derivation are exports, so the daemon, the extension
-// and the test harnesses stop re-typing them.
+// #77: the defaults table is an export, so the daemon, the extension and the test harnesses stop
+// re-typing it. The refresh period it feeds is the terms module's (ADR 0009).
 describe("policy defaults table", () => {
-	it("derives the client heartbeat as a third of the lease TTL with a 250 ms floor", () => {
-		assert.equal(heartbeatMs(DEFAULTS.leaseTtlMs), 10000);
-		// At the leaseTtlMs floor (1000 ms) a 1 s beat would equal the TTL, so a sweep landing between
-		// two beats would evict a healthy holder; the floor keeps the period under it.
-		assert.equal(heartbeatMs(1000), 333);
-		assert.equal(heartbeatMs(750), 250);
-	});
-
-	it("bounds a queue's keyed beat by its own TTL and idle-yield window (#81)", () => {
-		assert.equal(keyedBeatMs(1000, 30000), 333, "a short per-queue TTL governs the beat");
-		assert.equal(keyedBeatMs(30000, 1000), 500, "a short idle window needs a beat at half of it");
-		assert.equal(keyedBeatMs(30000, 0), 10000, "disabled idle-yield imposes no bound");
-		assert.equal(keyedBeatMs(30000, 30000), 10000, "the TTL beat is already tighter than idle/2");
-	});
-
 	// #98: the schema's leaseTtlMs floor (1000) and the beat derivation are one invariant — a beat
 	// must leave at least two refreshes inside every TTL the schema accepts, or a sweep landing
 	// between two beats evicts a healthy Holder. Before this the invariant was a pair of comments.
@@ -180,7 +166,7 @@ describe("policy defaults table", () => {
 				// The cascade rungs a schema-accepted value can sit on: queue entry, defaults, DEFAULTS.
 				for (const source of [{ leaseTtlMs: ttl, idleYieldMs: idle }, {}]) {
 					const policy = resolveQueuePolicy(source, source);
-					const beat = keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
+					const beat = periodForTerms(termsFor(policy.leaseTtlMs, policy.idleYieldMs));
 					assert.ok(beat * 2 <= policy.leaseTtlMs, `beat ${beat} ms leaves < 2 refreshes inside TTL ${policy.leaseTtlMs} ms (idle ${policy.idleYieldMs})`);
 				}
 			}

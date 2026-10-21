@@ -16,6 +16,7 @@ record. Never rewrite the old decision.
 | [0006 The pi seam is tested through a harness, not a factory](0006-pi-seam-tested-through-a-harness.md) | how the pi seam is tested: a test-only harness at the Extension's interface | writing an Extension test, the harness, the agent dir |
 | [0007 One client-side module owns the Run lifecycle](0007-run-lifecycle-module.md) | the Run's state, its lease ownership, the Grace and Beat timers, the parked Blocking Tool set | the Run lifecycle, Grace, the session registry, Extension-side state |
 | [0008 One module owns the config watch](0008-one-module-owns-the-config-watch.md) | the config watch both processes arm: the directory watch, the debounce, and the keep-alive rule | hot-reload, a stale config, a config watch that failed |
+| [0009 One module owns the Lease's terms](0009-one-module-owns-the-lease-terms.md) | the Lease's terms: their shape, the refresh period they imply, their wire encoding and the growth rule | lease terms, the refresh period, the terms' wire fields, the TTL growth rule |
 
 Amended records — read the amendment, not only the original decision:
 
@@ -24,17 +25,21 @@ Amended records — read the amendment, not only the original decision:
 - **0002** refined by 0003: an idle-yield adds a fifth cause of a Switch; amended 2026-10-21 (#104) —
   a policy edit never shortens a Lease that is already held; amended 2026-10-21 (#105) — the Grant
   carries the Lease's terms, and the client refreshes on them.
-- **0003** amended three times: 2026-10-19 (#57) — idle is "no keyed beat", not "between streams";
+- **0003** amended four times: 2026-10-19 (#57) — idle is "no keyed beat", not "between streams";
   2026-10-20 (#81) — the beat period follows the queue's own policy; 2026-10-21 (#105) — the
-  idle-yield window is a Lease term, and the beat period follows the terms the Grant carried.
+  idle-yield window is a Lease term, and the beat period follows the terms the Grant carried;
+  2026-10-21 (#109) — the period's derivation moved into the Lease's terms module; the rule is
+  unchanged.
 - **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that
   batch goes out; amended 2026-10-21 (#103) — the Scheduler owns the hot-reload Queue rebuild.
 - **0005** amended 2026-10-21 (#103) — the remap rule stays with Addressing, the rebuild moves into
-  the Scheduler.
+  the Scheduler; amended 2026-10-21 (#109) — the refresh-period derivation leaves the config module
+  for the Lease's terms module.
 - **0006** amended 2026-10-21 (#105) — the harness gained `daemonConfig`, so a suite can give the
   daemon a config copy of its own.
 - **0007** amended 2026-10-21 (#105) — the per-Queue Beat period now follows the Lease's terms;
-  the injected period is the fallback for a daemon that sends no terms.
+  the injected period is the fallback for a daemon that sends no terms; amended 2026-10-21 (#109) —
+  the Beat period crosses the `LeasePort`, and the separate beat-period injection is gone.
 
 The next record takes the next number. Where a fact belongs: [`docs/agents/domain.md`](../agents/domain.md).
 The vocabulary the records use: [`GLOSSARY.md`](../../GLOSSARY.md).

@@ -92,6 +92,11 @@ class FakeLease implements LeasePort {
 		}
 		return Promise.resolve({ kind: this.passthrough ? "passthrough" : "held" });
 	}
+
+	// The refresh period the port hands over (ADR 0009): the period the Lease's terms ask for.
+	beatPeriodMs(): number {
+		return BEAT_MS;
+	}
 }
 
 const noopUi = { status() {}, notify() {} };
@@ -104,7 +109,6 @@ const make = (sessionKey = "S", lease = new FakeLease(), clock = new FakeClock()
 		lease,
 		clock,
 		ui: noopUi,
-		beatMs: () => BEAT_MS,
 		blockingTools: () => ["subagent", "ask_user"],
 	}),
 });
@@ -275,7 +279,7 @@ describe("SessionRegistry", () => {
 		let index = 0;
 		return new SessionRegistry((sessionKey) => {
 			const lease = leases[index++] ?? new FakeLease();
-			return new RunLifecycle({ sessionKey, lease, clock: new FakeClock(), ui: noopUi, beatMs: () => BEAT_MS, blockingTools: () => [] });
+			return new RunLifecycle({ sessionKey, lease, clock: new FakeClock(), ui: noopUi, blockingTools: () => [] });
 		});
 	};
 

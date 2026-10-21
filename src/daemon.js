@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { loadValidConfig, resolveQueuePolicy } from "./config.js";
 import { watchConfigFile } from "./config-watch.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
+import { termsToWire } from "./lease-terms.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
 
@@ -224,9 +225,10 @@ function emit(decisions) {
 }
 
 // The granted reply: the grant itself, plus the Lease's terms (#105). The client refreshes the
-// Lease on the terms the daemon granted it under, never on its own copy of the config.
+// Lease on the terms the daemon granted it under, never on its own copy of the config. The wire
+// fields are the terms module's encoding (ADR 0009): the names and their meaning do not change.
 function grantedReply(queueKey, sessionKey, terms) {
-	return { op: "granted", queueKey, sessionKey, leaseTtlMs: terms.leaseTtlMs, idleYieldMs: terms.idleYieldMs };
+	return { op: "granted", queueKey, sessionKey, ...termsToWire(terms) };
 }
 
 function handle(msg, conn) {

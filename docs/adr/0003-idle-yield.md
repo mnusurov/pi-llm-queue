@@ -5,6 +5,9 @@ Date: 2026-10-18
 ## Status
 
 Accepted (implements #51, refines ADR 0002).
+Amended 2026-10-21 (#109): the keyed Beat's period is the refresh period the Lease's terms ask for,
+and that derivation moved into the Lease's terms module (ADR 0009). The rule itself does not
+change.
 
 ## Context
 
@@ -36,7 +39,8 @@ Purely behavioural — no plugin names, no tool names, works for any current or 
 mechanism.
 
 1. **Client (activity truth)**: while `queuedStream` is actually streaming (`for await` open),
-   send a keyed beat every `heartbeatMs`. Between streams — tool execution, blocked subagent —
+   send a keyed beat every `heartbeatMs` (the refresh period the lease's terms ask for; ADR 0009
+   moved that derivation into the terms module). Between streams — tool execution, blocked subagent —
    no keyed beats.
 2. **Daemon (decision)**: per-lease `lastActivityAt` (updated by grant + keyed beats). In
    `sweep`: if `waiters.length > 0 && now - lastActivityAt > idleYieldMs` →
@@ -127,6 +131,7 @@ The `defaults`-only beat period broke the one-slot promise when a queue overrode
 `idleYieldMs`: a holder beating for a 30 s TTL lost a queue's 1 s lease, and a 1 s idle window
 yielded an actively beating holder between beats. The client's keyed beat now runs at
 `min(heartbeatMs(the queue's leaseTtlMs), the queue's idleYieldMs / 2)` for the queue it holds
+(the refresh period the lease's terms ask for, ADR 0009)
 (`idleYieldMs: 0` imposes no bound), and the connection-wide bare heartbeat runs at the smallest
 such period across the configured queues. A config hot-reload re-resolves both, fires one immediate
 keyed beat, and restarts the timer; the daemon refreshes every carried holder's `lastActivityAt`

@@ -27,6 +27,12 @@ export interface LeasePort {
 	): Promise<AcquireVerdict>;
 	release(queueKey: string): void;
 	beat(queueKey: string): Promise<BeatVerdict>;
+	/**
+	 * The refresh period a Lease held on this Queue is refreshed at, in ms. The port's owner
+	 * resolves it: the period the Lease's terms ask for, or the config-implied fallback for a
+	 * daemon that sends no terms (ADR 0009).
+	 */
+	beatPeriodMs(queueKey: string): number;
 }
 
 /** The footer indicator and user-visible warnings; the Extension maps it onto pi's ui. */
@@ -37,19 +43,15 @@ export interface UiPort {
 
 /**
  * What one Run lifecycle needs: the session it belongs to, the injected Lease port, the clock and
- * the user-visible surface, plus the two per-Queue readings it cannot own — the keyed Beat period
- * and the live Blocking Tool list, both read on every use so a config hot-reload applies at once.
+ * the user-visible surface, plus the one per-Queue reading it cannot own — the live Blocking Tool
+ * list, read on every use so a config hot-reload applies at once. The refresh period comes from
+ * the Lease port, the seam the lifecycle already crosses (ADR 0007, ADR 0009).
  */
 export interface RunLifecycleOptions {
 	sessionKey: string;
 	lease: LeasePort;
 	clock: Clock;
 	ui: UiPort;
-	/**
-	 * Keyed Beat period for one Queue. The Extension passes the period the Lease's terms ask for
-	 * (#105), and this is the fallback it falls back to when the daemon sent no terms.
-	 */
-	beatMs(queueKey: string): number;
 	/** Live Blocking Tool list: read on every tool start, so a hot-reload applies at once. */
 	blockingTools(): readonly string[];
 }
@@ -84,7 +86,6 @@ export class RunLifecycle {
 	private readonly lease: LeasePort;
 	private readonly clock: Clock;
 	private ui: UiPort;
-	private readonly beatMs: (queueKey: string) => number;
 	private readonly blockingTools: () => readonly string[];
 
 	private state: RunState = "idle";
@@ -103,7 +104,6 @@ export class RunLifecycle {
 		this.lease = options.lease;
 		this.clock = options.clock;
 		this.ui = options.ui;
-		this.beatMs = options.beatMs;
 		this.blockingTools = options.blockingTools;
 	}
 
@@ -234,7 +234,7 @@ export class RunLifecycle {
 	private startBeat(queueKey: string): void {
 		this.stopBeat(queueKey);
 		if (!this.holds(queueKey)) return;
-		const period = this.beatMs(queueKey);
+		const period = this.lease.beatPeriodMs(queueKey);
 		const arm = (): void => {
 			const lease = this.leases.get(queueKey);
 			if (!lease) return;

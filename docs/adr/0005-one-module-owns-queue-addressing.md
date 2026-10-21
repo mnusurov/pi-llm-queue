@@ -8,6 +8,8 @@ Accepted (spec #77). Structural, not behavioural: the wire protocol, the daemon'
 queue behaviour are byte-for-byte unchanged. This ADR records where the addressing rule lives.
 Amended 2026-10-21 (#103): the hot-reload Queue rebuild moves into the Scheduler, which asks the
 resolver this module's rule is supplied through; the rule itself stays here.
+Amended 2026-10-21 (#109): the refresh-period derivation leaves this module for the Lease's terms
+module (ADR 0009) — a refresh period is a behaviour constant, not a config default.
 
 ## Context
 
@@ -49,6 +51,11 @@ The reverse direction is `queuedProviders(queues, providers)`; `membersOf`, `mat
 coverage check. `config.js` keeps schema, validation and defaults, and gains `DEFAULTS` (the policy
 defaults table) and `heartbeatMs(ttlMs)`.
 
+Amended 2026-10-21 (#109): `heartbeatMs(ttlMs)` and `keyedBeatMs(ttlMs, idleYieldMs)` leave this
+module for the Lease's terms module (ADR 0009), which owns the refresh period the terms imply. The
+schema, the validation and the defaults table stay here — a refresh period is a behaviour constant,
+not a config default.
+
 ## Considered options
 
 - **Keep the rule in `config.js`.** Rejected: the module is about queue addressing, the config
@@ -74,7 +81,7 @@ defaults table) and `heartbeatMs(ttlMs)`.
 - The defaults table has one spelling. The lease client's `10000` fallback and the daemon's
   idle-exit startup floor stay out of it: they are fallbacks of other layers, not policy defaults.
 - Tests stop baking constants: the rule tests live in `test/addressing.test.ts`, the heartbeat case
-  derives its period from `heartbeatMs`, and the in-memory driver reads `DEFAULTS`.
+  derives its period from the terms module, and the in-memory driver reads `DEFAULTS`.
 - The honest limit of the split: the provider-match branch is live for the extension and
   unreachable only through the endpoint form. A raw socket client names an endpoint, so it lands in
   the endpoint-level group — the documented split limitation, unchanged by this ADR.

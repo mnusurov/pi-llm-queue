@@ -13,7 +13,8 @@ import type {
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role, type StatusSession } from "./lease-client.ts";
-import { loadValidConfig, DEFAULTS, keyedBeatMs, resolveQueuePolicy } from "./config.js";
+import { loadValidConfig, DEFAULTS, resolveQueuePolicy } from "./config.js";
+import { periodForTerms, termsFor } from "./lease-terms.js";
 import { watchConfigFile } from "./config-watch.js";
 import { ensureStarterConfig } from "./starter-config.ts";
 import { addressEndpoint, addressModel, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
@@ -63,16 +64,19 @@ export default function (pi: ExtensionAPI) {
 	const configErrors = loaded.errors;
 	let queues = (config.queues ?? {}) as Record<string, QueueEntry>;
 
-	// The beat period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved through
-	// the same resolver the daemon uses, so client and daemon agree by construction (#98).
+	// The refresh period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved
+	// through the same resolver the daemon uses, so client and daemon agree by construction (#98).
 	// Deriving it from `defaults` alone lets a per-queue TTL lapse or a short idle window yield an
-	// actively beating Holder (#81). It is the fallback period only: a held Lease is refreshed on
-	// the terms the daemon granted it under (#105), so this copy of the config never decides a
-	// Lease's life.
+	// actively beating Holder (#81). The config-implied terms become the period through the terms
+	// module (ADR 0009), which owns that derivation.
+	//
+	// It is the fallback period only: a held Lease is refreshed at the period its terms ask for
+	// (#105), so this copy of the config never decides a Lease's life.
+	const periodOf = (leaseTtlMs: number, idleYieldMs: number): number => periodForTerms(termsFor(leaseTtlMs, idleYieldMs));
 	const queueBeatMs = (queueKey: string): number => {
 		const entry = addressEndpoint(queueKey, queues, modelsJson).entry as QueueEntry | undefined;
 		const policy = resolveQueuePolicy(entry ?? {}, config.defaults ?? {});
-		return keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
+		return periodOf(policy.leaseTtlMs, policy.idleYieldMs);
 	};
 	// The connection-wide bare renew refreshes every lease on the socket: it must run at the
 	// smallest period any live lease could need, so it also covers a queue the defaults under-serve.
@@ -82,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 		if (Number.isFinite(min)) return min;
 		// No enabled queue: the defaults block alone.
 		const policy = resolveQueuePolicy({}, config.defaults ?? {});
-		return keyedBeatMs(policy.leaseTtlMs, policy.idleYieldMs);
+		return periodOf(policy.leaseTtlMs, policy.idleYieldMs);
 	};
 
 	const lease = new LeaseClient({
@@ -110,6 +114,11 @@ export default function (pi: ExtensionAPI) {
 			lease.acquire(queueKey, sessionKey, currentRole(sessionKey), group, signal, handlers?.onQueued, handlers?.onWaitCap),
 		release: (queueKey) => lease.release(queueKey, sessionKey),
 		beat: (queueKey) => lease.beat(queueKey, sessionKey),
+		// The refresh period of a held Lease: the one its terms ask for (#105), and the
+		// config-implied fallback for a daemon that sends no terms. The fallback is the Extension's
+		// business — it owns the config — and the terms module turns terms into a period
+		// (ADR 0009).
+		beatPeriodMs: (queueKey) => lease.beatPeriodMs(queueKey, sessionKey) ?? queueBeatMs(queueKey),
 	});
 
 	// Clocks at the edge (CODING_STANDARDS): the lifecycle takes time as a port, so its unit tests
@@ -136,9 +145,6 @@ export default function (pi: ExtensionAPI) {
 				lease: leasePortFor(sessionKey),
 				clock,
 				ui: noUi,
-				// The keyed Beat period follows the terms the daemon granted the Lease under (#105):
-				// the config-derived period is only the fallback for a daemon that sends no terms.
-				beatMs: (queueKey) => lease.beatPeriodMs(queueKey, sessionKey) ?? queueBeatMs(queueKey),
 				// Read live on each tool start, so a config edit applies without a restart.
 				blockingTools: () => config.defaults?.blockingTools ?? DEFAULTS.blockingTools,
 			}),
