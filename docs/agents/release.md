@@ -6,7 +6,13 @@ lives in the repository: npm trusts the workflow through OIDC.
 
 ## One-time setup on npmjs.com
 
-npmjs.com → package `pi-llm-queue` → Settings → Trusted Publisher → GitHub Actions:
+The trusted publisher is what lets the workflow publish without a token. From the command line:
+
+    npm trust github pi-llm-queue --file release.yml --repo mnusurov/pi-llm-queue --allow-publish
+
+npm asks for two-factor authentication — a browser page, a security key, an OTP. The command needs
+npm 11.15 or newer; `npm install -g npm@latest` gets it. The same thing by hand: npmjs.com →
+package `pi-llm-queue` → Settings → Trusted Publisher → GitHub Actions:
 
 - Organization or user: `mnusurov`
 - Repository: `pi-llm-queue`
@@ -27,10 +33,13 @@ only closes the door to long-lived tokens.
 1. On a branch, bump the version: `npm version patch` (or `minor`, `major`). It moves the version
    in `package.json` and in the lockfile.
 2. Open a PR, let CI go green, squash-merge it into `main` (`docs/agents/merge-policy.md`).
-3. Tag the merged commit and push the tag:
+3. Tag the merged commit on `main` and push the tag:
 
-       git tag v0.1.2
+       git tag -s v0.1.2 -m "v0.1.2"
        git push origin v0.1.2
+
+   The tag is signed, like every other tag in this repo. Give the message with `-m`: the git
+   config annotates and signs every tag, so a bare `git tag` opens an editor and waits for it.
 
 4. The Release workflow publishes, then creates the GitHub Release with generated notes. Watch it:
    `gh run watch`.

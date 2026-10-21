@@ -38,7 +38,8 @@ Single-context: `GLOSSARY.md` + `docs/adr/` at root (index: `docs/adr/README.md`
 
 ### Release
 
-A `v*` tag publishes to npm from CI — no token in the repo. See `docs/agents/release.md`.
+The release recipe — bump the version in a PR, merge, tag, push — is in `docs/agents/release.md`.
+The tag publishes to npm from CI: no token in the repo.
 
 ### LLM queue
 
