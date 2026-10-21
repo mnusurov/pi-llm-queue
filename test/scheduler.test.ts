@@ -688,7 +688,7 @@ describe("status view (in memory)", () => {
 	// The snapshot returns raw Holder/Waiter records (tier under the Scheduler's word); the adapter's
 	// sessionView renames it to the wire `role`. The test projects the same three fields, renaming
 	// tier→role as the adapter does, to assert the tier/group property over the raw source.
-	const view = (list: { sessionKey: string; tier: string; group: string }[] | undefined) =>
+	const view = (list: { sessionKey: string; tier: string; group?: string }[] | undefined) =>
 		(list ?? []).map((e) => ({ sessionKey: e.sessionKey, role: e.tier, group: e.group }));
 
 	it("reports tier and group label for every Holder and Waiter", () => {

@@ -15,7 +15,10 @@ export function readJsonLines(socket, onMessage, onInvalid = () => {}) {
 	// Streaming decoder: a chunk that splits a multi-byte character must not corrupt the line.
 	const decoder = new TextDecoder("utf8");
 	socket.on("data", (chunk) => {
-		buffer += decoder.decode(chunk, { stream: true });
+		// A socket hands over a Buffer, whose bytes live in an ArrayBuffer; the cast states that for
+		// the decoder, whose signature also accepts a view over a SharedArrayBuffer.
+		const bytes = /** @type {Uint8Array<ArrayBuffer>} */ (chunk);
+		buffer += decoder.decode(bytes, { stream: true });
 		if (buffer.length > MAX_LINE_LENGTH) {
 			socket.destroy();
 			return;

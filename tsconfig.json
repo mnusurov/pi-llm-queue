@@ -9,10 +9,11 @@
     "noUnusedParameters": true,
     "allowImportingTsExtensions": true,
     "allowJs": true,
+    "checkJs": true,
     "verbatimModuleSyntax": true,
     "erasableSyntaxOnly": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "src/**/*.js", "test/**/*.ts", "test/**/*.js"]
 }

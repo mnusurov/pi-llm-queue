@@ -16,20 +16,36 @@ import { emit, grantedReply, overCapacityLine } from "./decisions.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
 
+/**
+ * @typedef {import("node:net").Socket} Socket
+ * @typedef {import("./decisions.js").Decision} Decision
+ * @typedef {Socket & { connId: number, counted?: boolean, cleaned?: boolean }} ClientConn
+ * @typedef {{ sessionKey: string, tier: string, group?: string }} SessionEntry
+ */
+
 const args = process.argv.slice(2);
+/**
+ * @param {string} name The flag's name.
+ * @returns {string | undefined} The flag's value, if the flag is there.
+ */
 const arg = (name) => {
 	const at = args.indexOf(name);
 	return at < 0 ? undefined : args[at + 1];
 };
-const socketPath = arg("--socket");
-const configPath = arg("--config");
-const modelsJsonPath = arg("--models-json");
+const socketArg = arg("--socket");
+const configArg = arg("--config");
+const modelsJsonArg = arg("--models-json");
 // Sweep interval: 1 s in production, a short tick in tests so a TTL-bound test costs milliseconds.
 const sweepMs = Number(arg("--sweep-ms") ?? 1000);
-if (!socketPath) {
+if (!socketArg) {
 	console.error("usage: daemon.js --socket <path> [--config <path>] [--models-json <path>] [--sweep-ms <ms>]");
 	process.exit(1);
 }
+// The socket path is required, so it is a string from here on; the config and catalog paths are
+// optional, and every use of them is guarded.
+const socketPath = socketArg;
+const configPath = configArg;
+const modelsJsonPath = modelsJsonArg;
 
 // A bad config must not kill the daemon: print clear errors and serve with defaults.
 // A missing file is all defaults — the documented default install, no error.
@@ -49,12 +65,16 @@ if (modelsJsonPath && existsSync(modelsJsonPath)) {
 		try {
 			JSON.parse(readFileSync(modelsJsonPath, "utf8"));
 		} catch (error) {
-			reason = error.message;
+			reason = error instanceof Error ? error.message : String(error);
 		}
 		console.error(`pi-llm-queue daemon: models.json: ${reason} — provider-name queue keys resolve to nothing`);
 	}
 }
 
+/**
+ * @param {Socket} conn The connection to write to.
+ * @param {object} msg The message to write.
+ */
 function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
 }
@@ -62,6 +82,10 @@ function send(conn, msg) {
 // One session as a client reads it: id, tier, group label. A Lease (Holder) and a Waiter carry the
 // tier under the Scheduler's word (`tier`); the wire field is `role` (protocol:15). This is the one
 // boundary that renames it, so `status` reports both lists through one view and cannot drift apart.
+/**
+ * @param {SessionEntry} entry The lease or waiter record.
+ * @returns {{ sessionKey: string, role: string, group?: string }} The wire view.
+ */
 function sessionView(entry) {
 	return { sessionKey: entry.sessionKey, role: entry.tier, group: entry.group };
 }
@@ -77,6 +101,9 @@ function sessionView(entry) {
 // The event-log sink: with `logFile` set, one JSON line is appended per event. Best effort,
 // swallowed: a bad path, a full disk or a log rotation race must never take the daemon down
 // (it is spawned detached, so a crash is silent) nor reject the request that logged.
+/**
+ * @param {object} line The event-log line to append.
+ */
 function writeEvent(line) {
 	const path = defaults.logFile;
 	if (!path) return;
@@ -94,10 +121,11 @@ function writeEvent(line) {
 // daemon); a huge value keeps the daemon resident. A `status`-only connection is never counted, so
 // an observer polling every 2 s cannot defeat the exit.
 let countedClients = 0;
+/** @type {NodeJS.Timeout | null} */
 let idleTimer = null;
 function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 	if (!isFinite(ms)) return;
-	clearTimeout(idleTimer);
+	clearTimeout(idleTimer ?? undefined);
 	// setTimeout coerces a delay past 2^31-1 (~24.8 days) to 1 ms, which would make "set it high to
 	// keep the daemon resident" exit at once — the exact inverse. Clamp to the largest real delay.
 	idleTimer = setTimeout(() => {
@@ -112,6 +140,9 @@ function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 // A connection joins the client count at its first state-touching op and leaves it on close. The
 // extension holds one persistent connection per pi process, so the OS closes it on pi exit and on
 // pi crash alike: socket close is the "last pi is gone" signal, crash-safe by construction.
+/**
+ * @param {ClientConn} conn The connection that joined the count.
+ */
 function countClient(conn) {
 	if (conn.counted) return;
 	conn.counted = true;
@@ -126,6 +157,10 @@ function countClient(conn) {
 // that provider's baseUrl; a baseUrl key wins when both name the same endpoint. The rule lives in
 // src/addressing.js (ADR 0005), in its endpoint form: a socket client names an endpoint and no
 // provider, so the provider-name branch is unreachable through it by construction.
+/**
+ * @param {string} key The queue key.
+ * @returns {Record<string, any>} The queue's config entry, or an empty one.
+ */
 function policyFor(key) {
 	return addressEndpoint(key, config.queues ?? {}, modelsJson).entry ?? {};
 }
@@ -136,6 +171,10 @@ function policyFor(key) {
 // This is also the rule the Scheduler asks where a Queue lives after a config reload: it reads the
 // live `config`, so a hot-reload re-resolves through the new values, and it never sees Scheduler
 // state (ADR 0005, #103).
+/**
+ * @param {string} key The queue key.
+ * @returns {string} The Queue's key.
+ */
 function groupFor(key) {
 	return addressEndpoint(key, config.queues ?? {}, modelsJson).queueKey;
 }
@@ -146,6 +185,10 @@ function groupFor(key) {
 // (`ttlMs`). `enabled: false` is passthrough: maxStreams Infinity, so every session is granted
 // immediately (status reports maxStreams null via JSON). The closure reads the live `config` /
 // `defaults`, so a hot-reload re-resolves through the new values.
+/**
+ * @param {string} key The queue key.
+ * @returns {{ maxStreams: number, ttlMs: number, agingAfterSlots: number, agingAfterMs: number, policy: string, idleYieldMs: number }} The resolved policy.
+ */
 function resolvePolicy(key) {
 	const p = resolveQueuePolicy(policyFor(key), defaults);
 	return {
@@ -169,6 +212,9 @@ const connById = new Map();
 // `granted` reply. The mapping is the decisions module's (ADR 0010) — this adapter supplies the
 // edges: the log sink, the socket and the clock. The batch order (every line before any reply) is
 // the module's rule too; see the comment there for why it is a promise and not a detail.
+/**
+ * @param {Decision[]} decisions The decisions to emit, in order.
+ */
 function emitDecisions(decisions) {
 	emit(decisions, {
 		write: writeEvent,
@@ -180,6 +226,11 @@ function emitDecisions(decisions) {
 	});
 }
 
+/**
+ * @param {Record<string, any>} msg The wire message.
+/**
+ * @param {ClientConn} conn The connection it came on.
+ */
 function handle(msg, conn) {
 	// One clock stamp per op: every expires/lastActivityAt/enqueuedAt this op writes uses this single
 	// value, so no timestamp inside one op floats relative to another (spec #65 phase A).
@@ -204,7 +255,7 @@ function handle(msg, conn) {
 			// A re-acquire of a held slot is a TTL refresh: `granted` with no Grant decision (the Grace
 			// window logs one grant and no switch). The direct-grant path's reply rides on its own
 			// `grant` decision, so reply here only for a refresh, keyed by the current op's requestedKey.
-			if (result.refreshed) {
+			if (result.refreshed && result.terms) {
 				send(conn, grantedReply(requestedKey, msg.sessionKey, result.terms));
 			}
 			return;
@@ -261,7 +312,8 @@ function handle(msg, conn) {
 	}
 }
 
-const server = createServer((conn) => {
+const server = createServer((socket) => {
+	const conn = /** @type {ClientConn} */ (socket);
 	conn.connId = ++connSeq;
 	connById.set(conn.connId, conn);
 	readJsonLines(
@@ -284,6 +336,9 @@ const server = createServer((conn) => {
 // A disconnect is an abort: the Scheduler releases every lease it held and drops every queued
 // request; the adapter then decrements the Counted-client count (the decrement is AFTER the
 // disconnect, per the dual-ownership crux). close and error both fire: count the disconnect once.
+/**
+ * @param {ClientConn} conn The connection that went away.
+ */
 function disconnect(conn) {
 	if (conn.cleaned) return;
 	conn.cleaned = true;
@@ -295,7 +350,7 @@ function disconnect(conn) {
 
 // Two sessions can autostart at once: the loser finds the socket taken and stands down.
 server.on("error", (error) => {
-	if (error.code === "EADDRINUSE") process.exit(0);
+	if (/** @type {NodeJS.ErrnoException} */ (error).code === "EADDRINUSE") process.exit(0);
 	throw error;
 });
 
