@@ -9,7 +9,7 @@ record. Never rewrite the old decision.
 | ADR | Decides | Read it when |
 | --- | --- | --- |
 | [0001 Auto-generate a starter config on first launch](0001-auto-starter-config.md) | the config file's schema, and the starter config generated from the user's own `models.json` on first launch | the config file, its schema, `schemaVersion`, what a fresh install writes |
-| [0002 No preemption: a live holder keeps the slot until it releases it](0002-no-preemption.md) | when a Slot changes hands — voluntary release, abort, disconnect, TTL lapse, and nothing else | the handover rules, what may take a Slot away, the `evict` event |
+| [0002 No preemption: a live holder keeps the slot until it releases it](0002-no-preemption.md) | when a Slot changes hands — voluntary release, abort, disconnect, TTL lapse, and nothing else | the handover rules, what may take a Slot away, the `evict` event, the TTL a held Lease keeps |
 | [0003 Idle Holder yields under contention](0003-idle-yield.md) | the idle-yield of an activity-flagged Holder, the keyed Beat and its period, the Blocking Tool gate | idle yield, beat periods, parked tools |
 | [0004 The Scheduler decides; the socket adapter emits](0004-scheduler-decides-socket-adapter-emits.md) | the daemon's two halves: the Scheduler decides, the Adapter writes the socket and the log | daemon structure, where a decision becomes an effect, the decision list |
 | [0005 One module owns queue addressing](0005-one-module-owns-queue-addressing.md) | the addressing rules in both directions, and the module that owns them | queue keys, groups, provider wrapping, which module owns a rule |
@@ -20,7 +20,8 @@ Amended records — read the amendment, not only the original decision:
 
 - **0001** amended by #46: the starter config writes a `defaults` block, and create-if-missing
   becomes add-only reconcile.
-- **0002** refined by 0003: an idle-yield adds a fifth cause of a Switch.
+- **0002** refined by 0003: an idle-yield adds a fifth cause of a Switch; amended 2026-10-21 (#104) —
+  a policy edit never shortens a Lease that is already held.
 - **0003** amended twice: 2026-10-19 (#57) — idle is "no keyed beat", not "between streams";
   2026-10-20 (#81) — the beat period follows the queue's own policy.
 - **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that

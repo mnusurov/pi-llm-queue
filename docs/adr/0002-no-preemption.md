@@ -6,7 +6,9 @@ Date: 2026-10-18
 
 Accepted (implements #49, supersedes the switch quanta of #3). Refined by ADR 0003 (#51): an
 idle-yield adds a fifth Switch cause, and the Sweep gains a gated idle-yield pass beside its
-unconditional TTL eviction.
+unconditional TTL eviction. Amended 2026-10-21 (#104): a policy edit never shortens a Lease that is
+already held — a Lease's term only ever grows, and its expiry is refreshed under the longer of that
+term and the Queue's current TTL.
 
 ## Context
 
@@ -59,3 +61,41 @@ Remove all three quanta. No forced preemption of a live holder under any role co
   streaming unqueued. Heartbeat period stays a third of the TTL for that reason.
 - Pre-#49 configs break loudly (a path-named unknown-field error at startup) rather than
   silently keeping a knob that no longer exists.
+
+## Amendment (2026-10-21, #104): a policy edit never shortens a held Lease
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's TTL lapse: a Lease is reclaimed only when the TTL it was
+granted under lapses).
+
+The daemon and the Extension read the same config file independently, each with its own debounce. A
+config edit that shortened a queue's `leaseTtlMs` reached the daemon at once, while the Extension
+may still have been beating at the old period (a third of the old TTL — ten seconds at the default).
+The first beat after the daemon's rebuild re-dated the Holder's Lease with the new, shorter TTL, so
+the Lease lapsed between two beats: the Sweep reclaimed it, and the Holder — still streaming — lost
+its Slot to a Waiter. Two sessions then streamed to the same endpoint at once: the serialisation
+promise this daemon exists to keep. The hole needed the new TTL to be under a third of the old one
+(the client's beat period), and the schema allows a TTL of 1000 ms — far under a third of the 30 s
+default.
+
+**Amended rule**: a Lease records the TTL it is held under, and that term only ever grows.
+
+- Every refresh of its expiry (a keyed beat, a bare heartbeat, a re-acquire) uses the longer of the
+  Lease's term and the Queue's current TTL, and the term absorbs the longer one.
+- A shortened TTL applies at the next Grant, never to a Lease that is already held: the Holder keeps
+  its Slot until it releases it — the promise this record makes for every other cause of a Switch.
+- A lengthened TTL applies at once: the rebuild re-dates the carried Holder's Lease under it.
+- A Queue whose TTL did not change behaves exactly as before: the effective TTL is the TTL it always
+  was, and the expiry still advances with every beat.
+
+The term only ever growing is what closes the last hole: a lengthening followed by a shortening
+cannot take the lengthening back, so a Holder that keeps beating is never evicted by a policy edit
+sequence either.
+
+The hot-reload rebuild carries a Holder's Lease with the terms it was granted under; only the
+Queue's own terms change.
+
+Not closed here: the mirror direction, where the client saw the edit and the daemon did not, so the
+client refreshed slower than the TTL the daemon was enforcing. The client must refresh on the terms
+the daemon granted the Lease under, not on its own copy of the config — that is #105.

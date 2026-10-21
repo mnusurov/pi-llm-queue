@@ -88,6 +88,163 @@ describe("lease / TTL (in memory)", () => {
 	});
 });
 
+// A config edit and the Lease it already holds (#104). A Lease records the TTL it was granted
+// under, and every refresh of its expiry uses the longer of that TTL and the Queue's current TTL:
+// a policy edit never shortens a Lease that is already held (ADR 0002), so the Holder keeps its
+// Slot until it releases it. The edit itself is the harness's `editPolicy` — the hot-reload, in
+// memory: the Queue's terms change, the Leases it holds keep theirs.
+describe("policy edit / lease TTL (in memory)", () => {
+	it("a shortened TTL never takes the Slot from a live Holder (the client's own reload never lands)", () => {
+		const h = new SchedulerHarness({ ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" }); // B waits behind A
+		h.advance(100);
+		h.beat(a, "A"); // the client beats at the old period: TTL / 3 = 10 s
+
+		// The daemon's config edit lands: the Queue's TTL is a third of what it was. The Extension's
+		// reload may land late or never, so A keeps beating at the old period.
+		h.editPolicy({ ttlMs: 1000 });
+
+		h.advance(9900); // now = 10000: the first beat after the edit
+		h.beat(a, "A");
+		h.advance(1001); // now = 11001: past the expiry the shortened TTL would have written
+		h.sweepAt();
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the Holder keeps its Slot: a policy edit never shortens a held Lease");
+		assert.deepEqual(h.grantedSessions(b), [], "the Waiter is not granted: the Slot never changed hands");
+	});
+
+	it("a Lease granted after the edit is held for the new TTL", () => {
+		const h = new SchedulerHarness({ ttlMs: 30000 });
+		const a = h.connect();
+
+		h.editPolicy({ ttlMs: 1000 });
+		h.acquire(a, "A", { role: "parent" }); // granted under the new terms: expires at 1000
+
+		h.sweepAt(999);
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the new Lease lives under the new TTL");
+		h.sweepAt(1001);
+		assert.deepEqual(h.holders(QUEUE_KEY), [], "the new Lease lapses at the new TTL");
+	});
+
+	it("a lengthened TTL applies at once: the Holder is evicted no earlier than the new TTL allows", () => {
+		const h = new SchedulerHarness({ ttlMs: 1000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+		h.editPolicy({ ttlMs: 60000 }); // the Queue's TTL is lengthened
+		h.beat(a, "A"); // the Holder's next beat refreshes under the new terms
+
+		h.sweepAt(1001);
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the old TTL no longer reclaims the Holder");
+		h.sweepAt(60001);
+		assert.deepEqual(h.grantedSessions(b), ["B"], "the Holder lapses under the new TTL");
+	});
+
+	it("a lengthened TTL applies at once even when the Holder's expiry is near (the rebuild re-dates it)", () => {
+		const h = new SchedulerHarness({ ttlMs: 1000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" }); // granted at 0, expires at 1000
+		h.acquire(b, "B", { role: "parent" });
+		h.advance(900); // now = 900: the Holder's expiry is 100 ms away
+		h.editPolicy({ ttlMs: 60000 }); // the Queue's TTL is lengthened
+
+		h.sweepAt(1001); // the expiry the Holder was granted under has passed
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the lengthened TTL applies at once: the Holder is not reclaimed at the old TTL");
+		h.sweepAt(60901);
+		assert.deepEqual(h.grantedSessions(b), ["B"], "the Holder lapses under the new TTL");
+	});
+
+	it("a lengthening a later shortening cannot take back", () => {
+		const h = new SchedulerHarness({ ttlMs: 1000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+		h.editPolicy({ ttlMs: 60000 }); // the Queue's TTL is lengthened
+		h.beat(a, "A");
+		h.advance(100);
+		h.editPolicy({ ttlMs: 1000 }); // and shortened again: the client still beats at the long period
+
+		h.advance(2000);
+		h.beat(a, "A"); // the client's next beat, far apart under the shortened TTL
+		h.advance(1001);
+		h.sweepAt();
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the Lease keeps the longest TTL it was held under");
+		assert.deepEqual(h.grantedSessions(b), [], "the Waiter is not granted: the Slot never changed hands");
+	});
+
+	it("the rebuild carries the Holder's terms and restarts its activity clock", () => {
+		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent", activity: true });
+		h.acquire(b, "B", { role: "parent", activity: true });
+		h.advance(600); // 2× idleYieldMs of silence: the Holder is idle
+		h.editPolicy({ idleYieldMs: 300, ttlMs: 30000 }); // the same TTL: only the carry happens
+
+		h.sweepAt();
+		assert.deepEqual(h.grantsFor(b), [], "the rebuild restarts the carried Holder's activity clock: no yield");
+		h.advance(301);
+		h.sweepAt();
+		assert.deepEqual(h.grantedSessions(b), ["B"], "the Holder is idle past the window: it yields");
+	});
+
+	it("a Queue whose TTL did not change advances the expiry with every beat", () => {
+		const h = new SchedulerHarness({ ttlMs: 1000 });
+		const a = h.connect();
+
+		h.acquire(a, "A", { role: "parent" }); // granted at 0, expires at 1000
+		h.editPolicy({ ttlMs: 1000 }); // the same TTL: nothing changes
+		h.advance(500);
+		h.beat(a, "A"); // the expiry advances to 1500
+
+		h.sweepAt(1001);
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the beat advanced the expiry past the old one");
+		h.sweepAt(1501);
+		assert.deepEqual(h.holders(QUEUE_KEY), [], "the Lease lapses one TTL after the last beat");
+	});
+
+	it("a bare heartbeat refreshes the Lease under the same rule", () => {
+		const h = new SchedulerHarness({ ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.acquire(b, "B", { role: "parent" });
+		h.editPolicy({ ttlMs: 1000 });
+
+		h.advance(10000);
+		h.heartbeat(a); // the connection-wide refresh
+		h.advance(1001); // now = 11001: past the expiry the shortened TTL would have written
+		h.sweepAt();
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "a bare heartbeat keeps the Holder's Slot too");
+	});
+
+	it("a re-acquire refreshes the Lease under the same rule", () => {
+		const h = new SchedulerHarness({ ttlMs: 30000 });
+		const a = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		h.editPolicy({ ttlMs: 1000 });
+		h.advance(10000);
+		const again = h.acquire(a, "A", { role: "parent" }); // the Grace re-acquire: a TTL refresh
+		assert.equal(again.refreshed, true, "the held Lease is refreshed, not granted again");
+
+		h.advance(1001); // now = 11001
+		h.sweepAt();
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the re-acquire keeps the Holder's Slot under the shortened TTL");
+	});
+});
+
 describe("idle yield (in memory)", () => {
 	it("bare heartbeats keep the TTL alive but not the slot: idle-yield fires (#57 guard)", () => {
 		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
