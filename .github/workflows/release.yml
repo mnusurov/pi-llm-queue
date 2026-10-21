@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  # npm trusted publishing: the runner exchanges this OIDC token for a short-lived publish token,
+  # so no npm token lives in the repository.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          # A poisoned npm cache can hand the OIDC token to code the cache was poisoned with.
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run check
+      - run: npm test
+      # The tag is the only trigger, so it has to name the version package.json declares.
+      - run: npm run check:release -- "$GITHUB_REF_NAME"
+      # The dry run shows what the tarball carries before the version becomes permanent.
+      - run: npm publish --dry-run
+      - run: npm publish
