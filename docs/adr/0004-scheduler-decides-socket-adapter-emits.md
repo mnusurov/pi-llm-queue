@@ -154,3 +154,26 @@ Structural, not behavioural: the wire protocol, the daemon's replies and the eve
 byte-for-byte unchanged. The record's core stands — the Scheduler decides, the Adapter emits — and
 so does the adapter's own surface: the file, the socket, the clock, the `status` view, the
 `requestedKey` echo and the config resolution.
+
+## Amendment (2026-10-21, #115): the Scheduler's public surface is its entries
+
+Date: 2026-10-21
+
+Status: Accepted (amends the #103 amendment's clause that "the members that existed only for the
+Adapter's surgery stop being part of its public surface"; the Scheduler's behaviour, the wire
+protocol and the daemon are unchanged).
+
+The #103 amendment left the surface half-narrowed: the Queue map and the rebuild's helpers went
+private, but the members only the Scheduler itself calls — the policy application, the Queue
+lookup, the pick, the grant, the release, the connection scope and the two resolvers — stayed
+public. Not one of them had a call site outside the class, and a caller that reached past an entry
+into a Queue's state broke it silently: a picked Waiter that stayed in the waiting list, an Aging
+streak that was not bumped.
+
+**Amended rule**: the Scheduler's public surface is its entries — the decisions it answers with —
+and nothing else. The Queue state, the grants, the pick, the release, the connection scope and the
+two resolvers are private to the class, so a call that would break a Queue's state does not run.
+
+Structural, not behavioural: the ten entries, the wire protocol, the daemon and every queue
+behaviour are byte-for-byte unchanged. The surface is asserted in memory, so a member that leaks
+back into it fails the suite.

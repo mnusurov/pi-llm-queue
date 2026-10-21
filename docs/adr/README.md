@@ -33,7 +33,8 @@ Amended records — read the amendment, not only the original decision:
   unchanged.
 - **0004** amended 2026-10-20 (#100) — the whole decision batch is logged before any reply of that
   batch goes out; amended 2026-10-21 (#103) — the Scheduler owns the hot-reload Queue rebuild;
-  amended 2026-10-21 (#111) — the mapping from a Decision to the wire moves into one module.
+  amended 2026-10-21 (#111) — the mapping from a Decision to the wire moves into one module;
+  amended 2026-10-21 (#115) — the Scheduler's public surface is its entries; the rest is private.
 - **0005** amended 2026-10-21 (#103) — the remap rule stays with Addressing, the rebuild moves into
   the Scheduler; amended 2026-10-21 (#109) — the refresh-period derivation leaves the config module
   for the Lease's terms module.
