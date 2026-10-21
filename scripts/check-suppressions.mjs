@@ -7,21 +7,19 @@
 // a hundred other lines, and a forbidden one is a silent hole in the type check the daemon-side
 // JavaScript now lives under.
 //
-// Scope: the repo's own sources — src/, test/ and scripts/. Usage: node scripts/check-suppressions.mjs
+// Scope: the whole repository — the rule says "anywhere in the repository". The checker names the
+// forbidden markers in its own source, so it skips itself.
+// Usage: node scripts/check-suppressions.mjs
 import { readFileSync } from "node:fs";
-import { join, relative } from "node:path";
+import { relative } from "node:path";
 import { repoRoot, walk } from "./lib/repo.mjs";
 
-const roots = ["src", "test", "scripts"];
 // The checker names the forbidden markers in its own source, so it skips itself.
 const SELF = "check-suppressions.mjs";
-const sources = roots
-	.flatMap((root) => walk(join(repoRoot, root), (name) => /\.(ts|js|mjs)$/.test(name)))
-	.filter((path) => !path.endsWith(SELF));
+const sources = walk(repoRoot, (name) => /\.(ts|js|mjs)$/.test(name)).filter((path) => !path.endsWith(SELF));
 
-// The markers are assembled from parts, so this script does not trip over its own source.
-const IGNORE = `@ts-${"ig"}nore`;
-const EXPECT = `@ts-${"exp"}ect-error`;
+const IGNORE = "@ts-ignore";
+const EXPECT = "@ts-expect-error";
 
 const findings = [];
 for (const path of sources) {

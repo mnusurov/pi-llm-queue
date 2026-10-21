@@ -13,7 +13,8 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
   JavaScript module is checked the moment it is written; a file that no one imports is checked
   because the program covers `src/`, not because someone imported it.
 - The JavaScript sources are held to the same `strict` rules as the TypeScript ones. Their types are
-  written as JSDoc: annotate every parameter, every return and every shared record's shape.
+  written as JSDoc: every parameter, every return and every shared record's shape carries a type.
+  A type that says it all needs no prose beside it.
 - `@ts-expect-error` is allowed when a suppression is the honest answer, and every one of them
   carries a comment saying why the suppression is needed. `@ts-ignore` is not allowed anywhere: it
   silences a check forever, and a check that is wrong should be fixed, not muted.

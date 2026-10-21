@@ -20,12 +20,12 @@ import { readJsonLines } from "./socket-lines.js";
  * @typedef {import("node:net").Socket} Socket
  * @typedef {import("./decisions.js").Decision} Decision
  * @typedef {Socket & { connId: number, counted?: boolean, cleaned?: boolean }} ClientConn
- * @typedef {{ sessionKey: string, tier: string, group?: string }} SessionEntry
+ * @typedef {import("./scheduler.js").Lease | import("./scheduler.js").Waiter} SessionEntry
  */
 
 const args = process.argv.slice(2);
 /**
- * @param {string} name The flag's name.
+ * @param {string} name
  * @returns {string | undefined} The flag's value, if the flag is there.
  */
 const arg = (name) => {
@@ -41,8 +41,10 @@ if (!socketArg) {
 	console.error("usage: daemon.js --socket <path> [--config <path>] [--models-json <path>] [--sweep-ms <ms>]");
 	process.exit(1);
 }
-// The socket path is required, so it is a string from here on; the config and catalog paths are
-// optional, and every use of them is guarded.
+
+// The socket path is required, so it is a string from here on. The alias is what makes that
+// visible inside the closures below: the narrowing of the check above does not reach them.
+// The config and catalog paths stay optional, and every use of them is guarded.
 const socketPath = socketArg;
 const configPath = configArg;
 const modelsJsonPath = modelsJsonArg;
@@ -72,8 +74,8 @@ if (modelsJsonPath && existsSync(modelsJsonPath)) {
 }
 
 /**
- * @param {Socket} conn The connection to write to.
- * @param {object} msg The message to write.
+ * @param {Socket} conn
+ * @param {object} msg
  */
 function send(conn, msg) {
 	conn.write(`${JSON.stringify(msg)}\n`);
@@ -83,7 +85,7 @@ function send(conn, msg) {
 // tier under the Scheduler's word (`tier`); the wire field is `role` (protocol:15). This is the one
 // boundary that renames it, so `status` reports both lists through one view and cannot drift apart.
 /**
- * @param {SessionEntry} entry The lease or waiter record.
+ * @param {SessionEntry} entry
  * @returns {{ sessionKey: string, role: string, group?: string }} The wire view.
  */
 function sessionView(entry) {
@@ -102,7 +104,7 @@ function sessionView(entry) {
 // swallowed: a bad path, a full disk or a log rotation race must never take the daemon down
 // (it is spawned detached, so a crash is silent) nor reject the request that logged.
 /**
- * @param {object} line The event-log line to append.
+ * @param {object} line
  */
 function writeEvent(line) {
 	const path = defaults.logFile;
@@ -141,7 +143,7 @@ function scheduleIdleExit(ms = defaults.daemonIdleExitMs ?? 0) {
 // extension holds one persistent connection per pi process, so the OS closes it on pi exit and on
 // pi crash alike: socket close is the "last pi is gone" signal, crash-safe by construction.
 /**
- * @param {ClientConn} conn The connection that joined the count.
+ * @param {ClientConn} conn
  */
 function countClient(conn) {
 	if (conn.counted) return;
@@ -187,7 +189,7 @@ function groupFor(key) {
 // `defaults`, so a hot-reload re-resolves through the new values.
 /**
  * @param {string} key The queue key.
- * @returns {{ maxStreams: number, ttlMs: number, agingAfterSlots: number, agingAfterMs: number, policy: string, idleYieldMs: number }} The resolved policy.
+ * @returns {import("./scheduler.js").QueuePolicy} The resolved policy.
  */
 function resolvePolicy(key) {
 	const p = resolveQueuePolicy(policyFor(key), defaults);
@@ -213,7 +215,7 @@ const connById = new Map();
 // edges: the log sink, the socket and the clock. The batch order (every line before any reply) is
 // the module's rule too; see the comment there for why it is a promise and not a detail.
 /**
- * @param {Decision[]} decisions The decisions to emit, in order.
+ * @param {Decision[]} decisions
  */
 function emitDecisions(decisions) {
 	emit(decisions, {
@@ -227,9 +229,9 @@ function emitDecisions(decisions) {
 }
 
 /**
- * @param {Record<string, any>} msg The wire message.
+ * @param {Record<string, any>} msg
 /**
- * @param {ClientConn} conn The connection it came on.
+ * @param {ClientConn} conn
  */
 function handle(msg, conn) {
 	// One clock stamp per op: every expires/lastActivityAt/enqueuedAt this op writes uses this single
@@ -255,7 +257,7 @@ function handle(msg, conn) {
 			// A re-acquire of a held slot is a TTL refresh: `granted` with no Grant decision (the Grace
 			// window logs one grant and no switch). The direct-grant path's reply rides on its own
 			// `grant` decision, so reply here only for a refresh, keyed by the current op's requestedKey.
-			if (result.refreshed && result.terms) {
+			if (result.refreshed) {
 				send(conn, grantedReply(requestedKey, msg.sessionKey, result.terms));
 			}
 			return;
@@ -337,7 +339,7 @@ const server = createServer((socket) => {
 // request; the adapter then decrements the Counted-client count (the decrement is AFTER the
 // disconnect, per the dual-ownership crux). close and error both fire: count the disconnect once.
 /**
- * @param {ClientConn} conn The connection that went away.
+ * @param {ClientConn} conn
  */
 function disconnect(conn) {
 	if (conn.cleaned) return;

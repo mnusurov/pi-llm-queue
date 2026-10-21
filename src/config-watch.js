@@ -68,14 +68,16 @@ export function watchConfigFile(configPath, { onChange, onError, watchFn = watch
 			onError(error instanceof Error ? error : new Error(String(error)));
 			return;
 		}
-		if (!watcher) return;
-		watcher.on("error", (error) => {
+		// The watch is armed now: a factory that hands back nothing is a broken watch, and the
+		// failure surfaces where it happens.
+		const armed = /** @type {import("node:fs").FSWatcher} */ (watcher);
+		armed.on("error", (error) => {
 			onError(error);
 			// The watch is broken: replace it, so the next edit is not missed.
 			stop();
 			arm();
 		});
-		watcher.unref?.();
+		armed.unref?.();
 	};
 
 	arm();

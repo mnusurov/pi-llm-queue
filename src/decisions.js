@@ -147,10 +147,11 @@ export const emit = (decisions, { write, send, now }) => {
 		if (owner === null) continue;
 		// The reply echoes the key the request asked with (the per-request `requestedKey` the
 		// Decision carries), falling back to the resolved queue key for a direct grant.
-		// A grant always carries the Lease's terms: the Scheduler attaches them (#105), so the
-		// terms are never missing here.
+		// A grant always carries the Lease's terms: the Scheduler attaches them (#105). A grant
+		// without them is a real failure, and it is reported as one — the client waits for a
+		// reply that never comes.
 		const terms = decision.terms;
-		if (!terms) continue;
+		if (!terms) throw new Error(`pi-llm-queue: the grant for session ${decision.sessionKey} carries no Lease terms`);
 		replies.push([owner, grantedReply(decision.requestedKey ?? decision.queueKey, decision.sessionKey, terms)]);
 	}
 	for (const [connId, msg] of replies) send(connId, msg);

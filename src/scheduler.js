@@ -92,6 +92,22 @@ import { growTerms, termsFor } from "./lease-terms.js";
  */
 
 /**
+ * A Queue before its policy is applied: the Queue's own state, with the policy fields still to fill.
+ *
+ * @typedef {object} QueueDraft
+ * @property {string} queueKey The Queue's key.
+ * @property {number} parentGrantStreak The consecutive parent grants the aging rule counts.
+ * @property {number} switches How many times the Queue handed its Slot to a new session.
+ * @property {Lease[]} holders The Queue's live Leases.
+ * @property {Waiter[]} waiting The Queue's parked requests.
+ * @property {number} [maxStreams] The Queue's capacity.
+ * @property {number} [agingAfterSlots] The parent-grant streak after which a child jumps the queue.
+ * @property {number} [agingAfterMs] The waiting time after which a child jumps the queue.
+ * @property {string} [policy] The Queue's tiering policy.
+ * @property {LeaseTerms} [terms] The terms new Leases are granted under.
+ */
+
+/**
  * One Queue's state as the adapter's `status` view reads it.
  *
  * @typedef {object} QueueSnapshot
@@ -150,28 +166,27 @@ export class Scheduler {
 	// maxStreams to Infinity, so every session is granted immediately (status reports null).
 	// The Queue's own state is the draft's; the policy fields are filled in here.
 	/**
-	 * @param {{ queueKey: string, parentGrantStreak: number, switches: number, holders: Lease[], waiting: Waiter[] }} core The Queue's own state.
+	 * @param {QueueDraft} queue The Queue's own state; the policy fields are filled in here.
 	 * @param {QueuePolicy} policy The queue's resolved policy.
 	 * @returns {Queue} The queue, with the policy applied.
 	 */
-	applyPolicyTo(core, policy) {
-		return {
-			...core,
-			// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49 / ADR
-			// 0002), so the slot moves on voluntary release, abort, disconnect, or a TTL lapse alone.
-			// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after this
-			// many consecutive parent grants, or after waiting this long.
-			maxStreams: policy.maxStreams,
-			agingAfterSlots: policy.agingAfterSlots,
-			agingAfterMs: policy.agingAfterMs,
-			// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
-			policy: policy.policy,
-			// The terms new Leases are granted under (ADR 0009): the TTL term and the idle-yield
-			// window. The TTL may be shorter than a held Lease's — the Lease keeps the TTL it was
-			// granted under (#104) — and the window a held Lease keeps is the one it was granted
-			// under (#105), so only a new Grant sees a changed one.
-			terms: termsFor(policy.ttlMs, policy.idleYieldMs),
-		};
+	applyPolicyTo(queue, policy) {
+		// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49 / ADR
+		// 0002), so the slot moves on voluntary release, abort, disconnect, or a TTL lapse alone.
+		// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after this
+		// many consecutive parent grants, or after waiting this long.
+		queue.maxStreams = policy.maxStreams;
+		queue.agingAfterSlots = policy.agingAfterSlots;
+		queue.agingAfterMs = policy.agingAfterMs;
+		// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
+		queue.policy = policy.policy;
+		// The terms new Leases are granted under (ADR 0009): the TTL term and the idle-yield
+		// window. The TTL may be shorter than a held Lease's — the Lease keeps the TTL it was
+		// granted under (#104) — and the window a held Lease keeps is the one it was granted
+		// under (#105), so only a new Grant sees a changed one.
+		queue.terms = termsFor(policy.ttlMs, policy.idleYieldMs);
+		// The policy fields are filled in above, so the draft is a Queue now.
+		return /** @type {Queue} */ (queue);
 	}
 
 	/**
@@ -326,7 +341,7 @@ export class Scheduler {
 	 * @param {string} queueKey The Queue the session asks for.
 	 * @param {string | undefined} requestedKey The key the request asked with.
 	 * @param {number} now The wall-clock instant, in ms since the epoch.
-	 * @returns {{ granted: boolean, refreshed: boolean, decisions: Decision[], terms?: LeaseTerms }} The answer and the decisions to emit.
+	 * @returns {{ granted: true, refreshed: true, decisions: Decision[], terms: LeaseTerms } | { granted: boolean, refreshed: false, decisions: Decision[] }} The answer and the decisions to emit. A refresh carries the Lease's terms: the term may have grown since the Grant.
 	 */
 	acquire(connId, sessionKey, tier, group, activity, queueKey, requestedKey, now) {
 		const queue = this.queueFor(queueKey);
@@ -595,8 +610,8 @@ export class Scheduler {
 }
 
 /**
- * @param {any[]} list The list to remove from.
- * @param {any} item The item to remove.
+ * @param {any[]} list
+ * @param {any} item
  */
 function remove(list, item) {
 	const at = list.indexOf(item);
@@ -608,9 +623,9 @@ function remove(list, item) {
 // that is already held (ADR 0002) — and the expiry follows it. The idle-yield window stays the
 // one the Lease was granted under.
 /**
- * @param {Lease} lease The lease whose expiry is refreshed.
- * @param {Queue} queue The Queue the lease is held in.
- * @param {number} now The wall-clock instant, in ms since the epoch.
+ * @param {Lease} lease
+ * @param {Queue} queue
+ * @param {number} now
  */
 function refreshExpiry(lease, queue, now) {
 	lease.terms = growTerms(lease.terms, queue.terms);

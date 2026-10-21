@@ -128,7 +128,8 @@ function checkValue(path, value, spec) {
 		case "path":
 			return typeof value === "string" && value.trim() ? null : bad(DESC.path);
 		case "enum": {
-			const values = spec.values ?? [];
+			// An enum field always carries its values; a spec without them is a broken schema.
+			const values = /** @type {string[]} */ (spec.values);
 			return typeof value === "string" && values.includes(value) ? null : bad(`one of ${values.map((v) => `"${v}"`).join(" or ")}`);
 		}
 	}
