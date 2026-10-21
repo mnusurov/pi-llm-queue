@@ -25,14 +25,27 @@
  *
  * A Queue's Policy arrives through the resolver the adapter supplies; a queue key the resolver
  * cannot resolve is the adapter's error, not a state the Scheduler recovers from.
+ *
+ * The Queue key a Queue lives under after a config reload arrives through the second resolver
+ * (ADR 0005): the Scheduler owns the Queue rebuild, so it asks for the target key itself.
  */
 export class Scheduler {
+	// The live Queues, by Queue key. Private: the Adapter never enumerates them — the Scheduler
+	// iterates its own (#103).
+	#queues;
 	// resolvePolicy(queueKey) -> { maxStreams, ttlMs, agingAfterSlots, agingAfterMs, policy, idleYieldMs }
 	// (plain resolved values; the adapter gets them from config.js resolveQueuePolicy, the one
 	// cascade that owns the defaults fallback).
-	constructor(resolvePolicy) {
+	// resolveQueueKey(queueKey) -> the Queue key that Queue lives under after a reload (the
+	// Addressing rule; the adapter supplies the call, the Scheduler applies it).
+	constructor(resolvePolicy, resolveQueueKey) {
+		// The Queue rebuild's rule is required: a Scheduler without it cannot answer where a Queue
+		// lives after a reload, and a default would silently drop the remap. Fail at construction, not
+		// at the first reload.
+		if (typeof resolveQueueKey !== "function") throw new Error("Scheduler: resolveQueueKey(queueKey) is required");
 		this.resolvePolicy = resolvePolicy;
-		this.queues = new Map();
+		this.resolveQueueKey = resolveQueueKey;
+		this.#queues = new Map();
 		// The connection scope of a Lease (protocol fact: a bare renew heartbeats every lease of the
 		// connection). Each Lease lives in queue.holders AND here; the granted answer is an identity
 		// comparison across both, so both live here (ADR 0004, "Considered options").
@@ -62,7 +75,7 @@ export class Scheduler {
 		return queue;
 	}
 
-	newQueue(queueKey) {
+	#newQueue(queueKey) {
 		return this.applyPolicyTo(
 			{ queueKey, parentGrantStreak: 0, switches: 0, holders: [], waiting: [] },
 			this.resolvePolicy(queueKey),
@@ -70,8 +83,8 @@ export class Scheduler {
 	}
 
 	queueFor(queueKey) {
-		if (!this.queues.has(queueKey)) this.queues.set(queueKey, this.newQueue(queueKey));
-		return this.queues.get(queueKey);
+		if (!this.#queues.has(queueKey)) this.#queues.set(queueKey, this.#newQueue(queueKey));
+		return this.#queues.get(queueKey);
 	}
 
 	leaseOf(queue, sessionKey) {
@@ -156,7 +169,7 @@ export class Scheduler {
 		return lease;
 	}
 
-	grantNext(queue, now, decisions = []) {
+	#grantNext(queue, now, decisions = []) {
 		while (queue.waiting.length && queue.holders.length < queue.maxStreams) {
 			const waiter = this.pickNext(queue, now);
 			remove(queue.waiting, waiter);
@@ -220,14 +233,14 @@ export class Scheduler {
 
 	release(connId, sessionKey, queueKey, now) {
 		const decisions = [];
-		const queue = this.queues.get(queueKey);
+		const queue = this.#queues.get(queueKey);
 		if (queue) this.releaseLease(queue, sessionKey, undefined, now, decisions);
 		return decisions;
 	}
 
 	cancel(connId, sessionKey, queueKey, now) {
 		const decisions = [];
-		const queue = this.queues.get(queueKey);
+		const queue = this.#queues.get(queueKey);
 		if (queue) {
 			const w = queue.waiting.find((x) => x.sessionKey === sessionKey && x.connId === connId);
 			if (w) {
@@ -242,7 +255,7 @@ export class Scheduler {
 	// retier (/queue promote|demote): re-tier a live queued waiter in place (no reply, like cancel).
 	retier(connId, sessionKey, tier) {
 		tier = tier === "child" ? "child" : "parent";
-		for (const queue of this.queues.values()) {
+		for (const queue of this.#queues.values()) {
 			const w = queue.waiting.find((x) => x.sessionKey === sessionKey && x.connId === connId);
 			if (w) {
 				w.tier = tier;
@@ -278,7 +291,7 @@ export class Scheduler {
 			if (reason === "ttl") decisions.push({ type: "evict", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason: "ttl" });
 			else decisions.push({ type: "release", queueKey: queue.queueKey, sessionKey, tier: lease.tier, reason });
 		}
-		this.grantNext(queue, now, decisions);
+		this.#grantNext(queue, now, decisions);
 	}
 
 	// sweepAt: TTL evict (unconditional, so `status` never reports a ghost holder) then idle-yield
@@ -286,7 +299,7 @@ export class Scheduler {
 	// ADR 0003).
 	sweepAt(now) {
 		const decisions = [];
-		for (const queue of this.queues.values()) {
+		for (const queue of this.#queues.values()) {
 			for (const lease of [...queue.holders]) if (now > lease.expires) this.releaseLease(queue, lease.sessionKey, "ttl", now, decisions);
 			// Idle-yield: an activity-flagged holder silent past its window with waiters present yields
 			// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
@@ -300,11 +313,56 @@ export class Scheduler {
 		return decisions;
 	}
 
-	// redateLease: a rebuild re-dates a carried Holder's Lease under the Queue's terms. A shortened
+	// #redateLease: a rebuild re-dates a carried Holder's Lease under the Queue's terms. A shortened
 	// TTL leaves the Lease untouched — the Holder keeps the terms it was granted under (ADR 0002) —
 	// and a lengthened one applies at once: the term grows and the expiry follows it (#104).
-	redateLease(queue, lease, now) {
+	#redateLease(queue, lease, now) {
 		if (queue.ttlMs > lease.ttlMs) refreshExpiry(lease, queue, now);
+	}
+
+	// rebuildQueues: the Queue rebuild of a config reload (#103). The Scheduler owns it end to end —
+	// it iterates its own Queues, asks the second resolver where each one lives after the reload,
+	// and carries that Queue's Holders, Waiters and switch count to the target key. The target's
+	// rules are re-resolved (the policy the reload brought), every carried Holder's activity clock
+	// restarts, and the Queues left over capacity are reported back to the adapter.
+	//
+	// The Adapter supplies the Addressing rule as the second resolver and never sees the Queues
+	// themselves: the rule stays in src/addressing.js, which never sees Scheduler state (ADR 0005).
+	rebuildQueues(now) {
+		const rebuilt = new Map();
+		for (const [key, queue] of this.#queues) {
+			const target = this.resolveQueueKey(key);
+			let moved = rebuilt.get(target);
+			if (!moved) rebuilt.set(target, (moved = this.#newQueue(target)));
+			moved.switches += queue.switches; // a rebuild (group merge) carries the switch counts with it
+			for (const lease of queue.holders) {
+				lease.queueKey = target;
+				// The terms are the Scheduler's: a policy edit never shortens a held Lease, and a
+				// lengthened TTL applies at once (#104).
+				this.#redateLease(moved, lease, now);
+				// A policy edit starts every carried holder's activity clock afresh: the idle-yield
+				// window a Lease is held under does not change (#105), so the fresh clock is the grace
+				// that keeps a rebuild from yielding a holder on the spot (#81).
+				lease.lastActivityAt = now;
+				moved.holders.push(lease);
+			}
+			for (const waiter of queue.waiting) {
+				waiter.queueKey = target;
+				moved.waiting.push(waiter);
+			}
+		}
+		// No-preemption (#49): the merged queue may start with more holders than its new maxStreams.
+		// Report that transient over-capacity rather than exceed the limit silently (#82). The report
+		// is taken before the grants below, so it counts the holders the move carried over.
+		const overCapacity = [];
+		for (const queue of rebuilt.values()) {
+			if (queue.holders.length > queue.maxStreams) overCapacity.push({ queueKey: queue.queueKey, holders: queue.holders.length, maxStreams: queue.maxStreams });
+		}
+		this.#queues.clear();
+		for (const [key, queue] of rebuilt) this.#queues.set(key, queue);
+		const decisions = [];
+		for (const queue of this.#queues.values()) this.#grantNext(queue, now, decisions);
+		return { decisions, overCapacity };
 	}
 
 	// snapshot: the raw queue state for the adapter's `status` view. It returns the live Holder (Lease)
@@ -312,7 +370,7 @@ export class Scheduler {
 	// build the wire shape. The adapter maps each record to the wire shape (sessionView, maxStreams
 	// Infinity -> JSON null) so the Scheduler never serialises (ADR 0004: the status view is adapter-side).
 	snapshot() {
-		return [...this.queues.values()].map((q) => ({
+		return [...this.#queues.values()].map((q) => ({
 			queueKey: q.queueKey,
 			maxStreams: q.maxStreams,
 			switches: q.switches,

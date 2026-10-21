@@ -120,8 +120,17 @@ _Avoid_: poller, monitor
 **Scheduler**:
 The daemon's deciding part: the rule that picks which Waiter takes a Slot next, and when a Lease
 ends. It answers who holds, who waits, and when a Switch happens. It never speaks to a client and
-never writes to a log: those are the daemon's doing, not its decision.
+never writes to a log: those are the daemon's doing, not its decision. It owns the Queue rebuild: on
+a config reload it carries each Queue's Holders, Waiters and switch count to the Queue key that
+Queue lives under.
 _Avoid_: daemon, dispatcher, scheduler pass, engine
+
+**Queue rebuild**:
+The carrying of a Queue's Holders, Waiters and switch count to the Queue key that Queue lives
+under after a config reload: a group added at runtime takes the endpoint's Queue with it, and the
+Holder keeps the Slot it was granted. The Addressing rule says which key that is; the Scheduler
+performs the rebuild.
+_Avoid_: migration, key rewrite, holder migration
 
 **Tier**:
 A requester's priority class — `parent` (interactive) above `child` (subagent) — that orders the
@@ -180,9 +189,10 @@ A subagent session; queues with an unbounded queue wait so it never streams unqu
 _Avoid_: sub-agent, worker
 
 **Addressing**:
-The rule deciding which Queue a request addresses. Direct (model → Queue key) and reverse (Queue
-key → providers to wrap) are directions of one concept, owned by one module (ADR 0005). A Queue key
-is its result, not the rule.
+The rule deciding which Queue a request addresses. Direct (model → Queue key), reverse (Queue
+key → providers to wrap) and reload (Queue key → the key that Queue lives under after a config
+reload) are directions of one concept, owned by one module (ADR 0005). A Queue key is its result,
+not the rule.
 _Avoid_: routing, resolution, keying
 
 **Queue key**:

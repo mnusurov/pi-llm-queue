@@ -52,7 +52,9 @@ scope is a protocol fact ("a bare `renew` heartbeats every lease of the connecti
   `waiter.queue` in place because the connection records reference the old Queue objects, and with
   the Scheduler owning those records the reference repair needs its own contract. Amendment (ADR
   0005): the addressing rules live in `src/addressing.js` — the adapter asks it for each live
-  queue's remap target, applies the remap and migrates the state itself.
+  queue's remap target, applies the remap and migrates the state itself. Amendment (2026-10-21,
+  #103): the Queue rebuild itself moves into the Scheduler, which iterates its own Queues and asks for
+  each Queue's remap target through the resolver the adapter supplies.
 - The Switch predicate becomes explicit: a Switch **iff** the granted session came from the waiting
   list — the protocol's wording, not an inference from the presence of a prior Holder.
 - The Aging streak is bumped in one Grant path, so the direct-grant fast path cannot drift from the
@@ -88,3 +90,35 @@ Consequences of the amendment:
   the log lines are exactly as decided above.
 - The rule is now testable as a promise rather than a race: the log's completeness at reply time
   is asserted over repeated handovers in `test/daemon-event-log.test.ts`.
+
+## Amendment (2026-10-21, #103): the Scheduler owns the hot-reload Queue rebuild
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Consequences clause that keeps the hot-reload adapter-side).
+
+The Consequences clause keeps `rebuildQueues` in the socket adapter because "the connection records
+reference the old Queue objects" — a Waiter held `waiter.queue = moved`, a direct reference to the
+Queue record. That was true when the Scheduler was extracted. It is not true now: the extraction
+replaced the reference with `waiter.queueKey = target`, and this record's own Decision moved the
+Lease records and their connection scope into the Scheduler. Nothing outside the Scheduler
+references a Queue record any more, so the reference repair the clause protects no longer exists.
+
+**Amended rule**: the Scheduler owns the hot-reload Queue rebuild end to end.
+
+- The Scheduler takes a second resolver beside the one it already has for a Queue's rules: given a
+  Queue key, it answers the Queue key that Queue lives under after a reload. The Adapter supplies
+  it — the rule stays in Addressing, which never sees Scheduler state (ADR 0005).
+- The Scheduler iterates its own Queues, so the Adapter never enumerates them, and the queue map
+  and the members that existed only for the Adapter's surgery stop being part of its public
+  surface.
+- The rebuild carries each Queue's Holders (each Holder's activity clock restarted, as before), its
+  Waiters and its switch count; re-resolves the Queue's rules; reports the Queues left over
+  capacity; and grants whatever the new capacity frees.
+- It returns the decisions to emit and the over-capacity report. The Adapter emits the decisions
+  and logs the report as the `config` event it already writes — the report's shape is the event's
+  shape, so the protocol does not change.
+
+Structural, not behavioural: the wire protocol, the daemon's replies and every queue behaviour are
+byte-for-byte unchanged. The rebuild becomes reachable in memory, so it is asserted through the
+Scheduler's interface; the socket-level hot-reload suites stay the integration oracle.

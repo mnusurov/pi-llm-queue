@@ -1,8 +1,8 @@
 // Queue addressing: the rule deciding which Queue a request addresses, in both directions
 // (ADR 0005). Direct: a model or an endpoint → { queueKey, entry }. Reverse: the queues → the
-// providers to wrap. Rules only, never state: the socket adapter keeps the reload's state
-// migration (holders, waiters, switch counts are Scheduler state), and asks this module for each
-// live queue's remap target.
+// providers to wrap. Rules only, never state: the Scheduler owns the reload's state migration
+// (holders, waiters, switch counts are Scheduler state, #103), and asks this module's rule for
+// each live queue's remap target.
 //
 // Plain JS on purpose: the daemon imports it, and Node's built-in type stripping is refused for
 // files under node_modules, so a .ts import would kill an installed daemon (the config.js reason).
