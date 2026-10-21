@@ -5,7 +5,8 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: read
+  # The release is created with the runner's own token, so it needs write access to the repository.
+  contents: write
   # npm trusted publishing: the runner exchanges this OIDC token for a short-lived publish token,
   # so no npm token lives in the repository.
   id-token: write
@@ -29,3 +30,10 @@ jobs:
       # The dry run shows what the tarball carries before the version becomes permanent.
       - run: npm publish --dry-run
       - run: npm publish
+      # The release comes after the publish: a release must never advertise a version npm has not
+      # taken. The notes are generated from the commits — rewrite them if the release says more
+      # than the list does.
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes --title "$GITHUB_REF_NAME" --verify-tag
