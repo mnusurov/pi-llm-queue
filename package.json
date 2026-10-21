@@ -41,8 +41,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "check:jsdoc": "node scripts/check-jsdoc.mjs",
+    "check:suppressions": "node scripts/check-suppressions.mjs",
     "check:docs": "node scripts/check-docs.mjs",
-    "check": "npm run typecheck && npm run check:jsdoc && npm run check:docs",
+    "check": "npm run typecheck && npm run check:jsdoc && npm run check:suppressions && npm run check:docs",
     "test": "node --test test/*.test.ts"
   },
   "devDependencies": {

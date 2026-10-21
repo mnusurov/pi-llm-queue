@@ -8,6 +8,16 @@ disagree, the ADR wins. Domain terms live in `GLOSSARY.md`.
 - Daemon-loaded modules under `src/` stay JavaScript (`.js`). Node refuses type stripping under
   `node_modules`, so an installed daemon must be able to import them; add no TypeScript syntax or
   `.ts` imports to that path.
+- The JavaScript under `src/` is type-checked: `tsconfig.json` runs `checkJs` over the whole program,
+  and every module in it — the daemon entry point included — is checked without an opt-in. A new
+  JavaScript module is checked the moment it is written; a file that no one imports is checked
+  because the program covers `src/`, not because someone imported it.
+- The JavaScript sources are held to the same `strict` rules as the TypeScript ones. Their types are
+  written as JSDoc: every parameter, every return and every shared record's shape carries a type.
+  A type that says it all needs no prose beside it.
+- `@ts-expect-error` is allowed when a suppression is the honest answer, and every one of them
+  carries a comment saying why the suppression is needed. `@ts-ignore` is not allowed anywhere: it
+  silences a check forever, and a check that is wrong should be fixed, not muted.
 - Extension code is TypeScript (`.ts`). Relative imports name the real file extension: `.js` for
   JavaScript, `.ts` for TypeScript.
 - Keep the package dependency-free at runtime. Dev and peer dependencies only.

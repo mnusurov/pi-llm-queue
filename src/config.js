@@ -44,7 +44,7 @@ export const DEFAULTS = {
  * @returns {{ maxStreams: number, leaseTtlMs: number, agingAfterSlots: number, agingAfterMs: number, policy: string, idleYieldMs: number }}
  */
 export function resolveQueuePolicy(entry, defaults) {
-	const pick = (field) => entry[field] ?? defaults[field] ?? DEFAULTS[field];
+	const pick = (/** @type {string} */ field) => entry[field] ?? defaults[field] ?? DEFAULTS[field];
 	return {
 		maxStreams: entry.enabled === false ? Infinity : pick("maxStreams"),
 		leaseTtlMs: pick("leaseTtlMs"),
@@ -108,12 +108,12 @@ const isObj = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
  * @returns {string | null}
  */
 function checkValue(path, value, spec) {
-	const bad = (desc) => `${path} must be ${desc} (got ${JSON.stringify(value)})`;
+	const bad = (/** @type {string} */ desc) => `${path} must be ${desc} (got ${JSON.stringify(value)})`;
 	switch (spec.kind) {
 		case "posInt":
-			return Number.isInteger(value) && value >= 1 ? null : bad(DESC.posInt);
+			return typeof value === "number" && Number.isInteger(value) && value >= 1 ? null : bad(DESC.posInt);
 		case "nonNegInt":
-			return Number.isInteger(value) && value >= 0 ? null : bad(DESC.nonNegInt);
+			return typeof value === "number" && Number.isInteger(value) && value >= 0 ? null : bad(DESC.nonNegInt);
 		case "posNum": {
 			const floor = spec.min ?? 0;
 			const desc = spec.min === undefined ? DESC.posNum : `a number >= ${spec.min}`;
@@ -127,8 +127,11 @@ function checkValue(path, value, spec) {
 			return Array.isArray(value) && value.every((m) => typeof m === "string") ? null : bad(DESC.strings);
 		case "path":
 			return typeof value === "string" && value.trim() ? null : bad(DESC.path);
-		case "enum":
-			return typeof value === "string" && spec.values.includes(value) ? null : bad(`one of ${spec.values.map((v) => `"${v}"`).join(" or ")}`);
+		case "enum": {
+			// An enum field always carries its values; a spec without them is a broken schema.
+			const values = /** @type {string[]} */ (spec.values);
+			return typeof value === "string" && values.includes(value) ? null : bad(`one of ${values.map((v) => `"${v}"`).join(" or ")}`);
+		}
 	}
 }
 
@@ -165,7 +168,7 @@ function checkFields(path, obj, inQueue) {
 export function validateConfig(raw) {
 	if (!isObj(raw)) return ["config must be a JSON object"];
 	const errors = [];
-	const { schemaVersion, defaults, queues, ...rest } = raw;
+	const { schemaVersion, defaults, queues, ...rest } = /** @type {Record<string, any>} */ (raw);
 	for (const field of Object.keys(rest)) errors.push(`${field} is an unknown top-level field (known: schemaVersion, defaults, queues)`);
 	if (schemaVersion !== undefined) {
 		if (!Number.isInteger(schemaVersion) || schemaVersion < 1) errors.push(`schemaVersion must be a positive integer (got ${JSON.stringify(schemaVersion)})`);
@@ -221,7 +224,7 @@ export function loadValidConfig(path) {
 	try {
 		parsed = JSON.parse(raw);
 	} catch (error) {
-		return { config: {}, errors: [`config is not valid JSON: ${error.message}`], invalidJson: true };
+		return { config: {}, errors: [`config is not valid JSON: ${error instanceof Error ? error.message : String(error)}`], invalidJson: true };
 	}
 	const errors = validateConfig(parsed);
 	return errors.length ? { config: {}, errors, invalidJson: false } : { config: parsed, errors, invalidJson: false };

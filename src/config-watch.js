@@ -34,8 +34,11 @@ import { basename, dirname } from "node:path";
 export function watchConfigFile(configPath, { onChange, onError, watchFn = watch, debounceMs = 250, rearmMs = 30000 }) {
 	const dir = dirname(configPath);
 	const name = basename(configPath);
+	/** @type {import("node:fs").FSWatcher | null} */
 	let watcher = null;
+	/** @type {NodeJS.Timeout | null} */
 	let debounce = null;
+	/** @type {NodeJS.Timeout | null} */
 	let rearm = null;
 	let closed = false;
 
@@ -62,16 +65,19 @@ export function watchConfigFile(configPath, { onChange, onError, watchFn = watch
 				debounce.unref?.();
 			});
 		} catch (error) {
-			onError(error);
+			onError(error instanceof Error ? error : new Error(String(error)));
 			return;
 		}
-		watcher.on("error", (error) => {
+		// The watch is armed now: a factory that hands back nothing is a broken watch, and the
+		// failure surfaces where it happens.
+		const armed = /** @type {import("node:fs").FSWatcher} */ (watcher);
+		armed.on("error", (error) => {
 			onError(error);
 			// The watch is broken: replace it, so the next edit is not missed.
 			stop();
 			arm();
 		});
-		watcher.unref?.();
+		armed.unref?.();
 	};
 
 	arm();

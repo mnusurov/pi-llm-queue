@@ -16,18 +16,34 @@ import { readJson } from "./config.js";
  *   the caller: this module returns the entry, never a resolved policy.
  */
 
-/** Providers a queue key addresses: a provider named directly, or every provider serving that endpoint. */
+/**
+ * Providers a queue key addresses: a provider named directly, or every provider serving that endpoint.
+ * @param {string} key The queue key.
+ * @param {Record<string, any>} providers The provider catalog.
+ * @returns {string[]} The provider names the key addresses.
+ */
 export function matchingProviders(key, providers) {
 	if (providers[key]) return [key];
 	return Object.keys(providers).filter((name) => providers[name]?.baseUrl === key);
 }
 
-/** A queue entry's members: its own key plus its `match` list — the names that address this queue. */
+/**
+ * A queue entry's members: its own key plus its `match` list — the names that address this queue.
+ * @param {string} key The queue key.
+ * @param {Record<string, any> | undefined} entry The queue's config entry.
+ * @returns {string[]} The member names.
+ */
 export function membersOf(key, entry) {
 	return [key, ...(entry?.match ?? [])];
 }
 
-/** True when a queue key addresses this endpoint: it names the endpoint, a provider serving it, or a provider name on it. */
+/**
+ * True when a queue key addresses this endpoint: it names the endpoint, a provider serving it, or a provider name on it.
+ * @param {string} key The queue key.
+ * @param {Record<string, any>} providers The provider catalog.
+ * @param {string} baseUrl The endpoint.
+ * @returns {boolean} Whether the key addresses the endpoint.
+ */
 export function keyAddressesEndpoint(key, providers, baseUrl) {
 	return matchingProviders(key, providers).some((name) => providers[name]?.baseUrl === baseUrl);
 }
@@ -38,13 +54,13 @@ export function keyAddressesEndpoint(key, providers, baseUrl) {
  * itself. A caller naming no provider (the endpoint form) never reaches the first branch.
  * @param {Record<string, any>} queues
  * @param {Record<string, any>} providers models.json provider catalog
- * @param {{ provider?: string, baseUrl?: string }} model
+ * @param {{ provider?: string, baseUrl: string }} model
  * @returns {string}
  */
 function groupKeyFor(queues, providers, model) {
 	const active = Object.entries(queues ?? {}).filter(([, entry]) => entry?.enabled !== false);
 	for (const [name, entry] of active) if (entry?.match?.includes(model.provider)) return name;
-	for (const [name, entry] of active) if (entry?.match?.some((m) => m === model.baseUrl || providers[m]?.baseUrl === model.baseUrl)) return name;
+	for (const [name, entry] of active) if (entry?.match?.some((/** @type {string} */ m) => m === model.baseUrl || providers[m]?.baseUrl === model.baseUrl)) return name;
 	return model.baseUrl;
 }
 
@@ -65,7 +81,7 @@ function owningEntry(queues, providers, key) {
 /**
  * Address a model's queue — the extension's form, where the provider-name branch is live: a group
  * naming the model's provider splits one endpoint into per-provider slot sets.
- * @param {{ provider?: string, baseUrl?: string }} model
+ * @param {{ provider?: string, baseUrl: string }} model
  * @param {Record<string, any>} queues
  * @param {Record<string, any>} providers
  * @returns {Address}
