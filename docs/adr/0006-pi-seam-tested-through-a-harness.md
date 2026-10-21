@@ -31,8 +31,8 @@ statuses, dispose — and never index a handler array or the provider registry.
 
 The surface has two levels:
 
-- `startExtension({ config, models, env?, daemon? })` — one per `extension(pi)` call. `daemon`
-  defaults to spawning a daemon on the harness's agent dir; `false` leaves the Extension to
+- `startExtension({ config, models, env?, daemon?, daemonConfig? })` — one per `extension(pi)` call.
+  `daemon` defaults to spawning a daemon on the harness's agent dir; `false` leaves the Extension to
   autostart one, which the fail-open and lifecycle suites need. `env` is applied around the
   registration call (where the Extension reads `PI_QUEUE_ROLE` / `PI_QUEUE_GROUP`) and restored on
   dispose.
@@ -68,3 +68,18 @@ reintroduce exactly the `ctx` construction being removed. `providers()` is read-
   instead of eight `after` hooks.
 - `GLOSSARY.md` gains **Extension** and **Adapter**; the harness itself stays out — it is test
   tooling, not domain language.
+
+## Amendment (2026-10-21, #105): the daemon can run on a config of its own
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's harness surface).
+
+The daemon and the Extension read the same config file, each through its own watcher, so a suite
+that needs the two copies to disagree — the divergence that decides a Lease's life — had no way to
+say so. `startExtension` gained `daemonConfig`: the harness writes it to a file of its own and
+spawns the daemon on that file, so the Extension's copy and the daemon's copy differ.
+
+The daemon is shared per process (one socket per agent dir), so the first harness in a file decides
+the config it serves: a harness that names a different one, or none at all, fails instead of
+testing against a daemon it never described.

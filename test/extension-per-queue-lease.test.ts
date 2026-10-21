@@ -92,7 +92,7 @@ describe("per-queue lease policy (#81)", () => {
 		await session.dispatch("session_shutdown");
 	});
 
-	it("restarts live beats when a hot-reload shortens a queue's idleYieldMs", async () => {
+	it("keeps the live holder when a hot-reload shortens a queue's idleYieldMs", async () => {
 		const ext = startExt(configFor(6000, 30000)); // the reload-idle queue: beats every 2000 ms, 30 s idle window
 		const a = ext.startSession("PQ-IDLE-RELOAD-A", { model: modelFor("reloadIdle", RELOAD_IDLE_URL) });
 		const b = ext.startSession("PQ-IDLE-RELOAD-B", { model: modelFor("reloadIdle", RELOAD_IDLE_URL) });
@@ -102,7 +102,9 @@ describe("per-queue lease policy (#81)", () => {
 		ext.writeConfig(configFor(6000, 1000)); // a 1000 ms idle window now applies while B is queued
 		await pollUntil(() => a.notifications().some((n) => /config reloaded/.test(n.message)), 3000, "waiting for the extension's config reload");
 
-		// Two new idle windows: without an immediate beat under the new policy, the sweep yields A.
+		// The window is a Lease term, and it does not change while the Lease is held (#105): A keeps
+		// the window it was granted under, and the client refreshes on the terms the Grant carried —
+		// so the shortened window reaches the next Grant, never the live Holder.
 		await sleep(2000);
 		const q = await ext.status(RELOAD_IDLE_URL);
 		assert.deepEqual(q.holders.map((h: any) => h.sessionKey), ["PQ-IDLE-RELOAD-A"], "a shortened idle window never yields the live holder");

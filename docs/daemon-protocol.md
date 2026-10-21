@@ -7,7 +7,7 @@ JSON. Every message is one JSON object on a single line.
 
 | op        | fields                                        | response                                                        |
 | --------- | --------------------------------------------- | --------------------------------------------------------------- |
-| `acquire` | `queueKey`*, `sessionKey`, `role`, `group`, `activity`     | `{"op":"granted","queueKey","sessionKey"}` — sent when granted   |
+| `acquire` | `queueKey`*, `sessionKey`, `role`, `group`, `activity`     | `{"op":"granted","queueKey","sessionKey","leaseTtlMs","idleYieldMs"}` — sent when granted; the last two fields are the lease's terms (#105) |
 | `release` | `queueKey`*, `sessionKey`                     | `{"op":"ok"}`                                                    |
 | `cancel`  | `queueKey`*, `sessionKey`                     | — (no reply) — drop a queued request, and release a Slot the session already holds |
 | `role`    | `sessionKey`, `role`                         | — (no reply) — re-tier a live queued waiter (`/queue promote\|demote`); a Holder keeps the tier it was granted with |
@@ -45,10 +45,9 @@ tier — with aging anti-starvation: the longest-waiting child jumps the queue o
 
 A grant is a **lease** with a TTL (`leaseTtlMs`, default 30 s, minimum 1000 ms). A live client
 keeps its leases alive with a bare `renew` heartbeat. Each queue resolves its own policy, and the
-client's keyed activity beat follows it: `leaseTtlMs / 3` (floor 250 ms) and at most
-`idleYieldMs / 2`, so a per-queue TTL never lapses and a live holder is never yielded between
-beats. The connection-wide bare heartbeat uses the smallest period across the configured queues.
-A config hot-reload re-resolves both and restarts live beats.
+client's keyed activity beat follows the lease's terms — `leaseTtlMs / 3` (floor 250 ms) and at
+most `idleYieldMs / 2` — so a per-queue TTL never lapses and a live holder is never yielded between
+beats.
 **A policy edit never shortens a lease that is already held**: the lease keeps the TTL it was granted
 under — the term only ever grows — and every refresh of its expiry uses the longer of that term and
 the queue's current TTL. A shortened TTL therefore applies at the next grant (the holder keeps its
@@ -57,6 +56,27 @@ slot until it releases it), and a lengthened one applies at once (#104).
 reclaims its slot when the TTL lapses and grants the next waiter. That is the only reclamation of a
 dead client, and it is bounded — the sweep evicts it within one sweep interval of `leaseTtlMs`
 after the last heartbeat (`leaseTtlMs + sweepMs`).
+
+### The Lease's terms
+
+The **terms** of a lease are the TTL and the idle-yield window it is held under. The `granted`
+reply carries them — `leaseTtlMs` and `idleYieldMs` — beside the grant itself, and they are
+additive: a client that does not read them keeps working.
+
+The client refreshes a lease on its terms, not on its own copy of the config: the keyed beat runs
+at `leaseTtlMs / 3` (floor 250 ms) and at most `idleYieldMs / 2` of the terms the daemon granted
+the lease under, and the connection-wide bare heartbeat — the one that covers a holder whose keyed
+beat is paused while it waits on another agent — runs at the smallest such period across the leases
+it covers. The client's copy of the config is its fallback for a daemon that sends no terms; it
+never decides a lease's life.
+
+That is what closes the class the two config copies opened: the daemon and the client read the
+config file independently, each through its own watcher, so a config edit one of them sees and the
+other does not used to decide how long a lease lived. A lease's terms are the ones the daemon
+enforces for it — the TTL grows with the queue's (#104), and the idle-yield window is the one the
+lease was granted under, because a window the daemon lengthened under a live holder would leave
+that holder's client beating slower than the window allows, and the slot would go to a waiter while
+the holder still streams. A changed window therefore applies at the next grant (#105).
 
 The slot is held per session across a whole run, and **a live holder is never preempted**
 (ADR 0002): the queue never switches a streaming holder away. A session switch happens only on:
@@ -70,10 +90,10 @@ The slot is held per session across a whole run, and **a live holder is never pr
   request it had queued (a killed session and a closed laptop look the same from here);
 - **TTL lapse** — the client stopped heartbeating, i.e. it died: a session killed mid-stream, a
   process that vanished, a heartbeat starved by a tool that blocks the event loop;
-- **idle yield** (ADR 0003) — an activity-flagged holder sent no keyed beat for `idleYieldMs`
-  and a waiter is queued: the daemon releases the slot and grants the next waiter. A lone holder
-  is never disturbed; an unflagged (old-client) lease is never yielded. The yielded client learns
-  on its next beat (`granted: false`) and re-queues.
+- **idle yield** (ADR 0003) — an activity-flagged holder sent no keyed beat for its idle-yield
+  window and a waiter is queued: the daemon releases the slot and grants the next waiter. A lone
+  holder is never disturbed; an unflagged (old-client) lease is never yielded. The yielded client
+  learns on its next beat (`granted: false`) and re-queues.
 
 A keyed `renew` (activity beat) refreshes the TTL, and its reply is authoritative: `granted: false`
 means the slot is gone (released, disconnected, past its TTL) and the client must re-queue before it
@@ -86,8 +106,10 @@ test costs milliseconds). The sweep is two passes:
 - **TTL eviction, unconditional** — every lease whose TTL lapsed is evicted whether or not anyone
   is waiting: a lapsed lease is a dead client, and `/queue` must never report it as a holder
   (ADR 0002).
-- **idle yield, gated** (ADR 0003) — only when `idleYieldMs > 0`, a waiter is queued, and the
-  lease is activity-flagged: a holder silent past `idleYieldMs` loses the slot to the next waiter.
+- **idle yield, gated** (ADR 0003) — only when the lease's idle-yield window is above zero, a
+  waiter is queued, and the lease is activity-flagged: a holder silent past its window loses the
+  slot to the next waiter. That window is the lease's own term: the one it was granted under, so a
+  changed window applies at the next grant (#105).
 
 shortcut: a child that stalls while holding the slot keeps it until it is stopped, its socket
 closes, its TTL lapses (a dead client), or it is idle-yielded (ADR 0003, activity-flagged
@@ -154,7 +176,9 @@ keeps the last good config.
 - **`idleYieldMs`** — idle-yield threshold (default `30000`, `0` disables): an activity-flagged
   holder that sends no keyed beat for this long, with a waiter queued, is released and the next
   waiter is granted. A lone holder is never disturbed; an unflagged (old-client) lease is never
-  yielded. Valid in `defaults` and per-queue.
+  yielded. Valid in `defaults` and per-queue. A lease that is already held keeps the window it was
+  granted under (#105): a changed window — shortened, lengthened, or disabled — applies at the next
+  grant.
 
 - **`logFile`** — the daemon's event log path (`defaults` only, a `path` string). Unset: no file,
   and the daemon behaves exactly as before (its stderr is discarded when the extension spawns it
@@ -217,9 +241,15 @@ Holder: the Holders keep streaming until they release, `status` reports the tran
 `logFile` is set. No additional request is granted until the count is back under the limit; the
 overrun drains as each Holder releases its slot. The extension watches the same file and re-resolves
 its wrapped provider set (registering new providers, unregistering removed ones). A half-written
-file keeps the last good config. No daemon or pi restart is needed; the client's per-queue beat
-periods follow the edit and live beats restart under the new period. `failOpen` and
+file keeps the last good config. No daemon or pi restart is needed; a held lease is refreshed on
+its own terms, so the edit does not change how often it is refreshed, and live beats restart under
+the current period. `failOpen` and
 `queueTimeoutMs` are read once at connect and are the fields that need a pi restart.
+
+**The watch is kept alive**: a failed watch is reported with its context and re-armed, and a watch
+that died without an error — a directory that is renamed away delivers nothing and reports no
+failure — is replaced on the next re-arm tick. A stale config then degrades the provider and queue
+sets, which the operator can see, instead of silently deciding a lease's life (#105).
 
 ## Client contract
 

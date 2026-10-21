@@ -45,7 +45,10 @@ export interface RunLifecycleOptions {
 	lease: LeasePort;
 	clock: Clock;
 	ui: UiPort;
-	/** Keyed Beat period for one Queue, resolved from that Queue's own policy (#81). */
+	/**
+	 * Keyed Beat period for one Queue. The Extension passes the period the Lease's terms ask for
+	 * (#105), and this is the fallback it falls back to when the daemon sent no terms.
+	 */
 	beatMs(queueKey: string): number;
 	/** Live Blocking Tool list: read on every tool start, so a hot-reload applies at once. */
 	blockingTools(): readonly string[];
@@ -202,9 +205,9 @@ export class RunLifecycle {
 	}
 
 	/**
-	 * Re-arm every live Beat at the current config's period (hot-reload, #81). Beat immediately
-	 * first: a shortened idle window applies at the daemon at once, and waiting a full new period
-	 * would let a sweep yield the holder before its first beat under the new policy.
+	 * Re-arm every live Beat at its current period (hot-reload, #81). Beat immediately first: the
+	 * daemon refreshes a carried Holder's activity clock when it rebuilds, so a Beat under the
+	 * current terms confirms the Lease before the Sweep looks at it.
 	 */
 	restartBeats(): void {
 		for (const queueKey of [...this.leases.keys()]) {

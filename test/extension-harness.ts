@@ -26,6 +26,13 @@ interface ExtensionOptions {
 	config?: Record<string, any> | null;
 	/** Exact file text, for suites that pin a hand-written config's bytes. */
 	configText?: string;
+	/**
+	 * The config the harness-spawned daemon serves, written to a file of its own: the daemon's copy
+	 * of the config can then differ from the Extension's — the divergence that decides a Lease's
+	 * life (#105). The daemon is shared per process (one socket per agent dir), so the first
+	 * harness in a file decides the config it serves: every harness in a file must pass the same one.
+	 */
+	daemonConfig?: Record<string, any>;
 	/** Provider catalog written to models.json; the map pi's readProviders unwraps. */
 	models?: Record<string, any>;
 	/** Applied around registration and restored on dispose. undefined deletes the variable. */
@@ -130,6 +137,8 @@ export class ExtensionHarness {
 	readonly configPath = join(AGENT_DIR, "llm-queue.json");
 	readonly modelsPath = join(AGENT_DIR, "models.json");
 	readonly socketPath = join(AGENT_DIR, "llm-queue.sock");
+	/** The daemon's own config file, when it serves a copy of its own (the divergence, #105). */
+	readonly daemonConfigPath = join(AGENT_DIR, "daemon-config.json");
 	private readonly pi = makePi();
 	readonly nativeOwned: (name: string) => unknown;
 	private readonly savedEnv = new Map<string, { previous: string | undefined; applied: string | undefined }>();
@@ -146,6 +155,24 @@ export class ExtensionHarness {
 		if (options.configText !== undefined) writeFileSync(this.configPath, options.configText);
 		else if (options.config === null || options.config === undefined) rmSync(this.configPath, { force: true });
 		else writeJson(this.configPath, options.config);
+		if (options.daemonConfig) {
+			// The daemon is shared per process: the first harness in a file decides the config it
+			// serves. A harness asking for a different one — or asking for one after the daemon was
+			// already spawned on the extension's config — would silently test against the wrong
+			// daemon, so it fails instead.
+			const mine = JSON.stringify(options.daemonConfig);
+			if (sharedDaemons.proc && sharedDaemons.config === null)
+				throw new Error("pi-llm-queue test harness: the shared daemon was already spawned on the extension's config");
+			if (sharedDaemons.config && JSON.stringify(sharedDaemons.config) !== mine)
+				throw new Error("pi-llm-queue test harness: every harness in a file must pass the same daemonConfig");
+			sharedDaemons.config = options.daemonConfig;
+			daemonConfigFile = this.daemonConfigPath;
+			writeJson(this.daemonConfigPath, options.daemonConfig);
+		} else if (sharedDaemons.config) {
+			// The file's daemon runs on a config of its own: a harness that does not name it would
+			// test against a daemon it never described.
+			throw new Error("pi-llm-queue test harness: every harness in a file must pass the same daemonConfig");
+		}
 
 		for (const [name, value] of Object.entries(options.env ?? {})) {
 			this.savedEnv.set(name, { previous: process.env[name], applied: value });
@@ -267,7 +294,10 @@ export class ExtensionHarness {
 	}
 
 	private spawnDaemon(sweepMs?: number): ChildProcess {
-		const args = [DAEMON, "--socket", this.socketPath, "--config", this.configPath, "--models-json", this.modelsPath];
+		// The daemon serves its own config file when the harness gave it one: the daemon's copy of
+		// the config can then differ from the Extension's (#105).
+		const configPath = daemonConfigFile ?? this.configPath;
+		const args = [DAEMON, "--socket", this.socketPath, "--config", configPath, "--models-json", this.modelsPath];
 		if (sweepMs) args.push("--sweep-ms", String(sweepMs));
 		const proc = spawn(process.execPath, args, { stdio: "ignore" });
 		proc.unref();
@@ -275,7 +305,9 @@ export class ExtensionHarness {
 	}
 }
 
-const sharedDaemons: { proc: ChildProcess | null; refs: number } = { proc: null, refs: 0 };
+const sharedDaemons: { proc: ChildProcess | null; refs: number; config: Record<string, any> | null } = { proc: null, refs: 0, config: null };
+/** The daemon's own config file, when the harness gave the daemon a copy of its own. */
+let daemonConfigFile: string | null = null;
 const apiPools = new Map<string, { refs: number; source: string }>();
 let apiSeq = 0;
 

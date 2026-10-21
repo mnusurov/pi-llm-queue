@@ -1,8 +1,8 @@
 // pi-llm-queue extension: wraps configured providers so a session holds the endpoint's slot for
 // its whole run, keeping the KV cache warm for one session at a time.
-import { existsSync, watch } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, basename, dirname } from "node:path";
+import { join } from "node:path";
 import { createAssistantMessageEventStream, getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import type {
 	Api,
@@ -14,6 +14,7 @@ import type {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { LeaseClient, type Role, type StatusSession } from "./lease-client.ts";
 import { loadValidConfig, DEFAULTS, keyedBeatMs, resolveQueuePolicy } from "./config.js";
+import { watchConfigFile } from "./config-watch.js";
 import { ensureStarterConfig } from "./starter-config.ts";
 import { addressEndpoint, addressModel, matchingProviders, membersOf, queuedProviders, readProviders } from "./addressing.js";
 import { RunLifecycle, SessionRegistry, type Clock, type LeasePort } from "./run-lifecycle.ts";
@@ -65,7 +66,9 @@ export default function (pi: ExtensionAPI) {
 	// The beat period a queue's Holder needs: its own leaseTtlMs and idleYieldMs, resolved through
 	// the same resolver the daemon uses, so client and daemon agree by construction (#98).
 	// Deriving it from `defaults` alone lets a per-queue TTL lapse or a short idle window yield an
-	// actively beating Holder (#81).
+	// actively beating Holder (#81). It is the fallback period only: a held Lease is refreshed on
+	// the terms the daemon granted it under (#105), so this copy of the config never decides a
+	// Lease's life.
 	const queueBeatMs = (queueKey: string): number => {
 		const entry = addressEndpoint(queueKey, queues, modelsJson).entry as QueueEntry | undefined;
 		const policy = resolveQueuePolicy(entry ?? {}, config.defaults ?? {});
@@ -133,7 +136,9 @@ export default function (pi: ExtensionAPI) {
 				lease: leasePortFor(sessionKey),
 				clock,
 				ui: noUi,
-				beatMs: queueBeatMs,
+				// The keyed Beat period follows the terms the daemon granted the Lease under (#105):
+				// the config-derived period is only the fallback for a daemon that sends no terms.
+				beatMs: (queueKey) => lease.beatPeriodMs(queueKey, sessionKey) ?? queueBeatMs(queueKey),
 				// Read live on each tool start, so a config edit applies without a restart.
 				blockingTools: () => config.defaults?.blockingTools ?? DEFAULTS.blockingTools,
 			}),
@@ -254,17 +259,16 @@ export default function (pi: ExtensionAPI) {
 
 	// Hot-reload: a config edit re-resolves the wrapped provider set (pi applies provider
 	// registration immediately); the daemon reloads the same file for queue policy. The client's
-	// beat periods follow the same edit, and live beats restart under the new period (#81).
+	// beat periods follow the Lease's terms, so a policy edit no longer decides how often a held
+	// Lease is refreshed (#105); the live beats still restart under the current period.
 	// shortcut: failOpen and queueTimeoutMs are read once at connect and take effect only on pi
 	// restart; the daemon hot-reloads its own policy.
+	// The watch lives in src/config-watch.js: it watches the directory (an atomic-save editor
+	// replaces the file and a file watcher goes dead with it), and it is re-armed when it fails, so
+	// a watch that died cannot leave the session on a stale provider set for good.
 	const watchConfig = (ctx: ExtensionContext) => {
-		let debounce: ReturnType<typeof setTimeout> | null = null;
-		// Watch the directory, not the file: an atomic-save editor replaces the file and a
-		// file watcher goes dead; a config created after startup needs a watcher too.
-		const watcher = watch(dirname(CONFIG_PATH), (_event, file) => {
-			if (file && file !== basename(CONFIG_PATH)) return;
-			clearTimeout(debounce ?? undefined);
-			debounce = setTimeout(() => {
+		watchConfigFile(CONFIG_PATH, {
+			onChange: () => {
 				if (!existsSync(CONFIG_PATH)) return; // config deleted: keep the current wrap set
 				const next = loadValidConfig(CONFIG_PATH);
 				if (next.errors.length) {
@@ -278,11 +282,9 @@ export default function (pi: ExtensionAPI) {
 				registry.restartBeats(); // a live holder is never evicted by a policy edit
 				registerQueuedProviders(ctx);
 				ctx.ui.notify("pi-llm-queue: config reloaded", "info");
-			}, 250);
-			debounce.unref();
+			},
+			onError: (error) => ctx.ui.notify(`pi-llm-queue: config watch failed: ${error.message} — re-arming`, "error"),
 		});
-		watcher.on("error", () => {});
-		watcher.unref();
 	};
 
 	// Fresh install: no config file means the queue is inert. The Starter module writes one from the

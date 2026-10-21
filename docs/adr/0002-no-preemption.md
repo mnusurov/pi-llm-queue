@@ -99,3 +99,36 @@ Queue's own terms change.
 Not closed here: the mirror direction, where the client saw the edit and the daemon did not, so the
 client refreshed slower than the TTL the daemon was enforcing. The client must refresh on the terms
 the daemon granted the Lease under, not on its own copy of the config — that is #105.
+
+## Amendment (2026-10-21, #105): the client refreshes on the Lease's terms
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's TTL lapse and the 2026-10-21 (#104) amendment: the Lease's
+terms are what both processes act on).
+
+The #104 rule closed the direction where the daemon enforced a shorter TTL than the client beat at.
+The other direction was open: the daemon and the Extension read the config file independently, each
+through its own watcher, so a config edit one of them saw and the other did not decided how long a
+Lease lived. A client that saw a lengthened TTL slowed its refresh below the TTL the daemon was
+still enforcing: the Lease lapsed between two beats, the Sweep reclaimed it, and the Holder — still
+streaming — lost its Slot to a Waiter.
+
+**Amended rule**: the Grant carries the Lease's terms — the TTL and the idle-yield window it is
+granted under — and the client refreshes the Lease on them.
+
+- The client derives its keyed Beat period from those terms, through the same derivation it used
+  before (`leaseTtlMs / 3`, at most `idleYieldMs / 2`), and the connection-wide bare heartbeat
+  runs at the smallest such period across the Leases it covers. The client's own copy of the config
+  is its fallback for a daemon that sends no terms; it never decides a Lease's life.
+- The TTL term still only ever grows (#104): a Lease is measured against the longer of the term it
+  was granted under and the Queue's current one.
+- The idle-yield window does **not** change under a held Lease: it is the window the Lease was
+  granted under, for as long as it is held. A window the daemon lengthened under a live Holder
+  would leave that Holder's client beating slower than the window allows — the Sweep would Yield
+  the Slot to a Waiter while the Holder still streams — so a changed window (shortened, lengthened
+  or disabled) applies at the next Grant.
+- The terms are additive on the wire: a client that does not read them keeps working.
+
+Together the two halves close the class: the daemon never cuts a Lease short, and the client never
+refreshes slower than the terms the daemon enforces allow.

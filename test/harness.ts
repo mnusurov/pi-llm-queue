@@ -4,9 +4,19 @@ import { connect } from "node:net";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DEFAULTS } from "../src/config.js";
 
 export const DAEMON = decodeURIComponent(new URL("../src/daemon.js", import.meta.url).pathname);
 export const QUEUE_KEY = "http://model.test/v1";
+
+/**
+ * The terms a Grant carries (#105): the TTL and the idle-yield window the Lease was granted under.
+ * The defaults are the config's own defaults, so a suite that does not set a policy expects them.
+ */
+export const leaseTerms = (leaseTtlMs = DEFAULTS.leaseTtlMs, idleYieldMs = DEFAULTS.idleYieldMs) => ({
+	leaseTtlMs,
+	idleYieldMs,
+});
 
 export interface Daemon {
 	socketPath: string;

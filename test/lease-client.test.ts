@@ -193,6 +193,68 @@ describe("lease client", () => {
 		d.stop();
 	});
 
+	// The terms the daemon granted the Lease under decide the refresh period (#105), never the
+	// client's own copy of the config: here the client believes a 30 s TTL (a 10 s heartbeat) while
+	// the daemon enforces 1 s.
+	it("refreshes a held lease on the terms the daemon granted it under, not on its own period", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 1000 }, queues: {} }, undefined, undefined, 50);
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: 10000 });
+		const b = new LeaseClient({ socketPath: d.socketPath });
+
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		const bAcquire = b.acquire(QUEUE_KEY, "B", "parent");
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending");
+
+		await sleep(1400); // past the TTL the daemon enforces: a 10 s heartbeat would have lost the lease
+		assert.equal(await raceWithSleep(bAcquire, 300), "pending", "the granted terms keep the holder's lease alive");
+
+		a.release(QUEUE_KEY, "A");
+		assert.equal(await raceWithSleep(bAcquire, 3000), "resolved");
+
+		a.close();
+		b.close();
+		d.stop();
+	});
+
+	it("reports the beat period the granted terms ask for", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 3000, idleYieldMs: 1000 }, queues: {} });
+		await waitForDaemon(d.socketPath);
+		const a = new LeaseClient({ socketPath: d.socketPath });
+
+		assert.equal(a.beatPeriodMs(QUEUE_KEY, "A"), undefined, "no terms before the grant: the caller falls back to its own policy");
+		await a.acquire(QUEUE_KEY, "A", "parent");
+		assert.equal(a.beatPeriodMs(QUEUE_KEY, "A"), 500, "the period follows the granted terms: half the idle window, under the TTL's third");
+
+		a.release(QUEUE_KEY, "A");
+		assert.equal(a.beatPeriodMs(QUEUE_KEY, "A"), undefined, "a released lease needs no period");
+
+		a.close();
+		d.stop();
+	});
+
+	it("keeps working against a daemon that sends no terms (#105)", async () => {
+		// The Grant's fields are additive: an older daemon grants without them, and the client falls
+		// back to its own policy instead of guessing terms.
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-noterms-"));
+		const socketPath = join(dir, "queue.sock");
+		const server = createServer((conn) => {
+			conn.once("data", () => {
+				conn.write(`${JSON.stringify({ op: "granted", queueKey: QUEUE_KEY, sessionKey: "OLD" })}\n`);
+			});
+		});
+		await new Promise<void>((resolve) => server.listen(socketPath, () => resolve()));
+
+		const c = new LeaseClient({ socketPath });
+		try {
+			assert.equal(await raceWithSleep(c.acquire(QUEUE_KEY, "OLD", "parent"), 2000), "resolved");
+			assert.equal(c.beatPeriodMs(QUEUE_KEY, "OLD"), undefined, "no terms in the grant: the client keeps its own policy");
+		} finally {
+			c.close();
+			server.close();
+		}
+	});
+
 	it("reports an unreachable status as null when the socket dies mid-request", async () => {
 		// A daemon that dies with a status in flight resolves the pending request with the close
 		// signal. Handing that to /queue crashes it on `.queues.map`: status must answer null instead.

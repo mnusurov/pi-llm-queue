@@ -4,12 +4,12 @@
 // are asserted in memory in test/scheduler.test.ts.
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { connect } from "node:net";
 import { after, before, describe, it } from "node:test";
-import { closeAllClients, connectClient, exited, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, exited, leaseTerms, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon, DAEMON, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 describe("daemon socket protocol", () => {
 	let d: Daemon;
@@ -26,13 +26,13 @@ describe("daemon socket protocol", () => {
 
 	it("serialises two sessions: second waits while first holds the slot, then is granted on release", async () => {
 		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 
 		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
 		await assert.rejects(b.next(300), /no message from daemon within/);
 
 		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B", ...leaseTerms() });
 	});
 
 	it("answers renew with ok", async () => {
@@ -53,6 +53,20 @@ describe("daemon socket protocol", () => {
 		const status = await c.next(3000);
 		assert.equal(status.op, "status", "the daemon survives the malformed line and answers the next op");
 		c.close();
+	});
+
+	// The Grant carries the Lease's terms (#105): the TTL and the idle-yield window the Lease is
+	// held under. The client refreshes on them, so a config edit one process sees and the other
+	// does not can never shorten a Lease's life.
+	it("the Grant carries the terms the Lease was granted under", async () => {
+		const terms = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: 12000, idleYieldMs: 4000 }, queues: {} });
+		const c = await connectClient(terms.socketPath);
+
+		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "T", role: "parent" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "T", leaseTtlMs: 12000, idleYieldMs: 4000 });
+
+		c.close();
+		terms.stop();
 	});
 
 });
@@ -79,7 +93,7 @@ describe("lease lifecycle and no preemption", () => {
 	};
 	const acquire = (c: Client, sessionKey: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
-	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string, terms = leaseTerms()) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey, ...terms });
 
 	after(() => {
 		for (const c of clients) c.close();
@@ -94,11 +108,11 @@ describe("lease lifecycle and no preemption", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(1000)));
 		acquire(b, "B");
 		await assert.rejects(b.next(300), /no message from daemon within/);
 
-		assert.deepEqual(await b.next(1500), granted("B"));
+		assert.deepEqual(await b.next(1500), granted("B", leaseTerms(1000)));
 	});
 
 	// No preemption (#49): a live holder is never switched away. The slot moves only on
@@ -109,7 +123,7 @@ describe("lease lifecycle and no preemption", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(60000)));
 		acquire(b, "B");
 		await assert.rejects(b.next(200), /no message from daemon within/);
 
@@ -117,7 +131,7 @@ describe("lease lifecycle and no preemption", () => {
 		await assert.rejects(b.next(200), /no message from daemon within/, "a silent live holder keeps the slot");
 
 		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(1500), granted("B"), "the waiter is granted on voluntary release");
+		assert.deepEqual(await b.next(1500), granted("B", leaseTerms(60000)), "the waiter is granted on voluntary release");
 	});
 
 	// A config edit that shortens a queue's TTL (#104): the daemon applies the new TTL at once, but
@@ -131,14 +145,14 @@ describe("lease lifecycle and no preemption", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(6000)));
 		acquire(b, "B");
 		await assert.rejects(b.next(200), /no message from daemon within/);
 
 		// The edit shortens the TTL and frees a second slot: B's grant is the daemon's own proof that
 		// it reloaded the file.
 		writeFileSync(d.configPath, JSON.stringify({ defaults: { maxStreams: 2, leaseTtlMs: 1000, daemonIdleExitMs: 1e9 }, queues: {} }));
-		assert.deepEqual(await b.next(5000), granted("B"), "the daemon reloaded the config");
+		assert.deepEqual(await b.next(5000), granted("B", leaseTerms(1000)), "the daemon reloaded the config");
 
 		// The client beats 1.5 s apart — wider than the shortened TTL (1 s), so a client whose own
 		// reload has not landed would lapse here.
@@ -166,7 +180,7 @@ describe("lease lifecycle and no preemption", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A"), "the rejected config falls back to the defaults");
 		acquire(b, "B");
 		for (let i = 0; i < 12; i++) {
 			beat(a, "A");
@@ -191,7 +205,7 @@ describe("tier ordering (parent > child) and aging", () => {
 	};
 	const acquire = (c: Client, sessionKey: string, role: string) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role });
 	const release = (c: Client, sessionKey: string) => c.send({ op: "release", queueKey: QUEUE_KEY, sessionKey });
-	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string, terms = leaseTerms()) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey, ...terms });
 
 	after(() => {
 		for (const c of clients) c.close();
@@ -344,6 +358,21 @@ describe("queue policy resolution", () => {
 		assert.match(await run('{ "providers": '), /models\.json: .* — provider-name queue keys resolve to nothing/, "a half-written catalog names its parse error");
 		assert.match(await run('{"providers":{}}'), /models\.json: no providers — provider-name/, "an empty catalog is reported as empty, not unreadable");
 	});
+
+	// The config watch fails loudly (#105): a watch that could not be armed is reported with its
+	// context, not swallowed — the daemon would otherwise serve a stale config for the rest of its
+	// life, with no diagnostics.
+	it("reports a config watch it could not arm", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "llm-queue-watch-"));
+		const configPath = join(dir, "missing-dir", "config.json"); // the directory does not exist
+		const proc = spawn(process.execPath, [DAEMON, "--socket", join(dir, "s.sock"), "--config", configPath], { stdio: ["ignore", "ignore", "pipe"] });
+		let stderr = "";
+		proc.stderr.on("data", (chunk) => (stderr += chunk));
+		await sleep(200); // the report is written at startup, before the daemon listens: slack, not a condition
+		proc.kill();
+
+		assert.match(stderr, /config watch failed: .*ENOENT/, "the failed watch is reported with its context");
+	});
 });
 
 describe("per-endpoint queues, groups and hot-reload", () => {
@@ -357,7 +386,7 @@ describe("per-endpoint queues, groups and hot-reload", () => {
 	const modelsJson = { providers: { strata: { baseUrl: GPU }, llama: { baseUrl: GPU }, zen: { baseUrl: ZEN } } };
 	const acquire = (c: Client, queueKey: string, sessionKey: string) => c.send({ op: "acquire", queueKey, sessionKey, role: "parent" });
 	const release = (c: Client, queueKey: string, sessionKey: string) => c.send({ op: "release", queueKey, sessionKey });
-	const granted = (queueKey: string, sessionKey: string) => ({ op: "granted", queueKey, sessionKey });
+	const granted = (queueKey: string, sessionKey: string, terms = leaseTerms()) => ({ op: "granted", queueKey, sessionKey, ...terms });
 
 	it("serialises two providers on one baseUrl through one queue", async () => {
 		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [GPU]: { maxStreams: 1 } } }, modelsJson);
@@ -629,12 +658,12 @@ describe("observability: status counters", () => {
 		const b = await connectClient(d.socketPath);
 
 		acquire(a, "A", "parent");
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		acquire(b, "B", "parent");
 		await assert.rejects(b.next(200), /no message from daemon within/);
 		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
 		assert.deepEqual(await a.next(3000), { op: "ok" }, "the release reply is consumed before status");
-		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B", ...leaseTerms() });
 
 		a.send({ op: "status" });
 		assert.equal((await a.next(3000)).queues[0].switches, 1, "the settle-and-handoff switch is the one a normal run makes");
@@ -658,7 +687,7 @@ describe("daemon idle-exit", () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 300 }, queues: {} });
 		const c = await connectClient(d.socketPath);
 		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" }); // a counted client (#60)
-		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		c.close(); // last client leaves: the idle timer arms
 		assert.ok(await exited(d.proc, 4000), "the daemon exits after daemonIdleExitMs with no clients");
 	});
@@ -667,12 +696,12 @@ describe("daemon idle-exit", () => {
 		const d = startDaemon({ defaults: { maxStreams: 1, daemonIdleExitMs: 900 }, queues: {} });
 		const c1 = await connectClient(d.socketPath);
 		c1.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await c1.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await c1.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		c1.close();
 		await sleep(400); // within the grace window
 		const c2 = await connectClient(d.socketPath);
 		c2.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" }); // a counted relaunch cancels the pending exit
-		assert.deepEqual(await c2.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		assert.deepEqual(await c2.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B", ...leaseTerms() });
 		await sleep(600); // past the 900 ms grace the first close armed
 		c2.send({ op: "status" });
 		assert.equal((await c2.next(3000)).op, "status", "the daemon survived the idle grace");
@@ -694,7 +723,7 @@ describe("daemon lifetime: counted clients and status invisibility (#60)", () =>
 	const counted = async (socketPath: string, sessionKey: string) => {
 		const c = await connectClient(socketPath);
 		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent" });
-		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey, ...leaseTerms() });
 		return c;
 	};
 
@@ -762,7 +791,7 @@ describe("daemon lifetime: counted clients and status invisibility (#60)", () =>
 		proc.unref();
 		const c = await connectClient(socketPath);
 		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		c.close();
 
 		assert.ok(await exited(proc, 2000), "the default is exit at once, not a 60 s grace");
@@ -785,12 +814,12 @@ describe("config schema validation at the daemon seam", () => {
 		const b = await connectClient(d.socketPath);
 
 		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
 		await assert.rejects(b.next(200), /no message from daemon within/, "defaults (maxStreams 1) apply: B queues");
 
 		a.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "A" });
-		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" });
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B", ...leaseTerms() });
 		a.close();
 		b.close();
 		d.stop();
@@ -802,9 +831,9 @@ describe("config schema validation at the daemon seam", () => {
 		const b = await connectClient(d.socketPath);
 
 		a.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent" });
-		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A" });
+		assert.deepEqual(await a.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "A", ...leaseTerms() });
 		b.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "B", role: "parent" });
-		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B" }, "two slots from the good config");
+		assert.deepEqual(await b.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "B", ...leaseTerms() }, "two slots from the good config");
 
 		writeFileSync(d.configPath, JSON.stringify({ queues: { [QUEUE_KEY]: { maxStreams: 0 } } }));
 		await sleep(600); // reload debounce: the invalid file is rejected
@@ -824,11 +853,12 @@ describe("config schema validation at the daemon seam", () => {
 		const dir = mkdtempSync(join(tmpdir(), "llm-queue-nm-"));
 		const srcDir = join(dir, "node_modules", "pi-llm-queue", "src");
 		mkdirSync(srcDir, { recursive: true });
-		copyFileSync(DAEMON, join(srcDir, "daemon.js"));
-		copyFileSync(decodeURIComponent(new URL("../src/config.js", import.meta.url).pathname), join(srcDir, "config.js"));
-		copyFileSync(decodeURIComponent(new URL("../src/addressing.js", import.meta.url).pathname), join(srcDir, "addressing.js"));
-		copyFileSync(decodeURIComponent(new URL("../src/scheduler.js", import.meta.url).pathname), join(srcDir, "scheduler.js"));
-		copyFileSync(decodeURIComponent(new URL("../src/socket-lines.js", import.meta.url).pathname), join(srcDir, "socket-lines.js"));
+		// The whole daemon-side source, as the package installs it: every module the daemon imports
+		// must be plain JavaScript, or the installed daemon dies at spawn.
+		for (const name of readdirSync(decodeURIComponent(new URL("../src", import.meta.url).pathname))) {
+			if (!name.endsWith(".js")) continue;
+			copyFileSync(decodeURIComponent(new URL(`../src/${name}`, import.meta.url).pathname), join(srcDir, name));
+		}
 		const configPath = join(dir, "config.json");
 		writeFileSync(configPath, JSON.stringify({ defaults: { maxStreams: 1 }, queues: {} }));
 		const socketPath = join(dir, "queue.sock");
@@ -837,7 +867,7 @@ describe("config schema validation at the daemon seam", () => {
 
 		const c = await connectClient(socketPath);
 		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey: "N", role: "parent" });
-		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "N" }, "the installed daemon serves");
+		assert.deepEqual(await c.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "N", ...leaseTerms() }, "the installed daemon serves");
 
 		c.close();
 		proc.kill();
@@ -912,7 +942,7 @@ describe("idle-yield under contention", () => {
 	const acquire = (c: Client, sessionKey: string, activity = true) =>
 		c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role: "parent", activity });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
-	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string, terms = leaseTerms()) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey, ...terms });
 
 	after(() => {
 		for (const c of clients) c.close();
@@ -927,12 +957,12 @@ describe("idle-yield under contention", () => {
 		const b = await open(d);
 
 		acquire(a, "A", true);
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(30000, 300)));
 		acquire(b, "B", true);
 		await assert.rejects(b.next(200), /no message from daemon within/);
 
 		// A is silent past idleYieldMs: the sweep yields it, B is granted.
-		assert.deepEqual(await b.next(2000), granted("B"), "idle holder yielded, waiter granted");
+		assert.deepEqual(await b.next(2000), granted("B", leaseTerms(30000, 300)), "idle holder yielded, waiter granted");
 		// A's next beat answers granted:false (the slot is gone).
 		beat(a, "A");
 		assert.deepEqual(await a.next(3000), { op: "ok", queueKey: QUEUE_KEY, sessionKey: "A", granted: false }, "yielded holder learns via beat");
