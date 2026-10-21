@@ -42,6 +42,9 @@ Amended records — read the amendment, not only the original decision:
 - **0007** amended 2026-10-21 (#105) — the per-Queue Beat period now follows the Lease's terms;
   the injected period is the fallback for a daemon that sends no terms; amended 2026-10-21 (#109) —
   the Beat period crosses the `LeasePort`, and the separate beat-period injection is gone.
+- **0009** amended 2026-10-21 (#111) — the decisions module writes the `granted` reply, so it calls
+  the terms' wire encoding; the terms' shape and the growth rule are unchanged.
+- **0010** is new: one module owns the Decision vocabulary and its effects.
 
 The next record takes the next number. Where a fact belongs: [`docs/agents/domain.md`](../agents/domain.md).
 The vocabulary the records use: [`GLOSSARY.md`](../../GLOSSARY.md).

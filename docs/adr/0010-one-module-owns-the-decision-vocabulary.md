@@ -49,7 +49,7 @@ One module owns the Decision vocabulary and its effects: `src/decisions.js`, pla
 `src/config.js` reason: the daemon imports it and Node refuses type stripping under
 `node_modules`, so a `.ts` module would kill an installed daemon).
 
-Its interface is the shape plus four things:
+Its interface is the shape plus five things:
 
 - `Decision` — the shape: `{ type, connId?, queueKey, sessionKey, tier, requestedKey?, reason?,
   terms? }`, where `type` is one of `grant · switch · queued · release · evict`. A JSDoc typedef in

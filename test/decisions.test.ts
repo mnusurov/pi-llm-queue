@@ -47,8 +47,11 @@ describe("the event-log line", () => {
 		assert.equal((line as Record<string, unknown>).tier, undefined, "the Scheduler's word does not travel to the wire");
 	});
 
-	it("carries the reason of a release and of an evict", () => {
+	it("carries the reason of a release", () => {
 		assert.equal(decisionLogLine({ type: "release", queueKey: "q", sessionKey: "A", tier: "parent", reason: "idle" }, 0).reason, "idle");
+	});
+
+	it("carries the reason of an evict", () => {
 		assert.equal(decisionLogLine({ type: "evict", queueKey: "q", sessionKey: "A", tier: "parent", reason: "ttl" }, 0).reason, "ttl");
 	});
 

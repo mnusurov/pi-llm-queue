@@ -110,3 +110,22 @@ Three consequences:
   beat-period injection is gone. ADR 0005 is amended: the config module no longer owns the
   refresh-period derivation. ADR 0002 and ADR 0003 stand unchanged — the rules they record (the
   TTL term only grows, the window is frozen) do not change.
+
+## Amendment (2026-10-21, #111): the decisions module writes the granted reply
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's "the daemon writes the terms through them" clause; the
+terms' shape, the refresh period, the wire field names and the growth rule are unchanged).
+
+The Decision gave the terms' wire encoding to whoever writes the reply — the daemon. That writer
+moved: the `granted` reply is now built by the decisions module (ADR 0010), which calls
+`termsToWire` itself. The daemon supplies the socket, and the module writes the terms into the
+reply.
+
+**Amended rule**: the terms module owns the wire encoding, and the decisions module is its
+caller on the daemon side. The client's counterpart is unchanged: it still reads the terms through
+`termsFromWire`.
+
+Nothing else moves: the terms' shape, the refresh period they imply, the growth rule, and the wire
+field names (`leaseTtlMs`, `idleYieldMs`) are exactly as decided above.

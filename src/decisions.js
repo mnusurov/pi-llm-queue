@@ -42,16 +42,19 @@ import { termsToWire } from "./lease-terms.js";
  */
 
 /**
- * One line of the event log: the queue event, the session it is about, the session's role, and the
- * wall-clock instant it happened at.
+ * One line of the event log. A scheduler event (a grant, a switch, a queued request, a release,
+ * an evict) carries the session it is about and the session's role; the one adapter event — the
+ * over-capacity report — carries the counts instead.
  *
  * @typedef {object} EventLine
  * @property {string} event The event name.
  * @property {string} queueKey The Queue the event is about.
- * @property {string} sessionKey The session the event is about.
- * @property {string} role The session's priority class, under the wire's name.
+ * @property {string} [sessionKey] The session the event is about (a scheduler event).
+ * @property {string} [role] The session's priority class, under the wire's name (a scheduler event).
  * @property {string} ts The wall-clock instant, as an ISO timestamp.
- * @property {string} [reason] The cause of a release or an evict.
+ * @property {string} [reason] The cause of a release, an evict or an over-capacity.
+ * @property {number} [holders] How many holders the queue carries (the over-capacity event).
+ * @property {number} [maxStreams] How many it may carry (the over-capacity event).
  */
 
 /**
@@ -70,7 +73,7 @@ export const decisionOwner = (decision) => decision.connId ?? null;
  *
  * @param {Decision} decision The decision.
  * @param {number} now The wall-clock instant of the event, in ms since the epoch.
- * @returns {EventLine} The line.
+ * @returns {EventLine} The line: a scheduler event, so it carries the session and the role.
  */
 export const decisionLogLine = (decision, now) => {
 	const line = {
@@ -107,7 +110,7 @@ export const grantedReply = (queueKey, sessionKey, terms) => ({
  *
  * @param {OverCapacityReport} report The report.
  * @param {number} now The wall-clock instant of the event, in ms since the epoch.
- * @returns {EventLine & { holders: number, maxStreams: number }} The line.
+ * @returns {EventLine} The line: the adapter's own event, so it carries the counts.
  */
 export const overCapacityLine = (report, now) => ({
 	event: "config",

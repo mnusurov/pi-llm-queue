@@ -18,7 +18,8 @@ import type { Decision, EventLine, OverCapacityReport } from "../src/decisions.j
 export const QUEUE_KEY = "http://model.test/v1";
 export const QUEUE_KEY2 = "http://model.test/v2";
 // The pseudo-connection a sweep's connId-less decisions (a TTL evict, an idle release) route to, so
-// capture() has one routing rule for every entry (the sweep has no triggering actor connection).
+// the module's ownership rule has one destination for every entry (the sweep has no triggering
+// actor connection).
 const SYSTEM = "__system__";
 
 export interface Policy {
@@ -81,7 +82,7 @@ export class SchedulerHarness {
 		const { decisions, overCapacity } = this.scheduler.rebuildQueues(this.now);
 		// The socket adapter reports the over-capacity before it emits the rebuild's decisions.
 		for (const report of overCapacity) this.eventLines.push(overCapacityLine(report, this.now));
-		this.emit(decisions, SYSTEM);
+		this.record(decisions, SYSTEM);
 		return { overCapacity };
 	}
 
@@ -108,7 +109,7 @@ export class SchedulerHarness {
 		const queueKey = opts.queueKey ?? QUEUE_KEY;
 		const requestedKey = opts.requestedKey ?? queueKey;
 		const result = this.scheduler.acquire(connId, sessionKey, opts.role, opts.group, opts.activity, queueKey, requestedKey, this.now);
-		this.emit(result.decisions, connId);
+		this.record(result.decisions, connId);
 		// A re-acquire of a held Slot is a TTL refresh: a `granted` reply and no Decision, exactly as
 		// the socket adapter answers it.
 		if (result.refreshed && result.terms) {
@@ -123,19 +124,19 @@ export class SchedulerHarness {
 
 	heartbeat(connId: string): Decision[] {
 		const decisions = this.scheduler.heartbeat(connId, this.now);
-		this.emit(decisions, connId);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
 	release(connId: string, sessionKey: string, queueKey = QUEUE_KEY): Decision[] {
 		const decisions = this.scheduler.release(connId, sessionKey, queueKey, this.now);
-		this.emit(decisions, connId);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
 	cancel(connId: string, sessionKey: string, queueKey = QUEUE_KEY): Decision[] {
 		const decisions = this.scheduler.cancel(connId, sessionKey, queueKey, this.now);
-		this.emit(decisions, connId);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
@@ -145,7 +146,7 @@ export class SchedulerHarness {
 
 	disconnect(connId: string): Decision[] {
 		const decisions = this.scheduler.disconnect(connId, this.now);
-		this.emit(decisions, connId);
+		this.record(decisions, connId);
 		return decisions;
 	}
 
@@ -154,7 +155,7 @@ export class SchedulerHarness {
 	sweepAt(now = this.now): Decision[] {
 		this.now = now;
 		const decisions = this.scheduler.sweepAt(now);
-		this.emit(decisions, SYSTEM);
+		this.record(decisions, SYSTEM);
 		return decisions;
 	}
 
@@ -200,7 +201,7 @@ export class SchedulerHarness {
 	// File the decisions by the module's ownership rule (a decision names its connection, or names
 	// none and belongs to the actor that triggered it), and let the module produce the lines and
 	// the replies — the same ones the socket adapter would have written and sent.
-	private emit(decisions: Decision[], actor: string): void {
+	private record(decisions: Decision[], actor: string): void {
 		for (const d of decisions) {
 			const owner = decisionOwner(d);
 			this.push(owner === null ? actor : String(owner), d);

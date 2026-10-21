@@ -12,7 +12,7 @@ import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { loadValidConfig, resolveQueuePolicy } from "./config.js";
 import { watchConfigFile } from "./config-watch.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
-import { emit as emitDecisions, grantedReply, overCapacityLine } from "./decisions.js";
+import { emit, grantedReply, overCapacityLine } from "./decisions.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
 
@@ -167,15 +167,10 @@ const connById = new Map();
 
 // Emit the decisions the Scheduler returned, in order: each maps to a log line and, for a grant, a
 // `granted` reply. The mapping is the decisions module's (ADR 0010) — this adapter supplies the
-// edges: the log sink, the socket and the clock.
-//
-// Two passes, on purpose. A handover is two decisions — the grant and the switch it causes — and
-// the reply belongs to both. One pass would put the `granted` reply out before the `switch` line
-// is written, and the peer process can wake up on another core and read the file in between: the
-// reader would see a grant with no switch. Logging the whole batch first keeps the promise the
-// log sink makes — every event a reply caused is on disk before that reply goes out (#47).
-function emit(decisions) {
-	emitDecisions(decisions, {
+// edges: the log sink, the socket and the clock. The batch order (every line before any reply) is
+// the module's rule too; see the comment there for why it is a promise and not a detail.
+function emitDecisions(decisions) {
+	emit(decisions, {
 		write: writeEvent,
 		send: (connId, msg) => {
 			const conn = connById.get(connId);
@@ -205,7 +200,7 @@ function handle(msg, conn) {
 	switch (msg.op) {
 		case "acquire": {
 			const result = scheduler.acquire(conn.connId, msg.sessionKey, msg.role, msg.group, msg.activity, msg.queueKey, requestedKey, now);
-			emit(result.decisions);
+			emitDecisions(result.decisions);
 			// A re-acquire of a held slot is a TTL refresh: `granted` with no Grant decision (the Grace
 			// window logs one grant and no switch). The direct-grant path's reply rides on its own
 			// `grant` decision, so reply here only for a refresh, keyed by the current op's requestedKey.
@@ -215,11 +210,11 @@ function handle(msg, conn) {
 			return;
 		}
 		case "release":
-			emit(scheduler.release(conn.connId, msg.sessionKey, msg.queueKey, now));
+			emitDecisions(scheduler.release(conn.connId, msg.sessionKey, msg.queueKey, now));
 			send(conn, { op: "ok" });
 			return;
 		case "cancel":
-			emit(scheduler.cancel(conn.connId, msg.sessionKey, msg.queueKey, now));
+			emitDecisions(scheduler.cancel(conn.connId, msg.sessionKey, msg.queueKey, now));
 			return;
 		// Bare renew: heartbeat, keeps every lease of this connection alive.
 		// Keyed renew: an activity beat — the holder is using the slot, so its TTL refreshes. The
@@ -231,7 +226,7 @@ function handle(msg, conn) {
 				send(conn, { op: "ok", queueKey: requestedKey, sessionKey: msg.sessionKey, granted });
 				return;
 			}
-			emit(scheduler.heartbeat(conn.connId, now));
+			emitDecisions(scheduler.heartbeat(conn.connId, now));
 			send(conn, { op: "ok" });
 			return;
 		}
@@ -293,7 +288,7 @@ function disconnect(conn) {
 	if (conn.cleaned) return;
 	conn.cleaned = true;
 	const now = Date.now();
-	emit(scheduler.disconnect(conn.connId, now));
+	emitDecisions(scheduler.disconnect(conn.connId, now));
 	connById.delete(conn.connId);
 	if (conn.counted && --countedClients <= 0) scheduleIdleExit();
 }
@@ -354,11 +349,11 @@ function rebuildQueues() {
 	// cannot take a slot from a live Holder, so it reports the transient over-capacity in the log
 	// instead of exceeding the new limit silently (#82). The counts show how far over the queue is.
 	for (const report of overCapacity) writeEvent(overCapacityLine(report, now));
-	emit(decisions);
+	emitDecisions(decisions);
 }
 
 // Sweep timer: the adapter reads the wall clock and hands the Scheduler a stamp.
-setInterval(() => emit(scheduler.sweepAt(Date.now())), sweepMs).unref();
+setInterval(() => emitDecisions(scheduler.sweepAt(Date.now())), sweepMs).unref();
 
 // Hot-reload: a config edit re-applies queue policy to live queues and grants whoever the
 // new capacity frees — no daemon restart, no pi restart. A half-written file keeps the last
