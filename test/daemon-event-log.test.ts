@@ -6,7 +6,7 @@ import { mkdtempSync, existsSync, readdirSync, readFileSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, describe, it } from "node:test";
-import { closeAllClients, connectClient, sleep, startDaemon, stopAllDaemons, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
+import { closeAllClients, connectClient, leaseTerms, sleep, startDaemon, stopAllDaemons, QUEUE_KEY, type Client, type Daemon } from "./harness.ts";
 
 const dir = mkdtempSync(join(tmpdir(), "llm-queue-log-"));
 const logPath = () => join(dir, `events-${Math.random().toString(36).slice(2)}.jsonl`);
@@ -45,7 +45,7 @@ describe("daemon event log", () => {
 	const acquire = (c: Client, sessionKey: string, role = "parent", activity = true) => c.send({ op: "acquire", queueKey: QUEUE_KEY, sessionKey, role, activity });
 	const release = (c: Client, sessionKey: string) => c.send({ op: "release", queueKey: QUEUE_KEY, sessionKey });
 	const beat = (c: Client, sessionKey: string) => c.send({ op: "renew", queueKey: QUEUE_KEY, sessionKey });
-	const granted = (sessionKey: string) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey });
+	const granted = (sessionKey: string, terms = leaseTerms()) => ({ op: "granted", queueKey: QUEUE_KEY, sessionKey, ...terms });
 
 	// The session is a Waiter: asked of the daemon's own status view, polled with a deadline.
 	// Presence is polled, never slept for — and it must be a Waiter, or the handover that follows
@@ -184,11 +184,11 @@ describe("daemon event log", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(1000)));
 		acquire(b, "B", "child");
 		await assert.rejects(b.next(200), /no message from daemon within/);
 
-		assert.deepEqual(await b.next(3000), granted("B"), "a dead client's slot is reclaimed and handed on");
+		assert.deepEqual(await b.next(3000), granted("B", leaseTerms(1000)), "a dead client's slot is reclaimed and handed on");
 		a.send({ op: "status" });
 		// A is gone from the holder list: the evict leaves no ghost holder for /queue to report.
 		assert.deepEqual((await a.next(3000)).queues[0].holders.map((h: any) => h.sessionKey), ["B"], "the evict leaves no ghost holder in status");
@@ -210,11 +210,11 @@ describe("daemon event log", () => {
 		const b = await open(d);
 
 		acquire(a, "A");
-		assert.deepEqual(await a.next(3000), granted("A"));
+		assert.deepEqual(await a.next(3000), granted("A", leaseTerms(30000, 100)));
 		// B queues, then the sweep yields A (silent past idleYieldMs) and grants B: the yield is
 		// the sweep's clock, so B's grant is the assertion that waits for it.
 		acquire(b, "B", "child");
-		assert.deepEqual(await b.next(2000), granted("B"), "idle holder yields, waiter granted");
+		assert.deepEqual(await b.next(2000), granted("B", leaseTerms(30000, 100)), "idle holder yields, waiter granted");
 
 		assert.deepEqual(eventLines(file), [
 			{ event: "grant", queueKey: QUEUE_KEY, sessionKey: "A", role: "parent", reason: undefined },

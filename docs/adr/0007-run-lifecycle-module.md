@@ -46,6 +46,11 @@ the edge; unit tests move time exactly), a `UiPort`, a live `blockingTools` reso
 per-Queue Beat period. `blockingTools` defaults move to `DEFAULTS.blockingTools` in
 `src/config.js`, read on every tool start so a hot-reload applies at once.
 
+Amended 2026-10-21 (#105): the per-Queue Beat period is now the period the Lease's terms ask for
+(the daemon tells the client the terms it granted the Lease under), and the injected period is the
+fallback for a daemon that sends no terms. The port and the injection are unchanged; only the
+period the Extension injects is resolved differently.
+
 `withSlot(queueKey, signal, body)` owns the Grant handover the old `finally` did: the Beat probe,
 joining the Run's in-flight acquire (#55), request-versus-Run lease ownership, stopping the Beat
 at release, and re-arming Grace for a lone request. `queuedStream` shrinks to resolving the Queue

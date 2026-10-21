@@ -51,6 +51,14 @@ The timed right of a holder to keep its slot, renewed by beats and heartbeats; r
 daemon when it stops being refreshed.
 _Avoid_: lock, ticket
 
+**Lease terms**:
+The TTL and the idle-yield window a lease is held under. The grant carries them, and the client
+refreshes the lease on them — so the client's own copy of the config, which may be stale, never
+decides how long a lease lives. The TTL term only ever grows; the idle-yield window is the one the
+lease was granted under, for as long as it is held. A changed window applies at the next grant
+(#104, #105).
+_Avoid_: lease policy, lease config
+
 **Lease verdict**:
 The one answer shape for a lease decision: `held`, `passthrough`, `lost`, or `cancelled`. Each verb
 returns only the values it can produce — `acquire` gives `held`, `passthrough`, or `cancelled`;

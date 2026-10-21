@@ -245,6 +245,91 @@ describe("policy edit / lease TTL (in memory)", () => {
 	});
 });
 
+// The Lease's terms (#105): the TTL and the idle-yield window it is held under. The Grant carries
+// them, and the client derives its refresh period from them — so a config edit one process sees and
+// the other does not can never shorten a Lease's life. The TTL term may grow, like #104's rule; the
+// idle-yield window does not change while the Lease is held, because a window the daemon lengthened
+// under a live Holder would leave that Holder's client beating slower than the window allows, and
+// the Slot would go to a Waiter while the Holder still streams.
+describe("lease terms (in memory)", () => {
+	it("the Grant carries the terms the Lease is held under", () => {
+		const h = new SchedulerHarness({ idleYieldMs: 4000, ttlMs: 12000 });
+		const a = h.connect();
+
+		h.acquire(a, "A", { role: "parent" });
+		const [grant] = h.grantsFor(a);
+		assert.deepEqual(grant.terms, { leaseTtlMs: 12000, idleYieldMs: 4000 }, "the Grant carries the terms the Lease is held under");
+	});
+
+	it("a shortened idle-yield window applies at the next Grant, not to a held Lease", () => {
+		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent", activity: true });
+		h.acquire(b, "B", { role: "parent", activity: true });
+		h.advance(100);
+		h.editPolicy({ idleYieldMs: 100, ttlMs: 30000 }); // the window is shortened under the live Holder
+
+		h.advance(250); // 350 ms of silence: past the shortened window (100 ms), inside the granted one (300 ms)
+		h.sweepAt();
+		assert.deepEqual(h.holders(QUEUE_KEY), ["A"], "the Holder keeps its Slot: the window it was granted under still holds");
+
+		h.advance(100); // 450 ms of silence: past the granted window
+		h.sweepAt();
+		assert.deepEqual(h.grantedSessions(b), ["B"], "the Holder is idle past its granted window: it yields");
+	});
+
+	it("a Lease granted after the edit is held under the new window", () => {
+		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
+		const a = h.connect();
+
+		h.editPolicy({ idleYieldMs: 100 });
+		h.acquire(a, "A", { role: "parent", activity: true });
+		const [grant] = h.grantsFor(a);
+		assert.equal(grant.terms?.idleYieldMs, 100, "the new Lease is granted under the new window");
+	});
+
+	it("a lengthened idle-yield window does not reach a held Lease", () => {
+		// The window is the one the Lease was granted under: a longer window would leave the
+		// Holder's client beating slower than the window allows, and the Sweep would yield a Holder
+		// that is still streaming (#105).
+		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent", activity: true });
+		h.acquire(b, "B", { role: "parent", activity: true });
+		h.advance(100);
+		h.editPolicy({ idleYieldMs: 1000, ttlMs: 30000 }); // the window is lengthened under the live Holder
+
+		h.advance(350); // 450 ms of silence: past the window A was granted under (300 ms)
+		h.sweepAt();
+		assert.deepEqual(h.grantedSessions(b), ["B"], "A is idle past its own window: it yields — the lengthened window does not reach it");
+	});
+
+	it("idleYieldMs 0 disables the yield at the next Grant, not under a held Lease", () => {
+		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });
+		const a = h.connect();
+		const b = h.connect();
+
+		h.acquire(a, "A", { role: "parent", activity: true });
+		h.acquire(b, "B", { role: "parent", activity: true });
+		h.advance(100);
+		h.editPolicy({ idleYieldMs: 0, ttlMs: 30000 }); // the yield is disabled
+
+		h.advance(350); // 450 ms of silence: past the window A was granted under (300 ms)
+		h.sweepAt();
+		assert.deepEqual(h.grantedSessions(b), ["B"], "A keeps the window it was granted under: the disable reaches the next Grant");
+
+		const c = h.connect();
+		h.acquire(c, "C", { role: "parent", activity: true }); // queued behind B, which took the freed Slot
+		h.release(b, "B");
+		const [grant] = h.grantsFor(c);
+		assert.equal(grant.terms?.idleYieldMs, 0, "the next Lease is granted with the yield disabled");
+	});
+});
+
 describe("idle yield (in memory)", () => {
 	it("bare heartbeats keep the TTL alive but not the slot: idle-yield fires (#57 guard)", () => {
 		const h = new SchedulerHarness({ idleYieldMs: 300, ttlMs: 30000 });

@@ -56,7 +56,8 @@ export class Scheduler {
 		// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
 		queue.policy = policy.policy;
 		// Idle-yield (ADR 0003): an activity-flagged holder silent past idleYieldMs, with Waiters
-		// present, yields the Slot. 0 disables the feature.
+		// present, yields the Slot. 0 disables the feature. This is the window new Leases are
+		// granted under; a Lease that is already held keeps the window it was granted under (#105).
 		queue.idleYieldMs = policy.idleYieldMs;
 		return queue;
 	}
@@ -118,6 +119,12 @@ export class Scheduler {
 			// that is already held (ADR 0002), so a shortened TTL applies at the next Grant and a
 			// lengthened one applies at once (#104).
 			ttlMs: queue.ttlMs,
+			// The idle-yield window this Lease is held under. It is the window the Lease was granted
+			// under, for as long as it is held (#105): the client derives its Beat period from the
+			// terms the Grant carried, so the window the daemon enforces must be the one the client
+			// was told — a window the daemon lengthened under a live Holder would leave that
+			// Holder's client beating slower than the window allows.
+			idleYieldMs: queue.idleYieldMs,
 			expires: now + queue.ttlMs,
 			activity: !!requester.activity,
 			lastActivityAt: now,
@@ -130,7 +137,17 @@ export class Scheduler {
 		// The grant carries the requester's `requestedKey` (the key it asked with, opaque to the
 		// Scheduler) so the adapter echoes it per-request: a session queued on two group members gets
 		// each grant keyed by the key that request used, never the other's (protocol: reply matching).
-		decisions.push({ type: "grant", connId: lease.connId, queueKey: queue.queueKey, sessionKey: lease.sessionKey, tier: lease.tier, requestedKey: requester.requestedKey });
+		// It carries the Lease's terms too (#105): the client refreshes on the terms the daemon
+		// granted the Lease under, never on its own copy of the config.
+		decisions.push({
+			type: "grant",
+			connId: lease.connId,
+			queueKey: queue.queueKey,
+			sessionKey: lease.sessionKey,
+			tier: lease.tier,
+			requestedKey: requester.requestedKey,
+			terms: termsOf(lease),
+		});
 		if (fromWaiting) {
 			// Handing the Slot to a new session is the Switch that re-prefills the KV cache.
 			queue.switches++;
@@ -158,11 +175,13 @@ export class Scheduler {
 		const held = this.leaseOf(queue, sessionKey);
 		if (held) {
 			refreshExpiry(held, queue, now);
-			return { granted: true, refreshed: true, decisions: [] };
+			// The refresh reply repeats the Lease's terms: the term may have grown since the Grant.
+			return { granted: true, refreshed: true, decisions: [], terms: termsOf(held) };
 		}
 		const decisions = [];
 		if (queue.holders.length < queue.maxStreams) {
 			this.grantLease(queue, { sessionKey, connId, activity, tier, group, requestedKey }, now, false, decisions);
+			// The terms ride on the grant decision: the adapter puts them in the reply.
 			return { granted: true, refreshed: false, decisions };
 		}
 		const waiter = { sessionKey, tier, group, connId, queueKey, requestedKey, enqueuedAt: now, activity: !!activity };
@@ -263,16 +282,18 @@ export class Scheduler {
 	}
 
 	// sweepAt: TTL evict (unconditional, so `status` never reports a ghost holder) then idle-yield
-	// (gated on idleYieldMs > 0, Waiters present, and the activity flag — ADR 0003).
+	// (gated on the lease's own window being above zero, Waiters present, and the activity flag —
+	// ADR 0003).
 	sweepAt(now) {
 		const decisions = [];
 		for (const queue of this.queues.values()) {
 			for (const lease of [...queue.holders]) if (now > lease.expires) this.releaseLease(queue, lease.sessionKey, "ttl", now, decisions);
-			// Idle-yield: an activity-flagged holder silent past idleYieldMs with waiters present yields
+			// Idle-yield: an activity-flagged holder silent past its window with waiters present yields
 			// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
-			if (queue.idleYieldMs > 0 && queue.waiting.length > 0) {
+			if (queue.waiting.length > 0) {
 				for (const lease of [...queue.holders]) {
-					if (lease.activity && now - lease.lastActivityAt > queue.idleYieldMs) this.releaseLease(queue, lease.sessionKey, "idle", now, decisions);
+					if (lease.idleYieldMs > 0 && lease.activity && now - lease.lastActivityAt > lease.idleYieldMs)
+						this.releaseLease(queue, lease.sessionKey, "idle", now, decisions);
 				}
 			}
 		}
@@ -323,4 +344,18 @@ function effectiveTtlMs(lease, queue) {
 function refreshExpiry(lease, queue, now) {
 	lease.ttlMs = effectiveTtlMs(lease, queue);
 	lease.expires = now + lease.ttlMs;
+}
+
+// The terms a Lease is held under: the TTL and the idle-yield window. The client refreshes the
+// Lease on these terms (#105), so they travel with the Grant.
+//
+// The window is the one the Lease was granted under, for as long as it is held: the client derives
+// its Beat period from the terms the Grant carried, so the window the daemon enforces must be the
+// one the client was told — a window the daemon lengthened under a live Holder would leave that
+// Holder's client beating slower than the window allows, and the Sweep would Yield the Slot to a
+// Waiter while the Holder still streams. A changed window therefore applies at the next Grant,
+// like a shortened TTL. (The TTL may grow: a longer TTL only makes the client's refresh more than
+// sufficient.)
+function termsOf(lease) {
+	return { leaseTtlMs: lease.ttlMs, idleYieldMs: lease.idleYieldMs };
 }

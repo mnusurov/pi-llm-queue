@@ -42,7 +42,9 @@ export const heartbeatMs = (ttlMs) => Math.max(250, Math.floor(ttlMs / 3));
  * Keyed beat period for one queue: a third of that queue's lease TTL (heartbeatMs) and at most half
  * its idle-yield window when the feature is enabled, so a live Holder is never yielded between
  * beats. The daemon resolves the same two fields per queue, so the client must derive its period
- * from the queue it holds, never from `defaults` alone (#81). idleYieldMs 0 disables the feature.
+ * from the queue it holds, never from `defaults` alone (#81). Since #105 the two fields are the
+ * Lease's terms — the daemon grants the Lease under them and the client refreshes on them.
+ * idleYieldMs 0 disables the feature.
  * @param {number} ttlMs @param {number} idleYieldMs @returns {number}
  */
 export const keyedBeatMs = (ttlMs, idleYieldMs = 0) => {

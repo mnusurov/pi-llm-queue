@@ -133,3 +133,31 @@ keyed beat, and restarts the timer; the daemon refreshes every carried holder's 
 when it rebuilds after a reload, so a shortened idle window cannot yield a holder before its client
 has had a chance to beat under the new policy. At the defaults (30 s / 30 s) the period is still
 10 s — three missed beats.
+
+## Amendment (2026-10-21, #105): the idle-yield window is a Lease term
+
+Date: 2026-10-21
+
+Status: Accepted (amends the Decision's item 2 and the 2026-10-20 (#81) amendment's beat period;
+the yield itself is unchanged).
+
+The #81 amendment made the client's Beat period follow the queue's policy — read from the client's
+own copy of the config file. That copy is not the daemon's: the two processes read the file
+independently, each through its own watcher, so one of them can see a config edit the other never
+sees. The client's period then stops matching the window the daemon enforces, and the Sweep yields
+a Holder that is still streaming.
+
+**Amended rule**: the idle-yield window a Lease is measured against is the window it was granted
+under, and the client derives its Beat period from the terms the Grant carried — the TTL and the
+window alike (ADR 0002's #105 amendment).
+
+- A changed window applies at the next Grant, never to a Lease that is already held: a Holder keeps
+  the window it was granted under, so the client that refreshes on those terms is never slower than
+  the window allows.
+- The window is not lengthened under a held Lease either: a longer window would leave that
+  Holder's client beating slower than the window allows — the Sweep would Yield the Slot to a
+  Waiter while the Holder still streams. (The TTL may grow: a longer TTL only makes the client's
+  refresh more than sufficient.)
+- The client's own copy of the config is the fallback for a daemon that sends no terms. A config
+  hot-reload no longer changes how often a held Lease is refreshed — it only re-resolves the
+  provider and queue sets, and restarts the live beats under the current period.

@@ -7,9 +7,9 @@
 // queue addressing through addressing.js, and emitting the decisions the Scheduler returns. All
 // scheduling decisions live in src/scheduler.js.
 import { createConnection, createServer } from "node:net";
-import { appendFileSync, existsSync, readFileSync, unlinkSync, watch } from "node:fs";
-import { basename, dirname } from "node:path";
+import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { loadValidConfig, resolveQueuePolicy } from "./config.js";
+import { watchConfigFile } from "./config-watch.js";
 import { addressEndpoint, readProviders } from "./addressing.js";
 import { Scheduler } from "./scheduler.js";
 import { readJsonLines } from "./socket-lines.js";
@@ -197,7 +197,7 @@ function emit(decisions) {
 				const conn = connById.get(d.connId);
 				// Echo the key the request asked with (the per-request `requestedKey` the Scheduler
 				// carries on the decision), falling back to the resolved queue key for a direct grant.
-				replies.push([conn, { op: "granted", queueKey: d.requestedKey ?? d.queueKey, sessionKey: d.sessionKey }]);
+				replies.push([conn, grantedReply(d.requestedKey ?? d.queueKey, d.sessionKey, d.terms)]);
 				break;
 			}
 			case "switch":
@@ -217,6 +217,12 @@ function emit(decisions) {
 	for (const [conn, msg] of replies) {
 		if (conn) send(conn, msg);
 	}
+}
+
+// The granted reply: the grant itself, plus the Lease's terms (#105). The client refreshes the
+// Lease on the terms the daemon granted it under, never on its own copy of the config.
+function grantedReply(queueKey, sessionKey, terms) {
+	return { op: "granted", queueKey, sessionKey, leaseTtlMs: terms.leaseTtlMs, idleYieldMs: terms.idleYieldMs };
 }
 
 function handle(msg, conn) {
@@ -244,7 +250,7 @@ function handle(msg, conn) {
 			// window logs one grant and no switch). The direct-grant path's reply rides on its own
 			// `grant` decision, so reply here only for a refresh, keyed by the current op's requestedKey.
 			if (result.refreshed) {
-				send(conn, { op: "granted", queueKey: requestedKey, sessionKey: msg.sessionKey });
+				send(conn, grantedReply(requestedKey, msg.sessionKey, result.terms));
 			}
 			return;
 		}
@@ -395,9 +401,9 @@ function rebuildQueues() {
 			// The terms are the Scheduler's: a policy edit never shortens a held Lease, and a
 			// lengthened TTL applies at once (#104).
 			scheduler.redateLease(moved, lease, now);
-			// A policy edit starts every carried holder's activity clock afresh: a shortened
-			// idleYieldMs must not yield a live holder before its client has had a chance to beat
-			// under the new window (#81).
+			// A policy edit starts every carried holder's activity clock afresh: the idle-yield
+			// window a Lease is held under does not change (#105), so the fresh clock is the grace
+			// that keeps a rebuild from yielding a holder on the spot (#81).
 			lease.lastActivityAt = now;
 			moved.holders.push(lease);
 		}
@@ -421,14 +427,12 @@ setInterval(() => emit(scheduler.sweepAt(Date.now())), sweepMs).unref();
 
 // Hot-reload: a config edit re-applies queue policy to live queues and grants whoever the
 // new capacity frees — no daemon restart, no pi restart. A half-written file keeps the last
-// good config. Watch the directory, not the file: an atomic-save editor replaces the file and
-// a file watcher goes dead.
+// good config. The watch itself lives in src/config-watch.js: it watches the directory (an
+// atomic-save editor replaces the file, and a file watcher goes dead with it), and it is re-armed
+// when it fails, so a watch that died cannot leave the daemon on a stale config for good (#105).
 if (configPath) {
-	let debounce = null;
-	const watcher = watch(dirname(configPath), (_event, file) => {
-		if (file && file !== basename(configPath)) return;
-		clearTimeout(debounce);
-		debounce = setTimeout(() => {
+	watchConfigFile(configPath, {
+		onChange: () => {
 			if (!existsSync(configPath)) return; // config deleted: keep the last good config
 			const next = loadValidConfig(configPath);
 			if (next.errors.length) {
@@ -441,11 +445,9 @@ if (configPath) {
 			// rebuildQueues rebuilds every live queue through scheduler.newQueue (which re-resolves the
 			// new policy); one rebuild, one policy resolution.
 			rebuildQueues();
-		}, 250);
-		debounce.unref();
+		},
+		onError: (error) => console.error(`pi-llm-queue daemon: config watch failed: ${error.message} — re-arming`),
 	});
-	watcher.on("error", () => {});
-	watcher.unref();
 }
 
 start();

@@ -32,6 +32,8 @@ export interface Decision {
 	tier: string;
 	requestedKey?: string;
 	reason?: string;
+	/** The Lease's terms (a grant decision carries them). */
+	terms?: { leaseTtlMs: number; idleYieldMs: number };
 }
 
 // The daemon's resolved defaults, read from the config.js table (#77) so the constants live in one

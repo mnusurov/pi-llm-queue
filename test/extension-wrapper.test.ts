@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import { after, describe, it } from "node:test";
 import { closeAllClients, disposeAllExtensions, firstEvent, pollUntil, QUEUE_KEY, race, sleep, startExtension } from "./extension-harness.ts";
+import { leaseTerms } from "./harness.ts";
 
 const STUB_API = "stub-queue-api";
 const QUEUE_KEY2 = "http://model2.test/v1";
@@ -256,7 +257,7 @@ describe("provider wrapper (queuedStream)", () => {
 		// The lease is gone (a TTL lapse of a starved heartbeat, a disconnect release: the daemon
 		// answers a beat ungranted). Here a release on its sessionKey takes the slot for RAW.
 		raw.send({ op: "release", queueKey: QUEUE_KEY, sessionKey: "EVICTED" });
-		assert.deepEqual(await raw.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "RAW" }, "the freed slot goes to the waiter");
+		assert.deepEqual(await raw.next(3000), { op: "granted", queueKey: QUEUE_KEY, sessionKey: "RAW", ...leaseTerms() }, "the freed slot goes to the waiter");
 		assert.deepEqual(await raw.next(3000), { op: "ok" });
 
 		const eA = firstEvent(session.stream(model)); // its beat comes back ungranted: must re-queue
