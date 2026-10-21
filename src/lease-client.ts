@@ -3,7 +3,8 @@
 import { connect, type Socket } from "node:net";
 import { spawn } from "node:child_process";
 import { readJsonLines } from "./socket-lines.js";
-import { keyedBeatMs } from "./config.js";
+import { periodForTerms, termsFromWire } from "./lease-terms.js";
+import type { LeaseTerms } from "./lease-terms.js";
 import type { AcquireVerdict, BeatVerdict } from "./lease-verdict.ts";
 
 /**
@@ -15,21 +16,8 @@ export type Role = "parent" | "child";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * The terms a Lease is held under, as the daemon reports them with the Grant (#105): the TTL the
- * daemon enforces for the Lease and the idle-yield window it is measured against. The client's
- * refresh period follows these terms, so its own copy of the config — which may be stale, or may
- * never have seen the edit the daemon saw — can never shorten a Lease's life.
- */
-export interface LeaseTerms {
-	/** The TTL the Lease is held under, in ms. */
-	leaseTtlMs: number;
-	/** The idle-yield window the Lease is held under, in ms (0 disables the yield). */
-	idleYieldMs: number;
-}
-
-/** The key the terms of one Lease are stored under: a queue key and a session key. */
-const termsKey = (queueKey: string, sessionKey: string): string => JSON.stringify([queueKey, sessionKey]);
+/** The key a live Lease's refresh period is stored under: a queue key and a session key. */
+const leaseKey = (queueKey: string, sessionKey: string): string => JSON.stringify([queueKey, sessionKey]);
 
 /**
  * Where the daemon lives and how the client behaves: the socket path, the daemon entry to
@@ -45,7 +33,7 @@ export interface DaemonPaths {
 	modelsJsonPath?: string;
 	/**
 	 * Heartbeat period; must stay well under the daemon's leaseTtlMs. It is the fallback: a live
-	 * Lease is refreshed on the terms the daemon granted it under (#105), and this period stands
+	 * Lease is refreshed at the period its terms ask for (#105, ADR 0009), and this period stands
 	 * until then — for a daemon that sends no terms, and for a connection that holds no Lease.
 	 */
 	heartbeatMs?: number;
@@ -155,8 +143,12 @@ export class LeaseClient {
 	private socketPath: string;
 	private paths: DaemonPaths;
 	private failOpen: boolean;
-	/** The terms every live Lease is held under, keyed by queue key and session key (#105). */
-	private readonly leaseTerms = new Map<string, LeaseTerms>();
+	/**
+	 * The refresh period of every live Lease, keyed by queue key and session key (#105). The client
+	 * uses the terms for exactly one thing — deriving the period — so it stores the period and
+	 * never the terms themselves.
+	 */
+	private readonly leasePeriods = new Map<string, number>();
 
 	constructor(paths: DaemonPaths) {
 		this.paths = paths;
@@ -197,9 +189,9 @@ export class LeaseClient {
 				// Daemon died while queued: release every caller to its request (fail-open).
 				sock.on("close", () => {
 					this.sock = null;
-					// The daemon took its Leases with it: their terms are gone, and so is the need to
+					// The daemon took its Leases with it: their periods are gone, and so is the need to
 					// cover them.
-					this.leaseTerms.clear();
+					this.leasePeriods.clear();
 					const wakers = this.pending.splice(0, this.pending.length);
 					for (const p of wakers) p.resolve(CLOSED);
 				});
@@ -224,14 +216,14 @@ export class LeaseClient {
 	}
 
 	/**
-	 * The connection-wide heartbeat period (#105): the smallest period any live Lease needs, derived
-	 * from the terms the daemon granted those Leases under. It covers a Holder whose keyed Beat is
+	 * The connection-wide heartbeat period (#105): the smallest period any live Lease needs, taken
+	 * from the periods the terms of those Leases asked for. It covers a Holder whose keyed Beat is
 	 * paused while it waits on another agent, so it must respect the terms of the Leases it covers.
 	 * With no live Lease the configured period stands (the smallest across the configured queues).
 	 */
 	private heartbeatPeriodMs(): number {
 		let min = Infinity;
-		for (const terms of this.leaseTerms.values()) min = Math.min(min, keyedBeatMs(terms.leaseTtlMs, terms.idleYieldMs));
+		for (const period of this.leasePeriods.values()) min = Math.min(min, period);
 		return Number.isFinite(min) ? min : (this.paths.heartbeatMs ?? 10000);
 	}
 
@@ -243,35 +235,35 @@ export class LeaseClient {
 	}
 
 	/**
-	 * The keyed Beat period a held Lease needs (#105): derived from the terms the daemon granted it
-	 * under, through the shared derivation. Undefined when the daemon sent no terms (an older
+	 * The keyed Beat period a held Lease needs (#105): the period its terms ask for, derived
+	 * through the terms module (ADR 0009). Undefined when the daemon sent no terms (an older
 	 * daemon) — the caller then falls back to its own policy.
 	 */
 	beatPeriodMs(queueKey: string, sessionKey: string): number | undefined {
-		const terms = this.leaseTerms.get(termsKey(queueKey, sessionKey));
-		return terms ? keyedBeatMs(terms.leaseTtlMs, terms.idleYieldMs) : undefined;
+		return this.leasePeriods.get(leaseKey(queueKey, sessionKey));
 	}
 
 	/**
-	 * Record the terms a Grant carried (#105). They are the terms the daemon enforces for that
-	 * Lease, taken as they come: a Lease granted under a shorter TTL is a new Lease, and a client
-	 * that kept the old term would refresh slower than the daemon enforces.
+	 * Record the period a Grant's terms ask for (#105). The terms are the ones the daemon enforces
+	 * for that Lease, taken as they come: a Lease granted under a shorter TTL is a new Lease, and
+	 * a client that kept the old period would refresh slower than the daemon enforces.
 	 */
-	private rememberTerms(queueKey: string, sessionKey: string, msg: any): void {
-		const leaseTtlMs = Number(msg.leaseTtlMs);
-		const idleYieldMs = Number(msg.idleYieldMs);
-		// Both fields, or none: a daemon that sends no terms leaves the client on its own policy.
-		if (!Number.isFinite(leaseTtlMs) || leaseTtlMs <= 0 || !Number.isFinite(idleYieldMs) || idleYieldMs < 0) return;
-		const terms: LeaseTerms = { leaseTtlMs, idleYieldMs };
-		const key = termsKey(queueKey, sessionKey);
-		const before = this.leaseTerms.get(key);
-		this.leaseTerms.set(key, terms);
-		if (!before || before.leaseTtlMs !== terms.leaseTtlMs || before.idleYieldMs !== terms.idleYieldMs) this.rearmHeartbeat();
+	private rememberPeriod(queueKey: string, sessionKey: string, msg: any): void {
+		const terms: LeaseTerms | null = termsFromWire(msg);
+		// No terms: the client stays on its own policy.
+		if (!terms) return;
+		const period = periodForTerms(terms);
+		const key = leaseKey(queueKey, sessionKey);
+		const before = this.leasePeriods.get(key);
+		this.leasePeriods.set(key, period);
+		// The re-arm follows the period: the timer runs on it, so a Grant whose terms change but
+		// whose period does not leaves the connection-wide heartbeat where it is.
+		if (before !== period) this.rearmHeartbeat();
 	}
 
-	/** Drop the terms of a released Lease: its TTL no longer needs covering. */
-	private forgetTerms(queueKey: string, sessionKey: string): void {
-		if (this.leaseTerms.delete(termsKey(queueKey, sessionKey))) this.rearmHeartbeat();
+	/** Drop the period of a released Lease: its TTL no longer needs covering. */
+	private forgetPeriod(queueKey: string, sessionKey: string): void {
+		if (this.leasePeriods.delete(leaseKey(queueKey, sessionKey))) this.rearmHeartbeat();
 	}
 
 	/**
@@ -279,8 +271,8 @@ export class LeaseClient {
 	 * per-queue keyed beat so a bare renew alone keeps every lease alive under that queue's TTL;
 	 * called on config hot-reload, which is why a live timer must be restarted, not left in place.
 	 *
-	 * The configured period is the fallback: a live Lease is refreshed on the terms the daemon
-	 * granted it under (#105), so a config edit never changes a held Lease's refresh period.
+	 * The configured period is the fallback: a live Lease is refreshed at the period its terms ask
+	 * for (#105), so a config edit never changes a held Lease's refresh period.
 	 */
 	setHeartbeatMs(ms: number): void {
 		if (!Number.isFinite(ms) || ms <= 0) return;
@@ -362,7 +354,7 @@ export class LeaseClient {
 			entry.resolve = (msg) => {
 				// The Grant carries the Lease's terms (#105): the client refreshes on the terms the
 				// daemon granted the Lease under, never on its own copy of the config.
-				if (msg !== CLOSED) this.rememberTerms(queueKey, sessionKey, msg);
+				if (msg !== CLOSED) this.rememberPeriod(queueKey, sessionKey, msg);
 				finish(msg === CLOSED ? { kind: "passthrough" } : { kind: "held" });
 			};
 			this.pending.push(entry);
@@ -390,7 +382,7 @@ export class LeaseClient {
 	}
 
 	release(queueKey: string, sessionKey: string): void {
-		this.forgetTerms(queueKey, sessionKey);
+		this.forgetPeriod(queueKey, sessionKey);
 		this.send({ op: "release", queueKey, sessionKey });
 	}
 
@@ -414,7 +406,7 @@ export class LeaseClient {
 		if (msg.granted === false) {
 			// The Slot is gone (a TTL lapse, a release, an idle yield): the Lease's terms no longer
 			// need covering, so the connection-wide heartbeat stops paying for them.
-			this.forgetTerms(queueKey, sessionKey);
+			this.forgetPeriod(queueKey, sessionKey);
 			return { kind: "lost" };
 		}
 		return { kind: "held" };
@@ -432,7 +424,7 @@ export class LeaseClient {
 			clearInterval(this.heartbeat);
 			this.heartbeat = null;
 		}
-		this.leaseTerms.clear();
+		this.leasePeriods.clear();
 		const sock = this.sock;
 		if (!sock) return;
 		try {

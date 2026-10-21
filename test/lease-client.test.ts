@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { DaemonUnreachableError, LeaseClient } from "../src/lease-client.ts";
-import { heartbeatMs } from "../src/config.js";
+import { periodForTerms, termsFor } from "../src/lease-terms.js";
 import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
@@ -170,12 +170,12 @@ describe("lease client", () => {
 	});
 
 	it("the default heartbeat ratio keeps a lease alive at the leaseTtlMs floor", async () => {
-		// The client heartbeats at config.js heartbeatMs(ttl). At the 1000 ms floor a 1 s floor would
+		// The client heartbeats at a third of the TTL. At the 1000 ms floor a 1 s floor would
 		// equal the TTL, so a sweep landing between two beats would evict a healthy holder.
 		const TTL = 1000;
 		const d = startDaemon({ defaults: { maxStreams: 1, leaseTtlMs: TTL }, queues: {} }, undefined, undefined, 50);
 		await waitForDaemon(d.socketPath);
-		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: heartbeatMs(TTL) });
+		const a = new LeaseClient({ socketPath: d.socketPath, heartbeatMs: periodForTerms(termsFor(TTL, 0)) });
 		const b = new LeaseClient({ socketPath: d.socketPath });
 
 		await a.acquire(QUEUE_KEY, "A", "parent");

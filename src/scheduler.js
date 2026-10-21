@@ -7,7 +7,8 @@
 // Plain JS on purpose (the src/config.js reason): the daemon imports it and Node's built-in type
 // stripping is refused for files under node_modules, so a .ts import would kill an installed daemon.
 // It imports no config module: the adapter resolves policy through src/config.js and passes plain
-// values in via the resolvePolicy callback.
+// values in via the resolvePolicy callback. The Lease's terms are the terms module's (ADR 0009):
+// this one holds them and asks it for the growth rule, but never writes their shape.
 
 // Decisions the adapter emits, in order:
 //   grant   — a session takes the Slot: the adapter logs "grant" and sends the `granted` reply.
@@ -16,6 +17,8 @@
 //   release — a Slot returns (voluntary, or an idle Yield with reason "idle"): log "release".
 //   evict   — a TTL reclaim: log "evict" with reason "ttl".
 // A direct grant into a free Slot is a Grant, not a Switch (protocol-facts), so it emits no switch.
+
+import { growTerms, termsFor } from "./lease-terms.js";
 
 /**
  * The daemon's deciding part (ADR 0004): it owns the Queues, the Lease records and the waiting
@@ -34,6 +37,7 @@ export class Scheduler {
 	// iterates its own (#103).
 	#queues;
 	// resolvePolicy(queueKey) -> { maxStreams, ttlMs, agingAfterSlots, agingAfterMs, policy, idleYieldMs }
+	// (the TTL and the idle-yield window are the two values the terms are built from)
 	// (plain resolved values; the adapter gets them from config.js resolveQueuePolicy, the one
 	// cascade that owns the defaults fallback).
 	// resolveQueueKey(queueKey) -> the Queue key that Queue lives under after a reload (the
@@ -59,19 +63,17 @@ export class Scheduler {
 		queue.maxStreams = policy.maxStreams;
 		// A lease dies only without heartbeats (TTL): a live holder is never preempted (#49 / ADR
 		// 0002), so the slot moves on voluntary release, abort, disconnect, or a TTL lapse alone.
-		// The Queue's TTL may be shorter than a held Lease's: the Lease keeps the TTL it was granted
-		// under — see refreshExpiry (#104).
-		queue.ttlMs = policy.ttlMs;
 		// Aging: anti-starvation for background jobs — a child is boosted ahead of parents after this
 		// many consecutive parent grants, or after waiting this long.
 		queue.agingAfterSlots = policy.agingAfterSlots;
 		queue.agingAfterMs = policy.agingAfterMs;
 		// "fifo" opts a queue out of parent/child tiering and aging (external multi-slot queues).
 		queue.policy = policy.policy;
-		// Idle-yield (ADR 0003): an activity-flagged holder silent past idleYieldMs, with Waiters
-		// present, yields the Slot. 0 disables the feature. This is the window new Leases are
-		// granted under; a Lease that is already held keeps the window it was granted under (#105).
-		queue.idleYieldMs = policy.idleYieldMs;
+		// The terms new Leases are granted under (ADR 0009): the TTL term and the idle-yield
+		// window. The TTL may be shorter than a held Lease's — the Lease keeps the TTL it was
+		// granted under (#104) — and the window a held Lease keeps is the one it was granted
+		// under (#105), so only a new Grant sees a changed one.
+		queue.terms = termsFor(policy.ttlMs, policy.idleYieldMs);
 		return queue;
 	}
 
@@ -128,17 +130,13 @@ export class Scheduler {
 			connId: requester.connId,
 			tier: requester.tier,
 			group: requester.group,
-			// The TTL this Lease is held under. It only ever grows: a policy edit never shortens a Lease
-			// that is already held (ADR 0002), so a shortened TTL applies at the next Grant and a
-			// lengthened one applies at once (#104).
-			ttlMs: queue.ttlMs,
-			// The idle-yield window this Lease is held under. It is the window the Lease was granted
-			// under, for as long as it is held (#105): the client derives its Beat period from the
-			// terms the Grant carried, so the window the daemon enforces must be the one the client
-			// was told — a window the daemon lengthened under a live Holder would leave that
-			// Holder's client beating slower than the window allows.
-			idleYieldMs: queue.idleYieldMs,
-			expires: now + queue.ttlMs,
+			// The terms this Lease is held under: the TTL term and the idle-yield window. The TTL
+			// term only ever grows — a policy edit never shortens a Lease that is already held
+			// (ADR 0002) — and the window is the one the Lease was granted under, for as long as
+			// it is held (#105). The client derives its refresh period from the terms the Grant
+			// carried, so the window the daemon enforces must be the one the client was told.
+			terms: termsFor(queue.terms.leaseTtlMs, queue.terms.idleYieldMs),
+			expires: now + queue.terms.leaseTtlMs,
 			activity: !!requester.activity,
 			lastActivityAt: now,
 		};
@@ -159,7 +157,7 @@ export class Scheduler {
 			sessionKey: lease.sessionKey,
 			tier: lease.tier,
 			requestedKey: requester.requestedKey,
-			terms: termsOf(lease),
+			terms: lease.terms,
 		});
 		if (fromWaiting) {
 			// Handing the Slot to a new session is the Switch that re-prefills the KV cache.
@@ -189,7 +187,7 @@ export class Scheduler {
 		if (held) {
 			refreshExpiry(held, queue, now);
 			// The refresh reply repeats the Lease's terms: the term may have grown since the Grant.
-			return { granted: true, refreshed: true, decisions: [], terms: termsOf(held) };
+			return { granted: true, refreshed: true, decisions: [], terms: held.terms };
 		}
 		const decisions = [];
 		if (queue.holders.length < queue.maxStreams) {
@@ -305,7 +303,7 @@ export class Scheduler {
 			// the slot. A lone holder is never disturbed; unflagged (old-client) leases are never yielded.
 			if (queue.waiting.length > 0) {
 				for (const lease of [...queue.holders]) {
-					if (lease.idleYieldMs > 0 && lease.activity && now - lease.lastActivityAt > lease.idleYieldMs)
+					if (lease.terms.idleYieldMs > 0 && lease.activity && now - lease.lastActivityAt > lease.terms.idleYieldMs)
 						this.releaseLease(queue, lease.sessionKey, "idle", now, decisions);
 				}
 			}
@@ -317,7 +315,7 @@ export class Scheduler {
 	// TTL leaves the Lease untouched — the Holder keeps the terms it was granted under (ADR 0002) —
 	// and a lengthened one applies at once: the term grows and the expiry follows it (#104).
 	#redateLease(queue, lease, now) {
-		if (queue.ttlMs > lease.ttlMs) refreshExpiry(lease, queue, now);
+		if (queue.terms.leaseTtlMs > lease.terms.leaseTtlMs) refreshExpiry(lease, queue, now);
 	}
 
 	// rebuildQueues: the Queue rebuild of a config reload (#103). The Scheduler owns it end to end —
@@ -385,35 +383,11 @@ function remove(list, item) {
 	if (at >= 0) list.splice(at, 1);
 }
 
-// The TTL a Lease is held under, after the Queue's current TTL is taken into account: the longer of
-// the two. A policy edit never shortens a Lease that is already held (ADR 0002) — a shortened TTL
-// applies at the next Grant, a lengthened one applies at once. Without this rule a config edit that
-// shortens the TTL re-dates a live Holder's Lease under the new, shorter TTL, and the Holder — still
-// streaming — loses its Slot to a Waiter (#104).
-//
-// The term only ever grows: a Lease keeps the longest TTL it was ever held under, so a lengthening
-// a later shortening cannot take back.
-function effectiveTtlMs(lease, queue) {
-	return Math.max(lease.ttlMs, queue.ttlMs);
-}
-
-// Refresh a Lease's expiry under the rule: the term grows to the effective TTL and the expiry
-// follows it.
+// Refresh a Lease's expiry under the terms module's rule (ADR 0009): the TTL term grows to the
+// longer of the Lease's own and the Queue's current one — a policy edit never shortens a Lease
+// that is already held (ADR 0002) — and the expiry follows it. The idle-yield window stays the
+// one the Lease was granted under.
 function refreshExpiry(lease, queue, now) {
-	lease.ttlMs = effectiveTtlMs(lease, queue);
-	lease.expires = now + lease.ttlMs;
-}
-
-// The terms a Lease is held under: the TTL and the idle-yield window. The client refreshes the
-// Lease on these terms (#105), so they travel with the Grant.
-//
-// The window is the one the Lease was granted under, for as long as it is held: the client derives
-// its Beat period from the terms the Grant carried, so the window the daemon enforces must be the
-// one the client was told — a window the daemon lengthened under a live Holder would leave that
-// Holder's client beating slower than the window allows, and the Sweep would Yield the Slot to a
-// Waiter while the Holder still streams. A changed window therefore applies at the next Grant,
-// like a shortened TTL. (The TTL may grow: a longer TTL only makes the client's refresh more than
-// sufficient.)
-function termsOf(lease) {
-	return { leaseTtlMs: lease.ttlMs, idleYieldMs: lease.idleYieldMs };
+	lease.terms = growTerms(lease.terms, queue.terms);
+	lease.expires = now + lease.terms.leaseTtlMs;
 }

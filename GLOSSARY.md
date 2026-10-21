@@ -54,9 +54,11 @@ _Avoid_: lock, ticket
 **Lease terms**:
 The TTL and the idle-yield window a lease is held under. The grant carries them, and the client
 refreshes the lease on them — so the client's own copy of the config, which may be stale, never
-decides how long a lease lives. The TTL term only ever grows; the idle-yield window is the one the
-lease was granted under, for as long as it is held. A changed window applies at the next grant
-(#104, #105).
+decides how long a lease lives. Two rules, one per term: the TTL term only ever grows (it is the
+longer of the TTL the lease was granted under and the Queue's current TTL), and the idle-yield
+window is frozen (it is the one the lease was granted under, for as long as it is held, so a changed
+window applies at the next grant) (#104, #105). One module owns their shape, the refresh period they
+imply, their wire encoding and the rule that grows them (ADR 0009).
 _Avoid_: lease policy, lease config
 
 **Lease verdict**:
@@ -77,6 +79,13 @@ _Avoid_: ping, signal
 A keyless lease refresh that keeps a live session's leases alive.
 _Avoid_: keepalive, ping
 
+**Refresh period**:
+The period a client refreshes a lease at: a third of the lease's TTL (floor 250 ms) and at most half
+its idle-yield window. It is derived from the lease's terms, never configured — a configured period
+is only the fallback for a daemon that sends no terms (ADR 0009). The keyed Beat runs at the
+refresh period; the connection-wide Heartbeat runs at the smallest one across the leases it covers.
+_Avoid_: beat interval, keepalive period
+
 **Blocking Tool**:
 A tool that parks the run on another agent or the user (`subagent`, `bg_wait`, `ask_user`, …;
 configurable via `defaults.blockingTools`). The run-scoped beat pauses while one is in flight, so
@@ -95,9 +104,9 @@ _Avoid_: busy, active
 
 **TTL**:
 The lease's expiry horizon: a client that dies mid-stream stops refreshing and the slot is
-reclaimed when the TTL lapses. A Lease is held under a term that only ever grows — the longer of
-the TTL it was granted under and the Queue's current TTL — so a policy edit that shortens the TTL
-never shortens a Lease that is already held, and a lengthened TTL applies at once (#104).
+reclaimed when the TTL lapses. A policy edit that shortens the TTL never shortens a Lease that is
+already held, and a lengthened TTL applies at once (#104) — the TTL term is one of the Lease
+terms.
 _Avoid_: timeout, expiry (as an event)
 
 **Counted client**:

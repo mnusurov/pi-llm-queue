@@ -70,6 +70,10 @@ beat is paused while it waits on another agent — runs at the smallest such per
 it covers. The client's copy of the config is its fallback for a daemon that sends no terms; it
 never decides a lease's life.
 
+That derivation lives in one module (ADR 0009): it owns the terms' shape, the refresh period they
+imply, their wire encoding and the growth rule. The daemon writes the terms through it and the
+client reads them through it; the wire field names above do not change.
+
 That is what closes the class the two config copies opened: the daemon and the client read the
 config file independently, each through its own watcher, so a config edit one of them sees and the
 other does not used to decide how long a lease lived. A lease's terms are the ones the daemon
