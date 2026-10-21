@@ -1,8 +1,8 @@
 # Release: the recipe
 
 The npm publish happens in CI. A tag `v*` pushed to `main` starts `.github/workflows/release.yml`,
-which runs the gate, checks the tag, and publishes. No npm token lives in the repository: npm
-trusts the workflow through OIDC.
+which runs the gate, checks the tag, publishes, and then creates the GitHub Release. No npm token
+lives in the repository: npm trusts the workflow through OIDC.
 
 ## One-time setup on npmjs.com
 
@@ -32,11 +32,15 @@ only closes the door to long-lived tokens.
        git tag v0.1.2
        git push origin v0.1.2
 
-4. The Release workflow publishes. Watch it: `gh run watch`.
+4. The Release workflow publishes, then creates the GitHub Release with generated notes. Watch it:
+   `gh run watch`.
 5. Check the registry: `npm view pi-llm-queue version`.
 
 The tag is the only trigger, so it must be pushed from a `main` that already carries the version
 the tag names. The workflow refuses anything else, and it refuses before it uploads anything.
+
+The generated notes are the commit list, not the release story. Rewrite them when the release
+deserves more than the list says: `gh release edit v0.1.2 --notes-file notes.md`.
 
 ## What the workflow refuses
 
