@@ -126,6 +126,7 @@ export class LeaseClient {
 	private sock: Socket | null = null;
 	private pending: Pending[] = [];
 	private heartbeat: ReturnType<typeof setInterval> | null = null;
+	private connecting: Promise<boolean> | null = null;
 	// Socket ref/unref is one switch, not a counter: ref/unref per call lets any second op
 	// (a beat, a status poll) free the process to exit while a queued acquire is still waiting.
 	// Count outstanding requests instead: ref on 0 -> 1, unref when the last one finishes.
@@ -170,6 +171,17 @@ export class LeaseClient {
 
 	private async connectDaemon(): Promise<boolean> {
 		if (this.sock) return true;
+		if (this.connecting) return this.connecting;
+		const promise = this.connectOnce();
+		this.connecting = promise;
+		try {
+			return await promise;
+		} finally {
+			if (this.connecting === promise) this.connecting = null;
+		}
+	}
+
+	private async connectOnce(): Promise<boolean> {
 		await ensureDaemon(this.paths);
 		for (let attempt = 0; attempt < (this.paths.daemonPath ? 60 : 1); attempt++) {
 			try {
