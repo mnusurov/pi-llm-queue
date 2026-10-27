@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { after, describe, it } from "node:test";
 import { DaemonUnreachableError, LeaseClient } from "../src/lease-client.ts";
 import { periodForTerms, termsFor } from "../src/lease-terms.js";
-import { DAEMON, QUEUE_KEY, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
+import { DAEMON, QUEUE_KEY, exited, pollUntil, sleep, startDaemon, stopAllDaemons, waitForDaemon } from "./harness.ts";
 
 const raceWithSleep = (promise: Promise<unknown>, ms: number) =>
 	Promise.race([promise.then(() => "resolved"), sleep(ms).then(() => "pending")]);
@@ -108,6 +108,29 @@ describe("lease client", () => {
 		c.close();
 		holder.close();
 		d.stop();
+	});
+
+	it("keeps one socket when two acquires race on connect (no connection leak)", async () => {
+		const d = startDaemon({ defaults: { daemonIdleExitMs: 200, maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const holder = new LeaseClient({ socketPath: d.socketPath });
+		await holder.acquire(QUEUE_KEY, "H", "parent"); // occupy the slot
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		// Both acquires pass connectDaemon concurrently: two sockets open, only one may be kept.
+		const first = c.acquire(QUEUE_KEY, "S1", "parent");
+		const second = c.acquire(QUEUE_KEY, "S2", "parent");
+		assert.equal(await raceWithSleep(first, 300), "pending");
+		assert.equal(await raceWithSleep(second, 300), "pending");
+		holder.release(QUEUE_KEY, "H");
+		assert.equal(await raceWithSleep(first, 3000), "resolved");
+		assert.equal(await raceWithSleep(second, 300), "pending"); // maxStreams 1: second still queued
+		c.release(QUEUE_KEY, "S1");
+		assert.equal(await raceWithSleep(second, 3000), "resolved");
+		holder.close();
+		c.close();
+		// No leak: no counted client remains, so the daemon idle-exits. A leaked socket stays
+		// counted and keeps the daemon up past the idle window.
+		assert.equal(await exited(d.proc, 600), true);
 	});
 
 	it("delivers two same-session acquires (queued run + compaction) without wedging", async () => {

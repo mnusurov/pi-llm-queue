@@ -126,6 +126,9 @@ export class LeaseClient {
 	private sock: Socket | null = null;
 	private pending: Pending[] = [];
 	private heartbeat: ReturnType<typeof setInterval> | null = null;
+	private connecting: Promise<boolean> | null = null;
+	private connectingSock: Socket | null = null;
+	private closed = false;
 	// Socket ref/unref is one switch, not a counter: ref/unref per call lets any second op
 	// (a beat, a status poll) free the process to exit while a queued acquire is still waiting.
 	// Count outstanding requests instead: ref on 0 -> 1, unref when the last one finishes.
@@ -170,14 +173,32 @@ export class LeaseClient {
 
 	private async connectDaemon(): Promise<boolean> {
 		if (this.sock) return true;
+		if (this.connecting) return this.connecting;
+		const promise = this.connectOnce();
+		this.connecting = promise;
+		try {
+			return await promise;
+		} finally {
+			if (this.connecting === promise) this.connecting = null;
+		}
+	}
+
+	private async connectOnce(): Promise<boolean> {
 		await ensureDaemon(this.paths);
 		for (let attempt = 0; attempt < (this.paths.daemonPath ? 60 : 1); attempt++) {
+			if (this.closed) return false;
 			try {
 				const sock = connect(this.socketPath);
+				this.connectingSock = sock;
 				await new Promise((resolve, reject) => {
 					sock.once("connect", resolve);
 					sock.once("error", reject);
 				});
+				if (this.closed) {
+					sock.destroy();
+					this.connectingSock = null;
+					return false;
+				}
 				readJsonLines(sock, (msg) => {
 					// Deliver by match; a reply with no matching request (e.g. a release "ok")
 					// is dropped, never buffered for a later acquire to consume.
@@ -196,6 +217,7 @@ export class LeaseClient {
 					for (const p of wakers) p.resolve(CLOSED);
 				});
 				this.sock = sock;
+				this.connectingSock = null;
 				sock.unref(); // never keep pi's process alive through the lease connection
 				// Lease heartbeat: a live session must never lose its slot to the TTL. Renew is
 				// connection-wide, so it only refreshes the leases still on this socket; a session's
@@ -420,17 +442,22 @@ export class LeaseClient {
 	 * converges cancellation, reload, session replacement and exit on the same shutdown path.
 	 */
 	bye(): void {
+		this.closed = true;
 		if (this.heartbeat) {
 			clearInterval(this.heartbeat);
 			this.heartbeat = null;
 		}
 		this.leasePeriods.clear();
 		const sock = this.sock;
-		if (!sock) return;
-		try {
-			sock.write(`${JSON.stringify({ op: "bye" })}\n`);
-		} catch {}
-		sock.destroy(); // the close handler clears this.sock and releases any pending request
+		if (sock) {
+			try {
+				sock.write(`${JSON.stringify({ op: "bye" })}\n`);
+			} catch {}
+			sock.destroy(); // the close handler clears this.sock and releases any pending request
+		}
+		const connecting = this.connectingSock;
+		this.connectingSock = null;
+		if (connecting) connecting.destroy();
 	}
 
 	async status(): Promise<StatusReply | null> {
@@ -445,7 +472,12 @@ export class LeaseClient {
 	}
 
 	close(): void {
-		this.sock?.destroy();
+		this.closed = true;
+		const sock = this.sock;
 		this.sock = null;
+		if (sock) sock.destroy();
+		const connecting = this.connectingSock;
+		this.connectingSock = null;
+		if (connecting) connecting.destroy();
 	}
 }
