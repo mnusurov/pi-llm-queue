@@ -79,6 +79,21 @@ function owningEntry(queues, providers, key) {
 }
 
 /**
+ * One addressing rule, in one place (ADR 0005): where a model/endpoint lands after group matching
+ * and entry lookup. Both entry points (`addressModel`, `addressEndpoint`) are thin wrappers over
+ * it, so the rule cannot drift between the daemon's form and the extension's form. Not exported —
+ * the public surface stays exactly as it was.
+ * @param {Record<string, any>} queues
+ * @param {Record<string, any>} providers
+ * @param {{ provider?: string, baseUrl: string }} model
+ * @returns {Address}
+ */
+function address(queues, providers, model) {
+	const queueKey = groupKeyFor(queues, providers, model);
+	return { queueKey, entry: owningEntry(queues, providers, queueKey) };
+}
+
+/**
  * Address a model's queue — the extension's form, where the provider-name branch is live: a group
  * naming the model's provider splits one endpoint into per-provider slot sets.
  * @param {{ provider?: string, baseUrl: string }} model
@@ -87,8 +102,7 @@ function owningEntry(queues, providers, key) {
  * @returns {Address}
  */
 export function addressModel(model, queues, providers) {
-	const queueKey = groupKeyFor(queues, providers, model);
-	return { queueKey, entry: owningEntry(queues, providers, queueKey) };
+	return address(queues, providers, model);
 }
 
 /**
@@ -101,8 +115,7 @@ export function addressModel(model, queues, providers) {
  * @returns {Address}
  */
 export function addressEndpoint(baseUrl, queues, providers) {
-	const queueKey = groupKeyFor(queues, providers, { baseUrl });
-	return { queueKey, entry: owningEntry(queues, providers, queueKey) };
+	return address(queues, providers, { baseUrl });
 }
 
 /**
