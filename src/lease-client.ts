@@ -172,6 +172,7 @@ export class LeaseClient {
 	}
 
 	private async connectDaemon(): Promise<boolean> {
+		if (this.closed) return false;
 		if (this.sock) return true;
 		if (this.connecting) return this.connecting;
 		const promise = this.connectOnce();
