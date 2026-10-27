@@ -645,6 +645,23 @@ describe("lease client", () => {
 		c.close();
 		d.stop();
 	});
+
+	it("destroys an in-flight connect socket on close/bye so no slot is held (#123)", async () => {
+		// close()/bye() must destroy a socket that connectOnce() opened but has not yet stored
+		// as this.sock; otherwise it stays counted by the daemon and blocks the idle-exit.
+		const d = startDaemon({ defaults: { daemonIdleExitMs: 100, maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		// Start a connect and close it while it is in flight: connectOnce() has invoked connect()
+		// (connectingSock is set) but the grant has not arrived.
+		const acquired = c.acquire(QUEUE_KEY, "A", "parent");
+		await sleep(0); // let connect() be invoked; do not await the grant
+		c.close();
+		// The mid-connect socket is destroyed: the acquire resolves to passthrough instead of
+		// hanging, and no slot is held so the daemon idle-exits within the idle window.
+		assert.equal(await raceWithSleep(acquired, 1000), "resolved", "a mid-connect close resolves instead of hanging");
+		assert.equal(await exited(d.proc, 1000), true, "no slot is held: the daemon idle-exits within the idle window");
+	});
 });
 
 describe("daemon autostart", () => {
