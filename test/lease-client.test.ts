@@ -599,6 +599,52 @@ describe("lease client", () => {
 		holder.close();
 		d.stop();
 	});
+
+	it("passes a closed client's acquire through instead of hanging on the destroyed socket (#122)", async () => {
+		// bye() sets closed = true and destroys the socket, but the close event that nils
+		// this.sock fires later. A closed client's acquire must resolve instead of hanging.
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		await c.acquire(QUEUE_KEY, "A", "parent");
+		c.bye();
+		assert.equal(await raceWithSleep(c.acquire(QUEUE_KEY, "A", "parent"), 500), "resolved");
+		c.close();
+		d.stop();
+	});
+
+	it("returns passthrough from acquire on a closed client (#122)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		await c.acquire(QUEUE_KEY, "A", "parent");
+		c.bye();
+		assert.deepEqual(await c.acquire(QUEUE_KEY, "A", "parent"), { kind: "passthrough" });
+		c.close();
+		d.stop();
+	});
+
+	it("returns passthrough from beat on a closed client (#122)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		await c.acquire(QUEUE_KEY, "A", "parent");
+		c.bye();
+		assert.deepEqual(await c.beat(QUEUE_KEY, "A"), { kind: "passthrough" });
+		c.close();
+		d.stop();
+	});
+
+	it("returns null from status on a closed client (#122)", async () => {
+		const d = startDaemon({ defaults: { maxStreams: 1 }, queues: { [QUEUE_KEY]: { maxStreams: 1 } } });
+		await waitForDaemon(d.socketPath);
+		const c = new LeaseClient({ socketPath: d.socketPath });
+		await c.acquire(QUEUE_KEY, "A", "parent");
+		c.bye();
+		assert.equal(await c.status(), null);
+		c.close();
+		d.stop();
+	});
 });
 
 describe("daemon autostart", () => {
